@@ -20,15 +20,15 @@ import Constants from 'expo-constants';
 import { Linking, Platform } from 'react-native';
 
 /** Must match app.json «version» at release time. */
-export const APP_VERSION = '1.4.1';
-export const APP_VERSION_CODE = 6;
+export const APP_VERSION = '1.4.2';
+export const APP_VERSION_CODE = 7;
 
 /**
  * Update-check URL — points at the raw version.json inside the public
  * GitHub repository of this project (ostad2fan/pompay).
  */
 export const DEFAULT_UPDATE_URL =
-  'https://raw.githubusercontent.com/ostad2fan/pompay/main/pampay-coin-alert-github/apk/version.json';
+  'https://raw.githubusercontent.com/ostad2fan/pompay/main/apk/version.json';
 
 const UPDATE_URL_KEY = '@app_update_check_url';
 const DISMISSED_KEY = '@app_update_dismissed_version';
