@@ -24,6 +24,11 @@ import { getNobitexUsdtToman } from "./nobitex";
 import { scanEngine } from "./scanEngine";
 import { runFastScanCycle, pumpDumpResponse } from "./fastScan";
 import { registerPushToken, unregisterPushToken, pushStatus } from "./push";
+import {
+  startBotCommandPoller,
+  getPendingForApp,
+  ackPendingForApp,
+} from "./botCommands";
 import store from "./store";
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -123,6 +128,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         hasConfig: Boolean(config),
         telegramConfigured: Boolean(config?.botToken && config?.chatId),
+        serverBotCommands: true,
         lastScanDate: lastScanDate ?? null,
         lastScanAt: lastScanAt ?? null,
         lastFastScanAt: lastFastScanAt ?? null,
@@ -154,6 +160,65 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await pushStatus());
     }
 
+    // ---- GitHub update relay (v1.4.3) ----
+    if (req.method === "GET" && url.pathname === "/latest-version") {
+      try {
+        const body = await fetchVersionJsonBody();
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
+          "X-Relay-Source": "github",
+        });
+        res.end(body);
+        return;
+      } catch (e) {
+        return json(res, 502, { ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    if (req.method === "GET" && url.pathname === "/latest-apk") {
+      try {
+        const upstream = await fetch(APK_URL, {
+          headers: { "User-Agent": "pompay-server" },
+        });
+        if (!upstream.ok) {
+          return json(res, 502, { ok: false, error: `github ${upstream.status}` });
+        }
+        res.writeHead(200, {
+          "Content-Type": "application/vnd.android.package-archive",
+          "Content-Disposition": 'attachment; filename="PampDumpCoins-latest.apk"',
+          "Cache-Control": "no-store",
+        });
+        // Node 20+: web ReadableStream can be piped after conversion
+        const nodeStream = upstream.body as unknown as NodeJS.ReadableStream;
+        if (nodeStream && typeof (nodeStream as { pipe?: unknown }).pipe === "function") {
+          nodeStream.pipe(res);
+        } else {
+          const buf = Buffer.from(await upstream.arrayBuffer());
+          res.end(buf);
+        }
+        return;
+      } catch (e) {
+        return json(res, 502, { ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
+    // ---- bot command relay (v1.4.3) ----
+    if (req.method === "GET" && url.pathname === "/bot/pending") {
+      const secret = String(url.searchParams.get("secret") ?? "");
+      const commands = await getPendingForApp(secret);
+      return json(res, 200, { ok: commands.length > 0, commands });
+    }
+    if (req.method === "POST" && url.pathname === "/bot/ack") {
+      const raw = await readBody(req);
+      try {
+        const body = JSON.parse(raw || "{}") as { secret?: string; ids?: number[] };
+        const removed = await ackPendingForApp(String(body.secret ?? ""), body.ids ?? []);
+        return json(res, 200, { ok: true, removed });
+      } catch {
+        return json(res, 400, { ok: false, error: "invalid json" });
+      }
+    }
+
     return json(res, 404, { ok: false, error: "not found" });
   } catch (e) {
     console.log(`[HTTP] error on ${req.method} ${url.pathname}:`, e);
@@ -166,7 +231,38 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`[Server] PamPay Coin Alert backend listening on :${PORT}`);
   console.log(`[Server] push configured: ${process.env.EXPO_ACCESS_TOKEN ? "yes (access token)" : "no token (open mode)"}`);
+  // v1.4.3: server-side Telegram command processing (24/7, even with the
+  // app closed). Starts polling getUpdates as soon as a bot token is synced.
+  startBotCommandPoller();
 });
+
+// --- GitHub update relay (v1.4.3) -------------------------------------------
+// raw.githubusercontent.com is blocked on many Iranian ISPs. The app now
+// checks for updates via THIS server first (/latest-version) and downloads
+// the APK via /latest-apk when jsDelivr and GitHub are both unreachable.
+
+const VERSION_JSON_URL =
+  "https://raw.githubusercontent.com/ostad2fan/pompay/main/pampay-coin-alert-github/apk/version.json";
+const APK_URL =
+  "https://raw.githubusercontent.com/ostad2fan/pompay/main/pampay-coin-alert-github/apk/PampDumpCoins-latest.apk";
+
+let versionCache: { at: number; body: string } | null = null;
+
+async function fetchVersionJsonBody(): Promise<string> {
+  if (versionCache && Date.now() - versionCache.at < 5 * 60_000) {
+    return versionCache.body;
+  }
+  const res = await fetch(VERSION_JSON_URL, {
+    headers: { "User-Agent": "pompay-server", Accept: "application/json" },
+  });
+  if (!res.ok) {
+    if (versionCache) return versionCache.body;
+    throw new Error(`github ${res.status}`);
+  }
+  const body = JSON.stringify(await res.json());
+  versionCache = { at: Date.now(), body };
+  return body;
+}
 
 // --- Hourly scheduler (replaces Durable Object alarms) -----------------------
 // Fires once per UTC hour at minute 0 (checked every 20s for precision), plus
