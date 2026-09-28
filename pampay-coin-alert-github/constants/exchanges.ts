@@ -163,6 +163,13 @@ export const EXCHANGES: Record<ExchangeId, ExchangeInfo> = {
     takerFee: 0.001,
     futuresBaseUrl: 'https://api.iranicart.ir',
   },
+  bitperp: {
+    id: 'bitperp',
+    name: 'بیت‌پرپ (BitPerp)',
+    makerFee: 0.0002,
+    takerFee: 0.0005,
+    futuresBaseUrl: 'https://bitperp.com',
+  },
 };
 
 export const EXCHANGE_LIST = Object.values(EXCHANGES);

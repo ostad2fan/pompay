@@ -9,7 +9,6 @@
   "main": "dist/index.js",
   "scripts": {
     "start": "node dist/index.js",
-    "start:js": "node index.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

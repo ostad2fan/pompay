@@ -21,7 +21,8 @@ export type ExchangeId =
   | 'huobi'
   | 'nobitex'
   | 'arzinja'
-  | 'iranicart';
+  | 'iranicart'
+  | 'bitperp';
 
 export type SignalType = 'pump' | 'dump';
 

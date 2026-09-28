@@ -28,7 +28,7 @@ export const APP_VERSION_CODE = 7;
  * GitHub repository of this project (ostad2fan/pompay).
  */
 export const DEFAULT_UPDATE_URL =
-  'https://raw.githubusercontent.com/ostad2fan/pompay/main/apk/version.json';
+  'https://raw.githubusercontent.com/ostad2fan/pompay/main/pampay-coin-alert-github/apk/version.json';
 
 const UPDATE_URL_KEY = '@app_update_check_url';
 const DISMISSED_KEY = '@app_update_dismissed_version';

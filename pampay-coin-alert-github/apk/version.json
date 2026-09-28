@@ -1,7 +1,7 @@
 {
   "latestVersion": "1.4.2",
   "versionCode": 7,
-  "apkUrl": "https://raw.githubusercontent.com/ostad2fan/pompay/main/apk/PampDumpCoins-latest.apk",
+  "apkUrl": "https://raw.githubusercontent.com/ostad2fan/pompay/main/pampay-coin-alert-github/apk/PampDumpCoins-latest.apk",
   "updatedAt": "2026-09-28",
-  "notes": "نسخه ۱.۴.۲: فایل فایربیس (google-services.json) در برنامه قرار گرفت — پوش نوتیفیکیشن اکنون روی اندروید کامل و فعال است (علاوه بر تلگرام). دکمه «تست نمایش نوتیفیکیشن» در تنظیمات برای اطمینان. حجم APK حدود ۱۷ مگابایت."
+  "notes": "نسخه ۱.۴.۲: صرافی BitPerp (بیت‌پرپ) به لیست صرافی‌ها اضافه شد — کلید API آن را در بخش مدیریت دارایی می‌توانید وارد کنید + بهبود پایداری. ⚠️ نکته نصب: این نسخه با کلید امضای جدید ساخته شده؛ اگر روی نسخه ۱.۴.۱ یا قدیمی‌تر نصب بود، یک بار برنامه را حذف و بعد این نسخه را نصب کنید (داده‌های برنامه در گیت‌هاب و تلگرام شما محفوظ است، فقط تنظیمات داخلی برنامه ریست می‌شود)."
 }

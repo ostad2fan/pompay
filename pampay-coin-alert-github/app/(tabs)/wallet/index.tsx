@@ -791,7 +791,123 @@ async function fetchNobitexBalance(wallet: ExchangeWallet): Promise<WalletBalanc
 
 async function fetchGenericBalance(wallet: ExchangeWallet): Promise<WalletBalance[]> {
   console.log(`[Wallet] Exchange ${wallet.exchangeId} - trying Binance-compatible API...`);
-  throw new Error(`صرافی ${wallet.exchangeName} فعلاً پشتیبانی نمی‌شود. فقط Binance، Bybit و OKX پشتیبانی می‌شوند.`);
+  throw new Error(`صرافی ${wallet.exchangeName} فعلاً پشتیبانی نمی‌شود. فقط Binance، Bybit، OKX، BitPerp، Nobitex و Arzinja پشتیبانی می‌شوند.`);
+}
+
+/**
+ * BitPerp (بیت‌پرپ) — صرافی فیوچرز دائمی با REST API اختصاصی
+ * (backend از نوع FastAPI؛ مسیرهای /api/balance و /api/positions).
+ * مستندات عمومی ندارد؛ طرح هدر احراز هویت به‌ترتیب امتحان می‌شود
+ * (X-API-KEY بعد Authorization Bearer) و پاسخ انعطاف‌پذیر parse می‌شود.
+ */
+async function bitperpRequest(
+  wallet: ExchangeWallet,
+  path: string
+): Promise<{ status: number; ok: boolean; data: unknown } | null> {
+  const schemes: Array<Record<string, string>> = [
+    { 'X-API-KEY': wallet.apiKey, 'X-API-SECRET': wallet.apiSecret },
+    { Authorization: `Bearer ${wallet.apiKey}` },
+    { 'X-MBX-APIKEY': wallet.apiKey },
+  ];
+  for (const headers of schemes) {
+    try {
+      const res = await fetch(`https://bitperp.com${path}`, { headers });
+      if (res.status === 401 || res.status === 403) continue; // طرح بعدی را امتحان کن
+      const text = await res.text();
+      let data: unknown = null;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        return { status: res.status, ok: false, data: null }; // صفحه HTML SPA — نه API
+      }
+      return { status: res.status, ok: res.ok, data };
+    } catch (e) {
+      console.log('[Wallet] BitPerp request error:', e);
+    }
+  }
+  return null;
+}
+
+/** Parse انعطاف‌پذیر لیست دارایی‌ها از اشکال مختلف پاسخ BitPerp. */
+function parseBitperpBalances(payload: unknown): WalletBalance[] {
+  const balances: WalletBalance[] = [];
+  let root: any = payload;
+  if (root && typeof root === 'object' && !Array.isArray(root) && 'data' in root) {
+    root = (root as Record<string, unknown>).data;
+  }
+  if (root && typeof root === 'object' && !Array.isArray(root)) {
+    for (const key of ['balances', 'coins', 'assets', 'list', 'rows', 'wallet']) {
+      const candidate = (root as Record<string, unknown>)[key];
+      if (Array.isArray(candidate)) {
+        root = candidate;
+        break;
+      }
+    }
+  }
+  if (!Array.isArray(root)) return balances;
+
+  for (const item of root) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    const asset = String(
+      rec.asset ?? rec.coin ?? rec.currency ?? rec.symbol ?? ''
+    ).toUpperCase();
+    if (!asset) continue;
+    const total = parseFloat(
+      String(rec.total ?? rec.balance ?? rec.amount ?? rec.equity ?? rec.walletBalance ?? '0')
+    );
+    if (!Number.isFinite(total) || total <= 0.0001) continue;
+    const freeRaw = parseFloat(
+      String(
+        rec.available ?? rec.free ?? rec.availableBalance ?? rec.availableToWithdraw ?? rec.usable ?? total
+      )
+    );
+    const free = Number.isFinite(freeRaw) ? freeRaw : total;
+    const valueUsd =
+      parseFloat(String(rec.usdValue ?? rec.valueUsd ?? rec.value ?? '0')) || 0;
+    balances.push({
+      asset,
+      free,
+      locked: Math.max(total - free, 0),
+      total,
+      valueUsd,
+      section: 'futures',
+    });
+  }
+  return balances;
+}
+
+async function fetchBitperpBalance(wallet: ExchangeWallet): Promise<WalletBalance[]> {
+  console.log('[Wallet] Fetching BitPerp balance...');
+  const res = await bitperpRequest(wallet, '/api/balance');
+
+  if (!res || !res.ok) {
+    const status = res?.status ?? 0;
+    if (status === 401 || status === 403) {
+      throw new Error('کلید API بیت‌پرپ قبول نشد — کلید API را در سایت BitPerp بسازید و دوباره امتحان کنید.');
+    }
+    throw new Error(
+      `اتصال به BitPerp ناموفق بود${status ? ` (کد ${status})` : ''} — کلید شما ذخیره شد؛ اگر API این صرافی محدود بود در نسخه بعدی تکمیل می‌شود.`
+    );
+  }
+
+  const balances = parseBitperpBalances(res.data);
+
+  // ارزش‌گذاری دارایی‌هایی که بدون ارزش دلاری برگشته‌اند
+  try {
+    const priceMap = await getUsdPriceMap();
+    for (const bal of balances) {
+      if (bal.valueUsd > 0) continue;
+      const stable = stableCoinValueUsd(bal.asset, bal.total);
+      if (stable !== null) {
+        bal.valueUsd = stable;
+      } else if (priceMap[`${bal.asset}USDT`]) {
+        bal.valueUsd = bal.total * priceMap[`${bal.asset}USDT`];
+      }
+    }
+  } catch {}
+
+  return balances;
 }
 
 async function fetchExchangeBalance(wallet: ExchangeWallet): Promise<ExchangeBalanceData> {
@@ -815,6 +931,9 @@ async function fetchExchangeBalance(wallet: ExchangeWallet): Promise<ExchangeBal
       case 'arzinja':
       case 'nobitex':
         balances = await fetchNobitexBalance(wallet);
+        break;
+      case 'bitperp':
+        balances = await fetchBitperpBalance(wallet);
         break;
       default:
         balances = await fetchGenericBalance(wallet);

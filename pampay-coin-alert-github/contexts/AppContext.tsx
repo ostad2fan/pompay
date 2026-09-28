@@ -35,8 +35,8 @@ import {
   updateHookReversalTimeframes,
 } from '@/utils/hookReversalService';
 import { fetchServerSignals, fetchServerPumpDumpSignals, syncScanConfig } from '@/utils/scanServerApi';
-import { setThemeMode as applyPalette, getThemeMode, type ThemeMode } from '@/constants/colors';
 import { registerPushOnServer, ensureNotificationPermission } from '@/utils/pushService';
+import { setThemeMode as applyPalette, getThemeMode, type ThemeMode } from '@/constants/colors';
 
 const DEFAULT_SETTINGS: AppSettings = {
   apiKey: '',
@@ -70,6 +70,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   telegramChatId: '',
   telegramEnabled: false,
   themeMode: 'dark' as ThemeMode,
+  autoScanEnabled: false,
 };
 
 const SETTINGS_KEY = '@crypto_scanner_settings';
@@ -214,19 +215,32 @@ export const [AppProvider, useApp] = createContextHook(() => {
   const scanMutation = useMutation({
     mutationFn: async () => {
       console.log('[AppContext] Starting full scan...');
+      // 1) Direct Binance scan (fast when reachable from the phone).
+      let results: TradeSignal[] = [];
       try {
-        const results = await scanAllSignals(settings.volumeThreshold);
-        return results;
-      } catch (directError) {
-        // Binance API is geo-blocked on many Iranian mobile networks — fall back
-        // to the server-computed pump/dump scan (the Railway server can reach Binance).
-        console.log('[AppContext] Direct scan failed, trying server fallback...', directError);
-        const serverSignals = await fetchServerPumpDumpSignals(settings.volumeThreshold);
-        if (serverSignals && serverSignals.length > 0) {
-          return serverSignals;
-        }
-        throw directError;
+        results = await scanAllSignals(settings.volumeThreshold);
+      } catch (e) {
+        console.log('[AppContext] Direct Binance scan failed, falling back to server:', e);
       }
+      // 2) Server fallback — the Railway backend can always reach Binance
+      // (geo-blocked regions like Iran get signals this way).
+      if (results.length === 0) {
+        try {
+          const serverSignals = await fetchServerPumpDumpSignals(settings.volumeThreshold);
+          if (serverSignals && serverSignals.length > 0) {
+            console.log(`[AppContext] Using ${serverSignals.length} server-computed pump/dump signals`);
+            results = serverSignals;
+          }
+        } catch (e) {
+          console.log('[AppContext] Server pump/dump fallback failed:', e);
+        }
+      }
+      if (results.length === 0) {
+        throw new Error(
+          'اتصال به بایننس و سرور اسکن ناموفق بود — اینترنت یا آدرس سرور را بررسی کنید'
+        );
+      }
+      return results;
     },
     onSuccess: async (results) => {
       let filteredResults = results;
@@ -267,6 +281,13 @@ export const [AppProvider, useApp] = createContextHook(() => {
   useEffect(() => {
     if (settings.notificationsEnabled) {
       registerForPushNotifications();
+      // Auto-register the device push token with the scan server (best-effort
+      // — Telegram remains the always-on channel when push isn't configured).
+      ensureNotificationPermission().then((granted) => {
+        if (granted) {
+          registerPushOnServer().catch(() => {});
+        }
+      });
     }
   }, [settings.notificationsEnabled]);
 
@@ -478,20 +499,20 @@ export const [AppProvider, useApp] = createContextHook(() => {
     [settings]
   );
 
+  // Auto-scan persistence: the toggle state lives in settings (AsyncStorage),
+  // so it survives app restarts — if it was ON, scanning resumes automatically.
   const startAutoScan = useCallback(() => {
     if (scanIntervalRef.current) {
       clearInterval(scanIntervalRef.current);
-    }
-    // Persist the ON state so auto-scan resumes after app restarts
-    // (previously the toggle always reset to OFF on reopen).
-    if (settings.autoScanEnabled !== true) {
-      saveSettingsMutation.mutate({ ...settings, autoScanEnabled: true });
     }
     scanMutation.mutate();
     scanIntervalRef.current = setInterval(() => {
       scanMutation.mutate();
     }, settings.scanInterval * 1000);
-  }, [settings]);
+    if (settings.autoScanEnabled !== true) {
+      updateSettings({ autoScanEnabled: true });
+    }
+  }, [settings.scanInterval, settings.autoScanEnabled]);
 
   const stopAutoScan = useCallback(() => {
     if (scanIntervalRef.current) {
@@ -499,28 +520,21 @@ export const [AppProvider, useApp] = createContextHook(() => {
       scanIntervalRef.current = null;
     }
     if (settings.autoScanEnabled === true) {
-      saveSettingsMutation.mutate({ ...settings, autoScanEnabled: false });
+      updateSettings({ autoScanEnabled: false });
     }
-  }, [settings]);
+  }, [settings.autoScanEnabled]);
 
-  // Auto-resume the persisted auto-scan mode as soon as settings load.
-  const autoScanResumedRef = useRef(false);
+  // Resume auto-scan automatically when the app (re)opens with the toggle ON.
   useEffect(() => {
-    if (settings.autoScanEnabled === true && !autoScanResumedRef.current) {
-      autoScanResumedRef.current = true;
-      startAutoScan();
+    if (settings.autoScanEnabled === true && !scanIntervalRef.current) {
+      console.log('[AppContext] Auto-scan was ON — resuming');
+      scanMutation.mutate();
+      scanIntervalRef.current = setInterval(() => {
+        scanMutation.mutate();
+      }, settings.scanInterval * 1000);
     }
-  }, [settings.autoScanEnabled, startAutoScan]);
-
-  // Register for native push notifications on launch (non-fatal — Telegram
-  // remains the always-on background-alerts channel).
-  useEffect(() => {
-    ensureNotificationPermission().then((granted) => {
-      if (granted) {
-        registerPushOnServer().catch(() => {});
-      }
-    });
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.autoScanEnabled, settings.scanInterval]);
 
   useEffect(() => {
     if (settings.telegramEnabled && settings.telegramBotToken && settings.telegramChatId) {
@@ -542,6 +556,10 @@ export const [AppProvider, useApp] = createContextHook(() => {
       gainzTimeframes: settings.gainzTimeframes ?? ['1d'],
       hookEnabled: settings.hookReversalNotifications !== false,
       hookTimeframes: settings.hookTimeframes ?? ['1d'],
+      scannerEnabled: settings.scannerNotifications !== false,
+      memeEnabled: settings.memeShortNotifications !== false,
+      preListingEnabled: settings.preListingNotifications !== false,
+      volumeThreshold: settings.volumeThreshold,
     });
   }, [
     settings.telegramEnabled,
@@ -551,6 +569,10 @@ export const [AppProvider, useApp] = createContextHook(() => {
     settings.gainzTimeframes,
     settings.hookReversalNotifications,
     settings.hookTimeframes,
+    settings.scannerNotifications,
+    settings.memeShortNotifications,
+    settings.preListingNotifications,
+    settings.volumeThreshold,
   ]);
 
   // Pull the signals the server computed while the app was closed into local
