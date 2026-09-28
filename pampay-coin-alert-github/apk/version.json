@@ -1,0 +1,7 @@
+{
+  "latestVersion": "1.4.1",
+  "versionCode": 6,
+  "apkUrl": "https://raw.githubusercontent.com/ostad2fan/pompay/main/pampay-coin-alert-github/apk/PampDumpCoins-latest.apk",
+  "updatedAt": "2026-09-28",
+  "notes": "نسخه ۱.۴.۱: پوش نوتیفیکیشن فعال شد (projectId اکسپو در برنامه ثبت شد) + دکمه «تست نمایش نوتیفیکیشن» در تنظیمات + حجم APK حدوداً نصف شد (مخصوص آپلود در گیت‌هاب — فقط معماری arm64) + افزایش پایداری نصب روی نسخه قبلی. برای رسیدن نوتیف با برنامه بسته، مسیر تلگرام فعال است و پوش بعد از افزودن google-services.json فایربیس کامل می‌شود."
+}
