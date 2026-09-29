@@ -13,7 +13,7 @@ import {
   HOOK_TF_LABEL,
   getStoredHookSignals,
 } from './hookReversalService';
-import { fetchServerSignals } from './scanServerApi';
+import { fetchServerSignals, serverSupportsBotCommands, fetchPendingBotCommands, ackBotCommands } from './scanServerApi';
 
 const SETTINGS_KEY = '@crypto_scanner_settings';
 const SIGNALS_KEY = '@crypto_scanner_signals';
@@ -950,6 +950,34 @@ async function pollTelegramUpdates(): Promise<void> {
       return;
     }
 
+    // v1.4.3: when the server handles bot commands 24/7 (getUpdates), the
+    // app must NOT also poll getUpdates (the two would race and updates
+    // would be consumed unpredictably). Instead it fetches the commands the
+    // server queued for it (those needing app-local data) and answers them.
+    const serverMode = await serverSupportsBotCommands();
+    if (serverMode) {
+      const pending = await fetchPendingBotCommands();
+      if (pending.length === 0) {
+        isPolling = false;
+        return;
+      }
+      const answeredIds: number[] = [];
+      for (const cmd of pending.slice(0, 10)) {
+        try {
+          console.log(`[Telegram] Answering queued command ${cmd.command} from server`);
+          await handleCommand(cmd.command, tg.telegramBotToken, cmd.chatId);
+          answeredIds.push(cmd.id);
+        } catch (e) {
+          console.log('[Telegram] Queued command error:', e);
+        }
+      }
+      await ackBotCommands(answeredIds);
+      isPolling = false;
+      return;
+    }
+
+    // Legacy mode: no server command support → the app polls getUpdates
+    // itself (commands only answered while the app is open).
     const offset = await getLastOffset();
 
     const url = `https://api.telegram.org/bot${tg.telegramBotToken}/getUpdates?offset=${offset + 1}&limit=10&timeout=0`;
@@ -989,13 +1017,20 @@ async function pollTelegramUpdates(): Promise<void> {
   isPolling = false;
 }
 
+/**
+ * Starts the bot command listener (v1.4.3 smart mode):
+ *  - server handles commands 24/7 → app answers only the queued
+ *    app-local commands (/balance /positions /signals /whale);
+ *  - server without command support → legacy local getUpdates polling.
+ * Called automatically from AppContext when Telegram is enabled.
+ */
 export function startTelegramPolling(): void {
   if (pollingInterval) {
     clearInterval(pollingInterval);
     pollingInterval = null;
   }
 
-  console.log('[Telegram] Starting bot polling (every 3s)...');
+  console.log('[Telegram] Starting bot command listener (every 3s)...');
   pollTelegramUpdates();
   pollingInterval = setInterval(pollTelegramUpdates, 3000);
 }

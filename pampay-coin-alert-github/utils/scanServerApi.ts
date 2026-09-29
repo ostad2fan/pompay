@@ -240,3 +240,91 @@ export async function fetchServerPumpDumpSignals(
     return null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// v1.4.3 — server-side Telegram bot commands
+//
+// The server answers bot commands 24/7 (even with the app closed). Commands
+// that need app-local data (/balance /positions /signals /whale) are queued
+// server-side; the app fetches them here and answers, then acks.
+// ---------------------------------------------------------------------------
+
+/** A command queued by the server, waiting for the app to answer it. */
+export interface PendingBotCommand {
+  id: number;
+  command: string;
+  chatId: string;
+  receivedAt: number;
+}
+
+let botCommandsSupportCache: { at: number; supported: boolean } | null = null;
+const SUPPORT_CACHE_MS = 10 * 60_000;
+
+/**
+ * Whether the configured server supports server-side bot command handling
+ * (/scan/status → serverBotCommands). When true the app stops its own
+ * getUpdates polling (the server consumes updates instead). Cached 10 min.
+ */
+export async function serverSupportsBotCommands(): Promise<boolean> {
+  if (botCommandsSupportCache && Date.now() - botCommandsSupportCache.at < SUPPORT_CACHE_MS) {
+    return botCommandsSupportCache.supported;
+  }
+  const serverUrl = await getServerUrl();
+  if (!serverUrl) return false;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12_000);
+    const res = await fetch(`${serverUrl}/scan/status`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    clearTimeout(timer);
+    if (!res.ok) return false;
+    const data = (await res.json()) as { serverBotCommands?: boolean };
+    const supported = data?.serverBotCommands === true;
+    botCommandsSupportCache = { at: Date.now(), supported };
+    return supported;
+  } catch {
+    // Network error → don't cache; assume the old behavior (local polling)
+    // so commands keep working while the server is unreachable.
+    return false;
+  }
+}
+
+/** Resets the support cache (e.g. after the user changes the server URL). */
+export function resetBotCommandsSupportCache(): void {
+  botCommandsSupportCache = null;
+}
+
+/** Queued commands the app should answer (empty when the secret doesn't match). */
+export async function fetchPendingBotCommands(): Promise<PendingBotCommand[]> {
+  const serverUrl = await getServerUrl();
+  if (!serverUrl) return [];
+  try {
+    const res = await fetch(
+      `${serverUrl}/bot/pending?secret=${encodeURIComponent(await getInstallSecret())}`,
+      { headers: { Accept: 'application/json' } }
+    );
+    if (!res.ok) return [];
+    const data = (await res.json()) as { commands?: PendingBotCommand[] };
+    return Array.isArray(data.commands) ? data.commands : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Marks queued commands as answered (after the app replied to the user). */
+export async function ackBotCommands(ids: number[]): Promise<void> {
+  if (ids.length === 0) return;
+  const serverUrl = await getServerUrl();
+  if (!serverUrl) return;
+  try {
+    await fetch(`${serverUrl}/bot/ack`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret: await getInstallSecret(), ids }),
+    });
+  } catch {
+    // non-fatal — the command stays queued and will be re-answered later
+  }
+}

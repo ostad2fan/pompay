@@ -1193,16 +1193,16 @@ export default function SettingsScreen() {
             disabled={updateBusy}
             onPress={async () => {
               setUpdateBusy(true);
-              setUpdateStatus('⏳ در حال بررسی نسخه...');
+              setUpdateStatus('⏳ در حال بررسی نسخه (سرور برنامه → CDN → گیت‌هاب)...');
               const r = await fetchUpdateInfo();
               if (r) {
                 if (r.available) {
-                  setUpdateStatus(`✅ نسخه جدید ${r.latestVersion} موجود است — دکمه بروزرسانی فعال شد`);
+                  setUpdateStatus(`✅ نسخه جدید ${r.latestVersion} موجود است — دکمه بروزرسانی فعال شد${r.source ? ` (بررسی از ${r.source})` : ''}`);
                 } else {
-                  setUpdateStatus('✅ برنامه شما به‌روز است');
+                  setUpdateStatus(`✅ برنامه شما به‌روز است${r.source ? ` (بررسی از ${r.source})` : ''}`);
                 }
               } else {
-                setUpdateStatus('❌ دریافت اطلاعات نسخه ناموفق بود — اینترنت یا آدرس گیت‌هاب را چک کنید');
+                setUpdateStatus('❌ هیچ‌کدام از مسیرهای بررسی (سرور برنامه، CDN و گیت‌هاب) پاسخ ندادند — اینترنت گوشی را چک کنید و دوباره بزنید');
               }
               setUpdateBusy(false);
             }}
