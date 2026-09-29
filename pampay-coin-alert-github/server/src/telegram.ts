@@ -3,12 +3,29 @@
 // multiple messages (Telegram hard limit: 4096 chars per message) so ALL
 // signals are announced — no more 10-signal caps.
 
+import store from "./store";
+
 export interface TelegramTarget {
   botToken: string;
   chatId: string;
 }
 
 const MAX_LEN = 3800;
+
+// v1.4.4 — remember the LAST send outcome so /scan/status and /bot/test can
+// explain WHY Telegram messages might not be arriving (revoked token, wrong
+// chat id, network hiccup). Null = every send so far succeeded. Persisted in
+// the store so a restart doesn't lose the diagnosis.
+let lastTelegramError: { at: number; error: string } | null = null;
+
+export async function getLastTelegramError(): Promise<{ at: number; error: string } | null> {
+  if (lastTelegramError) return lastTelegramError;
+  try {
+    return await store.get<{ at: number; error: string }>("lastTelegramError");
+  } catch {
+    return null;
+  }
+}
 
 export function splitTelegramText(text: string, limit: number = MAX_LEN): string[] {
   if (text.length <= limit) return [text];
@@ -64,6 +81,8 @@ export async function sendTelegram(
       );
       if (!res.ok) {
         const body = await res.text().catch(() => "");
+        lastTelegramError = { at: Date.now(), error: `HTTP ${res.status}: ${body.slice(0, 200)}` };
+        void store.put("lastTelegramError", lastTelegramError);
         console.log(
           `[Telegram] send failed (${res.status}) part ${i + 1}/${chunks.length}: ${body.slice(0, 200)}`
         );
@@ -71,9 +90,16 @@ export async function sendTelegram(
       }
       if (i > 0) await sleep(400); // stay under the bot rate limit
     } catch (e) {
+      lastTelegramError = { at: Date.now(), error: String(e).slice(0, 200) };
+      void store.put("lastTelegramError", lastTelegramError);
       console.log("[Telegram] send error:", e);
       allOk = false;
     }
+  }
+  if (allOk) {
+    lastTelegramError = null;
+    void store.put("lastTelegramError", null);
+    void store.put("lastTelegramSuccessAt", Date.now());
   }
   return allOk;
 }

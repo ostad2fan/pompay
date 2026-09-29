@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo, useEffect } from 'react';
+import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -34,6 +34,8 @@ import { createThemedStyles } from '@/utils/themeStyles';
 import { EXCHANGE_LIST } from '@/constants/exchanges';
 import { ExchangeId } from '@/types/crypto';
 import DropdownPicker from '@/components/DropdownPicker';
+import VpnWarningBanner from '@/components/VpnWarningBanner';
+import { isForeignExchange } from '@/utils/vpnGuard';
 import { useApp } from '@/contexts/AppContext';
 import { fetchUsdtTomanPrice, formatToman, arzinjaAuthHeaders } from '@/utils/nobitexApi';
 import {
@@ -1442,7 +1444,7 @@ async function fetchExchangeBalance(wallet: ExchangeWallet): Promise<ExchangeBal
 export default function WalletScreen() {
   const queryClient = useQueryClient();
   const { settings } = useApp();
-  const [activeTab, setActiveTab] = useState<string>('all');
+  const [expandedWallet, setExpandedWallet] = useState<string | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
   const [selectedExchange, setSelectedExchange] = useState<ExchangeId>('binance');
   const [newApiKey, setNewApiKey] = useState('');
@@ -1651,6 +1653,20 @@ export default function WalletScreen() {
     Alert.alert('موفق', `صرافی ${exchangeInfo?.name} اضافه شد`);
   }, [newApiKey, newApiSecret, newPassphrase, selectedExchange, wallets, needsPassphrase, isBitperp, saveMutation]);
 
+  // BitPerp — ورود خودکار: به‌محض کامل شدن کد ۶ رقمی، تأیید و ذخیره انجام می‌شود
+  // (کاربر لازم نیست دکمه‌ای بزند؛ دکمه «ورود» هم برای حالت دستی مانده است).
+  const lastOtpRef = useRef('');
+  useEffect(() => {
+    if (!isBitperp) return;
+    const code = newApiSecret.trim();
+    if (/^\d{6}$/.test(code) && code !== lastOtpRef.current) {
+      lastOtpRef.current = code;
+      void handleAddWallet();
+    } else if (code.length < 6) {
+      lastOtpRef.current = '';
+    }
+  }, [newApiSecret, isBitperp, handleAddWallet]);
+
   const handleRemoveWallet = useCallback(
     (id: string, name: string) => {
       Alert.alert('حذف صرافی', `آیا از حذف "${name}" اطمینان دارید؟`, [
@@ -1664,12 +1680,11 @@ export default function WalletScreen() {
             queryClient.removeQueries({ queryKey: ['exchange-balance', id] });
             queryClient.removeQueries({ queryKey: ['exchange-pnl', id] });
             AsyncStorage.removeItem(BALANCE_CACHE_PREFIX + id).catch(() => {});
-            if (activeTab === id) setActiveTab('all');
           },
         },
       ]);
     },
-    [wallets, activeTab, saveMutation]
+    [wallets, saveMutation]
   );
 
   const handleRefreshAll = useCallback(() => {
@@ -1679,8 +1694,12 @@ export default function WalletScreen() {
     queryClient.invalidateQueries({ queryKey: ['usdt-toman-price'] });
   }, [wallets]);
 
-  const activeWallet = activeTab !== 'all' ? wallets.find((w) => w.id === activeTab) : undefined;
-  const activeWalletIndex = activeWallet ? wallets.findIndex((w) => w.id === activeWallet.id) : -1;
+  // هشدار فیلترشکن فقط وقتی معنی دارد که صرافی خارجی متصل است (یا در حال
+  // افزودن آن هستیم) — صرافی‌های ایرانی با IP ایران مشکلی ندارند.
+  const hasForeignWallet = useMemo(
+    () => wallets.some((w) => isForeignExchange(w.exchangeId)),
+    [wallets]
+  );
 
   return (
     <ScrollView
@@ -1688,49 +1707,12 @@ export default function WalletScreen() {
       contentContainerStyle={styles.content}
       showsVerticalScrollIndicator={false}
     >
-      {/* ── سربرگ‌ها (tabs): همه + هر صرافی ── */}
-      {wallets.length > 0 && (
-        <View>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.tabBar}
-          >
-            <Pressable
-              style={[styles.tabChip, activeTab === 'all' && styles.tabChipActive]}
-              onPress={() => setActiveTab('all')}
-            >
-              <Text style={[styles.tabChipText, activeTab === 'all' && styles.tabChipTextActive]}>
-                همه ({wallets.length})
-              </Text>
-            </Pressable>
-            {wallets.map((w) => {
-              const data = balanceByWalletId[w.id];
-              const active = activeTab === w.id;
-              return (
-                <Pressable
-                  key={w.id}
-                  style={[styles.tabChip, active && styles.tabChipActive]}
-                  onPress={() => setActiveTab(w.id)}
-                >
-                  <Text style={[styles.tabChipText, active && styles.tabChipTextActive]}>
-                    {w.exchangeName.replace(/\s*\(.*\)\s*/, '')}
-                  </Text>
-                  <Text style={[styles.tabChipValue, active && styles.tabChipTextActive]}>
-                    {data
-                      ? `$${data.totalValueUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}`
-                      : '...'}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </ScrollView>
-        </View>
-      )}
+      {/* ── هشدار امنیتی: فیلترشکن خاموش ── */}
+      <VpnWarningBanner
+        show={hasForeignWallet || (showAddForm && isForeignExchange(selectedExchange))}
+      />
 
-      {activeTab === 'all' || !activeWallet ? (
-        <>
-          {/* ── سربرگ «همه» — کل دارایی یکجا ── */}
+      {/* ── کارت مجموع دارایی‌ها ── */}
           <View style={styles.portfolioCard}>
             <View style={styles.portfolioHeader}>
               <Wallet size={20} color={colors.dark.accent} />
@@ -1787,110 +1769,52 @@ export default function WalletScreen() {
               )}
             </View>
 
+            {/* ── تفکیک هر صرافی: مجموع کل دارایی همان صرافی ── */}
+            {wallets.length > 0 && (
+              <View style={styles.portfolioBreakdown}>
+                {wallets.map((w) => {
+                  const data = balanceByWalletId[w.id];
+                  return (
+                    <View key={w.id} style={styles.portfolioBreakdownRow}>
+                      <Text style={styles.portfolioBreakdownName}>{w.exchangeName}</Text>
+                      <Text style={styles.portfolioBreakdownValue}>
+                        {data
+                          ? `$${data.totalValueUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}`
+                          : '—'}
+                      </Text>
+                    </View>
+                  );
+                })}
+              </View>
+            )}
+
             <Text style={styles.portfolioSub}>{wallets.length} صرافی متصل</Text>
           </View>
 
-          {/* ── دارایی همه صرافی‌ها یکجا (به تفکیک صرافی) ── */}
-          {wallets.map((wallet, idx) => {
-            const data = balanceByWalletId[wallet.id];
-            const isLoading = balanceQueries[idx]?.isLoading;
-            const isFetching = balanceQueries[idx]?.isFetching;
-            const error = balanceQueries[idx]?.error;
-            return (
-              <View key={wallet.id} style={styles.walletCard}>
-                <Pressable
-                  style={styles.walletHeader}
-                  onPress={() => setActiveTab(wallet.id)}
-                >
-                  <View style={styles.walletLeft}>
-                    <View style={styles.walletIcon}>
-                      <Key size={18} color={colors.dark.blue} />
-                    </View>
-                    <View style={styles.walletInfo}>
-                      <Text style={styles.walletName}>{wallet.exchangeName}</Text>
-                      <Text style={styles.walletKey}>
-                        {wallet.exchangeId === 'bitperp'
-                          ? wallet.apiKey
-                          : `${wallet.apiKey.slice(0, 8)}...${wallet.apiKey.slice(-4)}`}
-                      </Text>
-                    </View>
-                  </View>
-                  <View style={styles.walletRight}>
-                    <View style={styles.walletHeaderTop}>
-                      <Text style={styles.walletTotal}>
-                        ${(data?.totalValueUsd ?? 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}
-                      </Text>
-                      {usdtToToman > 0 && data?.totalValueUsd !== undefined && (
-                        <Text style={styles.walletToman}>
-                          ≈ {formatToman((data.totalValueUsd ?? 0) * usdtToToman)} ت
-                        </Text>
-                      )}
-                      {(isFetching || isLoading) && (
-                        <ActivityIndicator size="small" color={colors.dark.accent} />
-                      )}
-                      <ChevronDown size={16} color={colors.dark.textMuted} />
-                    </View>
-                    {data?.totalPnlUsd !== undefined && data.totalPnlUsd !== 0 && (
-                      <Text
-                        style={[
-                          styles.walletPnl,
-                          { color: data.totalPnlUsd > 0 ? colors.dark.green : colors.dark.red },
-                        ]}
-                      >
-                        {data.totalPnlUsd > 0 ? '▲' : '▼'} {formatSignedUsd(data.totalPnlUsd)}
-                      </Text>
-                    )}
-                  </View>
-                </Pressable>
-
-                {error ? (
-                  <View style={styles.balanceError}>
-                    <ShieldAlert size={14} color={colors.dark.red} />
-                    <Text style={styles.balanceErrorText}>
-                      {error instanceof Error ? error.message : 'خطا در دریافت موجودی — مطمئن شوید API معتبر است'}
-                    </Text>
-                  </View>
-                ) : isLoading && !data ? (
-                  <View style={styles.balanceLoading}>
-                    <ActivityIndicator size="small" color={colors.dark.accent} />
-                    <Text style={styles.balanceLoadingText}>دریافت موجودی...</Text>
-                  </View>
-                ) : (
-                  data && (
-                    <View style={styles.walletExpanded}>
-                      <AssetGroupList balances={data.balances} usdtToToman={usdtToToman} />
-                      {data.balances.length === 0 && (
-                        <Text style={styles.noBalance}>موجودی‌ای یافت نشد</Text>
-                      )}
-                    </View>
-                  )
-                )}
-              </View>
-            );
-          })}
-
-          {wallets.length === 0 && !showAddForm && (
-            <View style={styles.emptyState}>
-              <Wallet size={48} color={colors.dark.textMuted} />
-              <Text style={styles.emptyTitle}>صرافی‌ای اضافه نشده</Text>
-              <Text style={styles.emptySubtitle}>
-                با افزودن API صرافی، موجودی و ارزش دارایی‌های خود را مشاهده کنید
-              </Text>
-            </View>
-          )}
-        </>
-      ) : (
-        /* ── سربرگ یک صرافی — جزئیات کامل + PnL دوره‌ای ── */
-        <WalletDetail
-          wallet={activeWallet}
+      {/* ── کارت هر صرافی — با فلش باز/بسته می‌شود؛ سربرگ‌های داخلی ── */}
+      {wallets.map((wallet, idx) => (
+        <WalletItem
+          key={wallet.id}
+          wallet={wallet}
+          isExpanded={expandedWallet === wallet.id}
           usdtToToman={usdtToToman}
-          balanceQuery={balanceQueries[activeWalletIndex]}
-          onRemove={() => handleRemoveWallet(activeWallet.id, activeWallet.exchangeName)}
+          balanceQuery={balanceQueries[idx]}
+          onToggle={() => setExpandedWallet(expandedWallet === wallet.id ? null : wallet.id)}
+          onRemove={() => handleRemoveWallet(wallet.id, wallet.exchangeName)}
           onRefresh={() =>
-            queryClient.invalidateQueries({ queryKey: ['exchange-balance', activeWallet.id] })
+            queryClient.invalidateQueries({ queryKey: ['exchange-balance', wallet.id] })
           }
-          onBack={() => setActiveTab('all')}
         />
+      ))}
+
+      {wallets.length === 0 && !showAddForm && (
+        <View style={styles.emptyState}>
+          <Wallet size={48} color={colors.dark.textMuted} />
+          <Text style={styles.emptyTitle}>صرافی‌ای اضافه نشده</Text>
+          <Text style={styles.emptySubtitle}>
+            با افزودن API صرافی، موجودی و ارزش دارایی‌های خود را مشاهده کنید
+          </Text>
+        </View>
       )}
 
       {showAddForm ? (
@@ -2004,7 +1928,9 @@ export default function WalletScreen() {
               onPress={() => void handleAddWallet()}
             >
               <Save size={16} color={colors.dark.background} />
-              <Text style={styles.formBtnSaveText}>ذخیره</Text>
+              <Text style={styles.formBtnSaveText}>
+                {isBitperp ? 'ورود به بیت‌پرپ' : 'ذخیره'}
+              </Text>
             </Pressable>
             <Pressable
               style={[styles.formBtn, styles.formBtnCancel]}
@@ -2041,60 +1967,352 @@ export default function WalletScreen() {
 }
 
 // ---------------------------------------------------------------------------
-// Grouped asset list (spot / Earn / funding / futures / alpha) with the
-// <$1 dust filter. Shared by the overview tab and per-exchange tab.
+// Per-exchange card (collapsible) with INNER section tabs:
+// «همه» (one row per asset, summed across sections) + اسپات/ارن/آلفا/فیوچرز/فاندینگ
 // ---------------------------------------------------------------------------
 
-function AssetGroupList({
-  balances,
-  usdtToToman,
-}: {
-  balances: WalletBalance[];
-  usdtToToman: number;
-}) {
-  const grouped = useMemo(() => {
-    const order: WalletSection[] = ['spot', 'earn', 'funding', 'futures', 'alpha'];
-    const groups: Array<{ section: WalletSection; items: WalletBalance[]; totalUsd: number; pnlUsd: number }> = [];
-    for (const section of order) {
-      const all = balances.filter((b) => (b.section ?? 'spot') === section);
-      if (all.length === 0) continue;
-      const totalUsd = all.reduce((sum, b) => sum + b.valueUsd, 0);
-      const pnlUsd = all.reduce((sum, b) => sum + (b.pnlUsd ?? 0), 0);
-      // v1.4.3 — hide assets under $1 (dust), keep the section total exact.
-      const items = all.filter((b) => b.valueUsd >= DUST_FILTER_USD);
-      if (items.length === 0) continue;
-      groups.push({ section, items, totalUsd, pnlUsd });
-    }
-    return groups;
-  }, [balances]);
+/** Short labels for the inner tab chips. */
+const SECTION_TAB_LABEL: Record<WalletSection, string> = {
+  spot: 'اسپات',
+  earn: 'ارن',
+  funding: 'فاندینگ',
+  futures: 'فیوچرز',
+  alpha: 'آلفا',
+};
 
-  if (grouped.length === 0) return null;
+/** Tab order — matches the user-requested اسپات/ارن/آلفا/فیوچرز/فاندینگ. */
+const SECTION_ORDER: WalletSection[] = ['spot', 'earn', 'alpha', 'futures', 'funding'];
+
+interface AggregatedBalance extends WalletBalance {
+  sections: WalletSection[];
+}
+
+interface WalletItemProps {
+  wallet: ExchangeWallet;
+  isExpanded: boolean;
+  usdtToToman: number;
+  balanceQuery: ReturnType<typeof useQuery<ExchangeBalanceData>>;
+  onToggle: () => void;
+  onRemove: () => void;
+  onRefresh: () => void;
+}
+
+function WalletItem({
+  wallet,
+  isExpanded,
+  usdtToToman,
+  balanceQuery,
+  onToggle,
+  onRemove,
+  onRefresh,
+}: WalletItemProps) {
+  const [activeSection, setActiveSection] = useState<'all' | WalletSection>('all');
+  const data = balanceQuery.data;
+  const isLoading = balanceQuery.isLoading;
+  const isFetching = balanceQuery.isFetching;
+  const hasError = !!balanceQuery.error;
+
+  // Only the sections that actually hold something get a tab.
+  const presentSections = useMemo(() => {
+    if (!data) return [] as WalletSection[];
+    return SECTION_ORDER.filter((s) => data.balances.some((b) => (b.section ?? 'spot') === s));
+  }, [data]);
+
+  // «همه» — one row per asset summed across sections
+  // (e.g. BTC in both اسپات and ارن → a single BTC row with the total).
+  const aggregated = useMemo(() => {
+    if (!data) return [] as AggregatedBalance[];
+    const map = new Map<string, AggregatedBalance>();
+    for (const bal of data.balances) {
+      const section = bal.section ?? 'spot';
+      const existing = map.get(bal.asset);
+      if (existing) {
+        existing.free += bal.free;
+        existing.locked += bal.locked;
+        existing.total += bal.total;
+        existing.valueUsd += bal.valueUsd;
+        if (bal.pnlUsd !== undefined) existing.pnlUsd = (existing.pnlUsd ?? 0) + bal.pnlUsd;
+        if (bal.pnlPercent !== undefined) existing.pnlPercent = bal.pnlPercent;
+        if (bal.avgCost !== undefined) existing.avgCost = bal.avgCost;
+        if (!existing.sections.includes(section)) existing.sections.push(section);
+      } else {
+        map.set(bal.asset, { ...bal, sections: [section] });
+      }
+    }
+    return [...map.values()]
+      .filter((b) => b.valueUsd >= DUST_FILTER_USD)
+      .sort((a, b) => b.valueUsd - a.valueUsd);
+  }, [data]);
+
+  const sectionRows = useMemo(() => {
+    if (!data || activeSection === 'all') return [] as WalletBalance[];
+    return data.balances.filter(
+      (b) => (b.section ?? 'spot') === activeSection && b.valueUsd >= DUST_FILTER_USD
+    );
+  }, [data, activeSection]);
+
+  const futuresPositions = useMemo(
+    () => (data?.futuresPositions ?? []).filter((pos) => pos.notionalUsd >= DUST_FILTER_USD),
+    [data]
+  );
+
+  const sectionTotalUsd = useMemo(
+    () => sectionRows.reduce((sum, b) => sum + b.valueUsd, 0),
+    [sectionRows]
+  );
 
   return (
-    <View style={styles.balanceList}>
-      {grouped.map((group) => (
-        <View key={group.section} style={styles.sectionBlock}>
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>{SECTION_LABEL[group.section]}</Text>
-            <Text style={styles.sectionTotal}>
-              ${group.totalUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}
-              {group.pnlUsd !== 0 && (
-                <Text
-                  style={[
-                    styles.sectionPnl,
-                    { color: group.pnlUsd > 0 ? colors.dark.green : colors.dark.red },
-                  ]}
-                >
-                  {'  '}{formatSignedUsd(group.pnlUsd)}
-                </Text>
-              )}
+    <View style={styles.walletCard}>
+      <Pressable style={styles.walletHeader} onPress={onToggle}>
+        <View style={styles.walletLeft}>
+          <View style={styles.walletIcon}>
+            <Key size={18} color={colors.dark.blue} />
+          </View>
+          <View style={styles.walletInfo}>
+            <Text style={styles.walletName}>{wallet.exchangeName}</Text>
+            <Text style={styles.walletKey}>
+              {wallet.exchangeId === 'bitperp'
+                ? wallet.apiKey
+                : `${wallet.apiKey.slice(0, 8)}...${wallet.apiKey.slice(-4)}`}
             </Text>
           </View>
-          {group.items.map((bal) => (
-            <BalanceRow key={`${group.section}-${bal.asset}`} bal={bal} usdtToToman={usdtToToman} />
-          ))}
         </View>
-      ))}
+        <View style={styles.walletRight}>
+          <View style={styles.walletHeaderTop}>
+            <Text style={styles.walletTotal}>
+              ${(data?.totalValueUsd ?? 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}
+            </Text>
+            {usdtToToman > 0 && data?.totalValueUsd !== undefined && (
+              <Text style={styles.walletToman}>
+                ≈ {formatToman((data.totalValueUsd ?? 0) * usdtToToman)} ت
+              </Text>
+            )}
+            {(isLoading || isFetching) && (
+              <ActivityIndicator size="small" color={colors.dark.accent} />
+            )}
+          </View>
+          {data?.totalPnlUsd !== undefined && data.totalPnlUsd !== 0 && (
+            <Text
+              style={[
+                styles.walletPnl,
+                { color: data.totalPnlUsd > 0 ? colors.dark.green : colors.dark.red },
+              ]}
+            >
+              {data.totalPnlUsd > 0 ? '▲' : '▼'} {formatSignedUsd(data.totalPnlUsd)}
+            </Text>
+          )}
+          <View style={styles.walletActions}>
+            <Pressable style={styles.actionBtn} onPress={onRefresh} hitSlop={6}>
+              <RefreshCw size={14} color={colors.dark.accent} />
+            </Pressable>
+            <Pressable style={styles.actionBtn} onPress={onRemove} hitSlop={6}>
+              <Trash2 size={14} color={colors.dark.red} />
+            </Pressable>
+            {isExpanded ? (
+              <ChevronUp size={16} color={colors.dark.textMuted} />
+            ) : (
+              <ChevronDown size={16} color={colors.dark.textMuted} />
+            )}
+          </View>
+        </View>
+      </Pressable>
+
+      {isExpanded && (
+        <View style={styles.walletExpanded}>
+          {isLoading && !data && (
+            <View style={styles.balanceLoading}>
+              <ActivityIndicator size="small" color={colors.dark.accent} />
+              <Text style={styles.balanceLoadingText}>دریافت موجودی...</Text>
+            </View>
+          )}
+
+          {hasError && (
+            <View style={styles.balanceError}>
+              <ShieldAlert size={14} color={colors.dark.red} />
+              <Text style={styles.balanceErrorText}>
+                {balanceQuery.error instanceof Error
+                  ? balanceQuery.error.message
+                  : 'خطا در دریافت موجودی — مطمئن شوید API معتبر است'}
+              </Text>
+            </View>
+          )}
+
+          {data && data.balances.length > 0 && (
+            <View style={styles.balanceList}>
+              {/* ── سربرگ‌های داخلی: همه + هر بخش ── */}
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.sectionTabBar}
+              >
+                <Pressable
+                  style={[
+                    styles.sectionTabChip,
+                    activeSection === 'all' && styles.sectionTabChipActive,
+                  ]}
+                  onPress={() => setActiveSection('all')}
+                >
+                  <Text
+                    style={[
+                      styles.sectionTabChipText,
+                      activeSection === 'all' && styles.sectionTabChipTextActive,
+                    ]}
+                  >
+                    همه
+                  </Text>
+                </Pressable>
+                {presentSections.map((s) => (
+                  <Pressable
+                    key={s}
+                    style={[
+                      styles.sectionTabChip,
+                      activeSection === s && styles.sectionTabChipActive,
+                    ]}
+                    onPress={() => setActiveSection(s)}
+                  >
+                    <Text
+                      style={[
+                        styles.sectionTabChipText,
+                        activeSection === s && styles.sectionTabChipTextActive,
+                      ]}
+                    >
+                      {SECTION_TAB_LABEL[s]}
+                    </Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+
+              {activeSection === 'all' ? (
+                <>
+                  {aggregated.map((bal) => (
+                    <AggregatedRow key={bal.asset} bal={bal} usdtToToman={usdtToToman} />
+                  ))}
+                  {aggregated.length === 0 && (
+                    <Text style={styles.noBalance}>
+                      موجودی قابل نمایشی نیست (دارایی‌های زیر ۱ دلار مخفی می‌شوند)
+                    </Text>
+                  )}
+
+                  {/* پوزیشن‌های باز فیوچرز */}
+                  {futuresPositions.length > 0 && (
+                    <View style={styles.sectionBlock}>
+                      <View style={styles.sectionHeader}>
+                        <Text style={styles.sectionTitle}>پوزیشن‌های باز فیوچرز</Text>
+                        {data.futuresUnrealizedPnl !== undefined && (
+                          <Text
+                            style={[
+                              styles.sectionTotal,
+                              {
+                                color:
+                                  data.futuresUnrealizedPnl > 0
+                                    ? colors.dark.green
+                                    : colors.dark.red,
+                              },
+                            ]}
+                          >
+                            uPnL: {formatSignedUsd(data.futuresUnrealizedPnl)}
+                          </Text>
+                        )}
+                      </View>
+                      {futuresPositions.map((pos) => (
+                        <FuturesPositionRow key={`${pos.symbol}-${pos.positionSide}`} pos={pos} />
+                      ))}
+                      {data.futuresRealizedPnl !== undefined && (
+                        <Text style={styles.futuresRealized}>
+                          سود/زیان محقق‌شده فیوچرز (کل تاریخچه):{' '}
+                          {formatSignedUsd(data.futuresRealizedPnl)}
+                        </Text>
+                      )}
+                    </View>
+                  )}
+
+                  {/* سود/زیان کل این صرافی */}
+                  {data.totalPnlUsd !== undefined && (
+                    <View style={styles.walletPnlRow}>
+                      <Text style={styles.walletPnlLabel}>سود/زیان کل این صرافی (تقریبی)</Text>
+                      <Text
+                        style={[
+                          styles.walletPnlValue,
+                          {
+                            color:
+                              data.totalPnlUsd > 0 ? colors.dark.green : colors.dark.red,
+                          },
+                        ]}
+                      >
+                        {formatSignedUsd(data.totalPnlUsd)}
+                      </Text>
+                    </View>
+                  )}
+                  {data.pnlNote && <Text style={styles.pnlNote}>{data.pnlNote}</Text>}
+
+                  {/* PnL دوره‌ای ۳۰/۹۰/۱۸۰/۳۶۰ روز — دقیقاً از خود صرافی */}
+                  <PnlPeriodSection wallet={wallet} />
+                </>
+              ) : (
+                <>
+                  <View style={styles.sectionHeader}>
+                    <Text style={styles.sectionTitle}>{SECTION_LABEL[activeSection]}</Text>
+                    <Text style={styles.sectionTotal}>
+                      ${sectionTotalUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}
+                    </Text>
+                  </View>
+                  {sectionRows.map((bal) => (
+                    <BalanceRow
+                      key={`${activeSection}-${bal.asset}`}
+                      bal={bal}
+                      usdtToToman={usdtToToman}
+                    />
+                  ))}
+                  {activeSection === 'futures' && futuresPositions.length > 0 && (
+                    <View style={styles.sectionBlock}>
+                      <View style={styles.sectionHeader}>
+                        <Text style={styles.sectionTitle}>پوزیشن‌های باز</Text>
+                        {data.futuresUnrealizedPnl !== undefined && (
+                          <Text
+                            style={[
+                              styles.sectionTotal,
+                              {
+                                color:
+                                  data.futuresUnrealizedPnl > 0
+                                    ? colors.dark.green
+                                    : colors.dark.red,
+                              },
+                            ]}
+                          >
+                            uPnL: {formatSignedUsd(data.futuresUnrealizedPnl)}
+                          </Text>
+                        )}
+                      </View>
+                      {futuresPositions.map((pos) => (
+                        <FuturesPositionRow key={`${pos.symbol}-${pos.positionSide}`} pos={pos} />
+                      ))}
+                      {data.futuresRealizedPnl !== undefined && (
+                        <Text style={styles.futuresRealized}>
+                          سود/زیان محقق‌شده فیوچرز (کل تاریخچه):{' '}
+                          {formatSignedUsd(data.futuresRealizedPnl)}
+                        </Text>
+                      )}
+                    </View>
+                  )}
+                  {sectionRows.length === 0 && (
+                    <Text style={styles.noBalance}>در این بخش موجودی‌ای نیست</Text>
+                  )}
+                </>
+              )}
+            </View>
+          )}
+
+          {data && data.balances.length === 0 && !isLoading && (
+            <Text style={styles.noBalance}>موجودی‌ای یافت نشد</Text>
+          )}
+
+          {data?.lastUpdated && (
+            <Text style={styles.lastUpdate}>
+              آخرین بروزرسانی: {new Date(data.lastUpdated).toLocaleTimeString('fa-IR')}
+            </Text>
+          )}
+        </View>
+      )}
     </View>
   );
 }
@@ -2145,213 +2363,107 @@ function BalanceRow({ bal, usdtToToman }: { bal: WalletBalance; usdtToToman: num
 }
 
 // ---------------------------------------------------------------------------
-// Per-exchange tab — full detail incl. PnL 30/90/180/360
+// «همه» aggregated row — per-asset sum across sections with section chips
 // ---------------------------------------------------------------------------
 
-interface WalletDetailProps {
-  wallet: ExchangeWallet;
-  usdtToToman: number;
-  /** undefined while the cached snapshots are still loading (first frames). */
-  balanceQuery?: ReturnType<typeof useQuery<ExchangeBalanceData>>;
-  onRemove: () => void;
-  onRefresh: () => void;
-  onBack: () => void;
-}
-
-function WalletDetail({ wallet, usdtToToman, balanceQuery, onRemove, onRefresh, onBack }: WalletDetailProps) {
-  const data = balanceQuery?.data;
-  const isLoading = balanceQuery ? balanceQuery.isLoading : true;
-  const isFetching = balanceQuery?.isFetching ?? false;
-  const hasError = !!balanceQuery?.error;
-
+function AggregatedRow({ bal, usdtToToman }: { bal: AggregatedBalance; usdtToToman: number }) {
+  // Chips only when the asset lives in more than one (or a non-spot) section.
+  const showSectionChips =
+    bal.sections.length > 1 || (bal.sections.length === 1 && bal.sections[0] !== 'spot');
   return (
-    <View style={styles.walletCard}>
-      <Pressable style={styles.walletHeader} onPress={onBack}>
-        <View style={styles.walletLeft}>
-          <View style={styles.walletIcon}>
-            <Key size={18} color={colors.dark.blue} />
-          </View>
-          <View style={styles.walletInfo}>
-            <Text style={styles.walletName}>{wallet.exchangeName}</Text>
-            <Text style={styles.walletKey}>
-              {wallet.exchangeId === 'bitperp'
-                ? wallet.apiKey
-                : `${wallet.apiKey.slice(0, 8)}...${wallet.apiKey.slice(-4)}`}
-            </Text>
-          </View>
+    <View style={styles.balanceRow}>
+      <View style={styles.balanceLeft}>
+        <View style={styles.assetBadge}>
+          <Text style={styles.assetBadgeText}>{bal.asset.slice(0, 3)}</Text>
         </View>
-        <View style={styles.walletRight}>
-          <View style={styles.walletHeaderTop}>
-            <Text style={styles.walletTotal}>
-              ${(data?.totalValueUsd ?? 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}
-            </Text>
-            {usdtToToman > 0 && data?.totalValueUsd !== undefined && (
-              <Text style={styles.walletToman}>
-                ≈ {formatToman((data.totalValueUsd ?? 0) * usdtToToman)} تومان
-              </Text>
-            )}
-            {(isLoading || isFetching) && (
-              <ActivityIndicator size="small" color={colors.dark.accent} />
-            )}
-          </View>
-          {data?.totalPnlUsd !== undefined && data.totalPnlUsd !== 0 && (
-            <Text
-              style={[
-                styles.walletPnl,
-                { color: data.totalPnlUsd > 0 ? colors.dark.green : colors.dark.red },
-              ]}
-            >
-              {data.totalPnlUsd > 0 ? '▲' : '▼'} {formatSignedUsd(data.totalPnlUsd)}
+        <View style={{ flex: 1 }}>
+          <Text style={styles.assetName}>{bal.asset}</Text>
+          <Text style={styles.assetAmount}>
+            {bal.free.toFixed(4)}{bal.locked > 0 ? ` (+${bal.locked.toFixed(4)} قفل)` : ''}
+          </Text>
+          {showSectionChips && (
+            <Text style={styles.assetSections}>
+              {bal.sections.map((s) => SECTION_TAB_LABEL[s]).join(' + ')}
             </Text>
           )}
-          <View style={styles.walletActions}>
-            <Pressable style={styles.actionBtn} onPress={onRefresh}>
-              <RefreshCw size={14} color={colors.dark.accent} />
-            </Pressable>
-            <Pressable style={styles.actionBtn} onPress={onRemove}>
-              <Trash2 size={14} color={colors.dark.red} />
-            </Pressable>
-            <ChevronUp size={16} color={colors.dark.textMuted} />
-          </View>
         </View>
-      </Pressable>
-
-      <View style={styles.walletExpanded}>
-        {isLoading && !data && (
-          <View style={styles.balanceLoading}>
-            <ActivityIndicator size="small" color={colors.dark.accent} />
-            <Text style={styles.balanceLoadingText}>دریافت موجودی...</Text>
-          </View>
-        )}
-
-        {hasError && (
-          <View style={styles.balanceError}>
-            <ShieldAlert size={14} color={colors.dark.red} />
-            <Text style={styles.balanceErrorText}>
-              {balanceQuery?.error instanceof Error
-                ? balanceQuery.error.message
-                : 'خطا در دریافت موجودی — مطمئن شوید API معتبر است'}
-            </Text>
-          </View>
-        )}
-
-        {data && data.balances.length > 0 && (
-          <View style={styles.balanceList}>
-            <AssetGroupList balances={data.balances} usdtToToman={usdtToToman} />
-
-            {/* Open futures positions with unrealized PnL */}
-            {data.futuresPositions && data.futuresPositions.length > 0 && (
-              <View style={styles.sectionBlock}>
-                <View style={styles.sectionHeader}>
-                  <Text style={styles.sectionTitle}>پوزیشن‌های باز فیوچرز</Text>
-                  {data.futuresUnrealizedPnl !== undefined && (
-                    <Text
-                      style={[
-                        styles.sectionTotal,
-                        {
-                          color:
-                            data.futuresUnrealizedPnl > 0 ? colors.dark.green : colors.dark.red,
-                        },
-                      ]}
-                    >
-                      uPnL: {formatSignedUsd(data.futuresUnrealizedPnl)}
-                    </Text>
-                  )}
-                </View>
-                {data.futuresPositions
-                  .filter((pos) => pos.notionalUsd >= DUST_FILTER_USD)
-                  .map((pos) => (
-                    <View
-                      key={`${pos.symbol}-${pos.positionSide}`}
-                      style={styles.positionRow}
-                    >
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.positionSymbol}>
-                          {pos.symbol.replace('USDT', '/USDT')}{' '}
-                          <Text
-                            style={{
-                              color:
-                                pos.positionSide === 'SHORT' || pos.unrealizedPnl < 0
-                                  ? colors.dark.red
-                                  : colors.dark.green,
-                            }}
-                          >
-                            {pos.positionSide === 'BOTH' ? '' : pos.positionSide} {pos.leverage}x
-                          </Text>
-                        </Text>
-                        <Text style={styles.positionDetail}>
-                          ورود: ${pos.entryPrice < 1 ? pos.entryPrice.toPrecision(4) : pos.entryPrice.toFixed(2)} → قیمت: ${pos.markPrice < 1 ? pos.markPrice.toPrecision(4) : pos.markPrice.toFixed(2)}
-                        </Text>
-                        <Text style={styles.positionDetail}>
-                          ارزش پوزیشن: ${pos.notionalUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-                        </Text>
-                      </View>
-                      <View style={styles.positionRight}>
-                        <Text
-                          style={[
-                            styles.positionPnl,
-                            {
-                              color:
-                                pos.unrealizedPnl > 0 ? colors.dark.green : colors.dark.red,
-                            },
-                          ]}
-                        >
-                          {formatSignedUsd(pos.unrealizedPnl)}
-                        </Text>
-                        <Text
-                          style={[
-                            styles.positionRoe,
-                            {
-                              color: pos.roePercent > 0 ? colors.dark.green : colors.dark.red,
-                            },
-                          ]}
-                        >
-                          ROE: {pos.roePercent > 0 ? '+' : ''}
-                          {pos.roePercent.toFixed(2)}%
-                        </Text>
-                      </View>
-                    </View>
-                  ))}
-                {data.futuresRealizedPnl !== undefined && (
-                  <Text style={styles.futuresRealized}>
-                    سود/زیان محقق‌شده فیوچرز (کل تاریخچه): {formatSignedUsd(data.futuresRealizedPnl)}
-                  </Text>
-                )}
-              </View>
-            )}
-
-            {/* Total exchange PnL */}
-            {data.totalPnlUsd !== undefined && (
-              <View style={styles.walletPnlRow}>
-                <Text style={styles.walletPnlLabel}>سود/زیان کل این صرافی (تقریبی)</Text>
-                <Text
-                  style={[
-                    styles.walletPnlValue,
-                    {
-                      color: data.totalPnlUsd > 0 ? colors.dark.green : colors.dark.red,
-                    },
-                  ]}
-                >
-                  {formatSignedUsd(data.totalPnlUsd)}
-                </Text>
-              </View>
-            )}
-            {data.pnlNote && <Text style={styles.pnlNote}>{data.pnlNote}</Text>}
-          </View>
-        )}
-
-        {data && data.balances.length === 0 && !isLoading && (
-          <Text style={styles.noBalance}>موجودی‌ای یافت نشد</Text>
-        )}
-
-        {/* ── PnL دوره‌ای: ۳۰ / ۹۰ / ۱۸۰ / ۳۶۰ روز ── */}
-        <PnlPeriodSection wallet={wallet} />
-
-        {data?.lastUpdated && (
-          <Text style={styles.lastUpdate}>
-            آخرین بروزرسانی: {new Date(data.lastUpdated).toLocaleTimeString('fa-IR')}
+      </View>
+      <View style={styles.balanceRight}>
+        <Text style={styles.balanceValue}>
+          ≈ ${bal.valueUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}
+        </Text>
+        {bal.pnlUsd !== undefined && bal.pnlUsd !== 0 && (
+          <Text
+            style={[
+              styles.balancePnl,
+              { color: bal.pnlUsd > 0 ? colors.dark.green : colors.dark.red },
+            ]}
+          >
+            {formatSignedUsd(bal.pnlUsd)}
+            {bal.pnlPercent !== undefined &&
+              ` (${bal.pnlPercent > 0 ? '+' : ''}${bal.pnlPercent.toFixed(1)}%)`}
           </Text>
         )}
+        {usdtToToman > 0 && bal.valueUsd > 0 && (
+          <Text style={styles.balanceToman}>
+            ≈ {formatToman(bal.valueUsd * usdtToToman)} ت
+          </Text>
+        )}
+      </View>
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Open futures position row
+// ---------------------------------------------------------------------------
+
+function FuturesPositionRow({ pos }: { pos: FuturesPosition }) {
+  return (
+    <View style={styles.positionRow}>
+      <View style={{ flex: 1 }}>
+        <Text style={styles.positionSymbol}>
+          {pos.symbol.replace('USDT', '/USDT')}{' '}
+          <Text
+            style={{
+              color:
+                pos.positionSide === 'SHORT' || pos.unrealizedPnl < 0
+                  ? colors.dark.red
+                  : colors.dark.green,
+            }}
+          >
+            {pos.positionSide === 'BOTH' ? '' : pos.positionSide} {pos.leverage}x
+          </Text>
+        </Text>
+        <Text style={styles.positionDetail}>
+          ورود: ${pos.entryPrice < 1 ? pos.entryPrice.toPrecision(4) : pos.entryPrice.toFixed(2)} → قیمت: ${pos.markPrice < 1 ? pos.markPrice.toPrecision(4) : pos.markPrice.toFixed(2)}
+        </Text>
+        <Text style={styles.positionDetail}>
+          ارزش پوزیشن: ${pos.notionalUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+        </Text>
+      </View>
+      <View style={styles.positionRight}>
+        <Text
+          style={[
+            styles.positionPnl,
+            {
+              color: pos.unrealizedPnl > 0 ? colors.dark.green : colors.dark.red,
+            },
+          ]}
+        >
+          {formatSignedUsd(pos.unrealizedPnl)}
+        </Text>
+        <Text
+          style={[
+            styles.positionRoe,
+            {
+              color: pos.roePercent > 0 ? colors.dark.green : colors.dark.red,
+            },
+          ]}
+        >
+          ROE: {pos.roePercent > 0 ? '+' : ''}
+          {pos.roePercent.toFixed(2)}%
+        </Text>
       </View>
     </View>
   );
@@ -2492,39 +2604,61 @@ const styles = createThemedStyles(() => StyleSheet.create({
     paddingTop: 12,
     paddingBottom: 40,
   },
-  tabBar: {
+  sectionTabBar: {
     flexDirection: 'row',
-    gap: 8,
-    paddingVertical: 6,
+    gap: 6,
+    paddingVertical: 4,
     marginBottom: 6,
   },
-  tabChip: {
+  sectionTabChip: {
     backgroundColor: colors.dark.surface,
     borderWidth: 1,
     borderColor: colors.dark.border,
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    minWidth: 64,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    minWidth: 44,
     alignItems: 'center',
   },
-  tabChipActive: {
+  sectionTabChipActive: {
     backgroundColor: colors.dark.accentDim,
     borderColor: colors.dark.accent,
   },
-  tabChipText: {
-    fontSize: 12,
+  sectionTabChipText: {
+    fontSize: 11,
     fontWeight: '600' as const,
     color: colors.dark.textSecondary,
   },
-  tabChipTextActive: {
+  sectionTabChipTextActive: {
     color: colors.dark.accent,
     fontWeight: '700' as const,
   },
-  tabChipValue: {
-    fontSize: 11,
-    color: colors.dark.textMuted,
-    marginTop: 2,
+  assetSections: {
+    fontSize: 9,
+    color: colors.dark.blue,
+    marginTop: 1,
+    letterSpacing: 0.2,
+  },
+  portfolioBreakdown: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: colors.dark.border,
+    gap: 4,
+  },
+  portfolioBreakdownRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  portfolioBreakdownName: {
+    fontSize: 12,
+    color: colors.dark.textSecondary,
+  },
+  portfolioBreakdownValue: {
+    fontSize: 12,
+    fontWeight: '600' as const,
+    color: colors.dark.text,
   },
   portfolioCard: {
     backgroundColor: colors.dark.surface,

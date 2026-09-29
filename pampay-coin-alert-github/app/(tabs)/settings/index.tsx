@@ -17,7 +17,7 @@ import {
 } from 'react-native';
 import { Plus, Trash2, Pencil, Check, X, Search, Save, HelpCircle, ChevronDown, ChevronUp, Instagram, Send, Bot, MessageCircle, Globe, Download, RefreshCw, Sun, Moon, Bell } from 'lucide-react-native';
 import { sendTelegramWelcome, startTelegramPolling } from '@/utils/telegramService';
-import { getServerUrl, setServerUrl, testServerUrl, syncScanConfig } from '@/utils/scanServerApi';
+import { getServerUrl, setServerUrl, testServerUrl, syncScanConfig, sendServerTelegramTest } from '@/utils/scanServerApi';
 import { registerPushOnServer, sendTestLocalNotification } from '@/utils/pushService';
 import {
   AppUpdateInfo,
@@ -1122,8 +1122,41 @@ export default function SettingsScreen() {
           onPress={async () => {
             setServerBusy(true);
             try {
-              const ok = await registerPushOnServer();
-              setServerStatus(ok ? '✅ نوتیفیکیشن بومی ثبت شد' : '⚠️ ثبت پوش ناموفق (تلگرام همچنان فعال است)');
+              // اول پیکربندی (توکن/چت‌آیدی) با سرور همگام شود بعد تست ارسال شود
+              await syncScanConfig({
+                botToken: (settings.telegramBotToken || '').trim(),
+                chatId: (settings.telegramChatId || '').trim(),
+                gainzAlgoEnabled: settings.gainzAlgoNotifications !== false,
+                gainzTimeframes: settings.gainzTimeframes ?? ['1h', '4h', '1d'],
+                hookEnabled: settings.hookReversalNotifications !== false,
+                hookTimeframes: settings.hookTimeframes ?? ['4h', '1d'],
+              });
+              const r = await sendServerTelegramTest();
+              setServerStatus(
+                r.ok
+                  ? `✅ سرور پیام تست تلگرام را فرستاد — چک کنید ${r.detail ? `(${r.detail})` : ''}`
+                  : `❌ ${r.detail ?? 'ارسال تست از سرور ناموفق بود'}`
+              );
+            } finally {
+              setServerBusy(false);
+            }
+          }}
+        >
+          <Send size={14} color="#FFF" />
+          <Text style={styles.testTelegramBtnText}>تست ارسال تلگرام از سرور</Text>
+        </Pressable>
+        <Pressable
+          style={({ pressed }) => [styles.testTelegramBtn, pressed && { opacity: 0.8 }]}
+          disabled={serverBusy}
+          onPress={async () => {
+            setServerBusy(true);
+            try {
+              const r = await registerPushOnServer();
+              setServerStatus(
+                r.ok
+                  ? '✅ نوتیفیکیشن بومی ثبت شد'
+                  : `⚠️ ثبت پوش ناموفق: ${r.error ?? 'دلیل نامشخص'} — تلگرام همچنان فعال است`
+              );
             } finally {
               setServerBusy(false);
             }

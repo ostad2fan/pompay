@@ -23,6 +23,21 @@
 
 const BASE = 'https://bitperp.com';
 
+/** Endpoint variants tried in order (FastAPI routers sometimes get renamed). */
+const OTP_REQUEST_PATHS = [
+  '/api/auth/request-otp',
+  '/api/auth/send-otp',
+  '/api/auth/otp-request',
+  '/api/auth/request-code',
+];
+const OTP_VERIFY_PATHS = [
+  '/api/auth/verify-otp',
+  '/api/auth/check-otp',
+  '/api/auth/submit-otp',
+  '/api/auth/verify-code',
+];
+const REFRESH_PATHS = ['/api/auth/refresh', '/api/auth/token-refresh'];
+
 const BASE_HEADERS: Record<string, string> = {
   'Content-Type': 'application/json',
   'ngrok-skip-browser-warning': 'true',
@@ -97,11 +112,33 @@ export async function bitperpRequestOtp(email: string): Promise<{ ok: boolean; e
   if (!email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
     return { ok: false, error: 'یک ایمیل معتبر وارد کنید' };
   }
-  const r = await postJson('/api/auth/request-otp', { email: email.trim() });
-  if (!r.ok) {
-    return { ok: false, error: r.errorDetail ?? 'ارسال کد ناموفق بود' };
+  const attempts: string[] = [];
+  let networkFailed = false;
+  for (const path of OTP_REQUEST_PATHS) {
+    const r = await postJson(path, { email: email.trim() });
+    if (r.ok) return { ok: true };
+    if (r.status === 0) {
+      networkFailed = true; // fetch itself failed — keep trying other paths
+      attempts.push(`${path}: اتصال برقرار نشد`);
+    } else {
+      attempts.push(`${path}: ${r.errorDetail}`);
+      if (r.status === 404) continue; // wrong path — try the next variant
+      if (r.status === 400 || r.status === 422) {
+        // A validation answer means the ENDPOINT exists — surface its detail.
+        return {
+          ok: false,
+          error: `صرافی پاسخ داد: ${r.errorDetail}`,
+        };
+      }
+    }
   }
-  return { ok: true };
+  if (networkFailed) {
+    return {
+      ok: false,
+      error: 'اتصال به بیت‌پرپ برقرار نشد — فیلترشکن را روشن کنید و دوباره بزنید (bitperp.com از ایران مستقیم در دسترس نیست)',
+    };
+  }
+  return { ok: false, error: `ارسال کد ناموفق بود (${attempts[attempts.length - 1] ?? 'خطای نامشخص'})` };
 }
 
 export interface BitperpTokens {
@@ -114,36 +151,56 @@ export async function bitperpVerifyOtp(
   email: string,
   code: string
 ): Promise<{ ok: boolean; tokens?: BitperpTokens; error?: string }> {
-  const r = await postJson<{ access_token?: string; refresh_token?: string; data?: { access_token?: string; refresh_token?: string } }>(
-    '/api/auth/verify-otp',
-    { email: email.trim(), code: code.trim() }
-  );
-  if (!r.ok || !r.data) {
-    return { ok: false, error: r.errorDetail ?? 'کد تأیید اشتباه است' };
+  let networkFailed = false;
+  let lastDetail = '';
+  for (const path of OTP_VERIFY_PATHS) {
+    const r = await postJson<{ access_token?: string; refresh_token?: string; data?: { access_token?: string; refresh_token?: string } }>(
+      path,
+      { email: email.trim(), code: code.trim() }
+    );
+    if (r.status === 0) {
+      networkFailed = true;
+      continue;
+    }
+    if (r.status === 404) continue; // wrong path — try the next variant
+    lastDetail = r.errorDetail ?? '';
+    if (r.ok && r.data) {
+      const accessToken = r.data.access_token ?? r.data.data?.access_token;
+      const refreshToken = r.data.refresh_token ?? r.data.data?.refresh_token;
+      if (accessToken && refreshToken) {
+        return { ok: true, tokens: { accessToken, refreshToken } };
+      }
+    }
+    // 400/401/422 → the endpoint exists, the code (or email) is wrong.
+    if (r.status === 400 || r.status === 401 || r.status === 422) break;
   }
-  const accessToken = r.data.access_token ?? r.data.data?.access_token;
-  const refreshToken = r.data.refresh_token ?? r.data.data?.refresh_token;
-  if (!accessToken || !refreshToken) {
-    return { ok: false, error: 'پاسخ ورود نامعتبر بود — دوباره تلاش کنید' };
+  if (networkFailed) {
+    return {
+      ok: false,
+      error: 'اتصال به بیت‌پرپ برقرار نشد — فیلترشکن را روشن کنید و دوباره امتحان کنید',
+    };
   }
-  return { ok: true, tokens: { accessToken, refreshToken } };
+  return { ok: false, error: lastDetail || 'کد تأیید اشتباه است یا منقضی شده — دوباره «دریافت کد» را بزنید' };
 }
 
 /** Silent token rotation (called when the access token expired). */
 export async function bitperpRefresh(
   refreshToken: string
 ): Promise<{ ok: boolean; tokens?: BitperpTokens; error?: string }> {
-  const r = await postJson<{ access_token?: string; refresh_token?: string }>(
-    '/api/auth/refresh',
-    { refresh_token: refreshToken }
-  );
-  if (!r.ok || !r.data) {
-    return { ok: false, error: r.errorDetail ?? 'نشست منقضی شده است' };
+  for (const path of REFRESH_PATHS) {
+    const r = await postJson<{ access_token?: string; refresh_token?: string }>(
+      path,
+      { refresh_token: refreshToken }
+    );
+    if (r.status === 404) continue;
+    if (r.ok && r.data && r.data.access_token && r.data.refresh_token) {
+      return { ok: true, tokens: { accessToken: r.data.access_token, refreshToken: r.data.refresh_token } };
+    }
+    if (r.status !== 0) {
+      return { ok: false, error: r.errorDetail ?? 'نشست منقضی شده است' };
+    }
   }
-  if (!r.data.access_token || !r.data.refresh_token) {
-    return { ok: false, error: 'پاسخ تمدید نشست نامعتبر بود' };
-  }
-  return { ok: true, tokens: { accessToken: r.data.access_token, refreshToken: r.data.refresh_token } };
+  return { ok: false, error: 'نشست منقضی شده است' };
 }
 
 // ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ import { getNobitexUsdtToman } from "./nobitex";
 import { scanEngine } from "./scanEngine";
 import { runFastScanCycle, pumpDumpResponse } from "./fastScan";
 import { registerPushToken, unregisterPushToken, pushStatus } from "./push";
+import { sendTelegram, getLastTelegramError } from "./telegram";
 import {
   startBotCommandPoller,
   getPendingForApp,
@@ -118,11 +119,13 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: !summary.skipped, summary });
     }
     if (req.method === "GET" && url.pathname === "/scan/status") {
-      const [config, lastScanDate, lastScanAt, lastFastScanAt] = await Promise.all([
+      const [config, lastScanDate, lastScanAt, lastFastScanAt, lastTelegramError, lastTelegramSuccessAt] = await Promise.all([
         store.get<{ secret: string; botToken: string; chatId: string }>("config"),
         store.get<string>("lastScanDate"),
         store.get<number>("lastScanAt"),
         store.get<number>("lastFastScanAt"),
+        getLastTelegramError(),
+        store.get<number>("lastTelegramSuccessAt"),
       ]);
       return json(res, 200, {
         ok: true,
@@ -132,6 +135,10 @@ const server = http.createServer(async (req, res) => {
         lastScanDate: lastScanDate ?? null,
         lastScanAt: lastScanAt ?? null,
         lastFastScanAt: lastFastScanAt ?? null,
+        telegram: {
+          lastSuccessAt: lastTelegramSuccessAt ?? null,
+          lastError: lastTelegramError ?? null,
+        },
         push: await pushStatus(),
       });
     }
@@ -217,6 +224,40 @@ const server = http.createServer(async (req, res) => {
       } catch {
         return json(res, 400, { ok: false, error: "invalid json" });
       }
+    }
+
+    // ---- v1.4.4: one-button server→Telegram health check ----
+    // The app calls this from Settings («تست ارسال تلگرام از سرور») to verify
+    // the exact 24/7 notification path. Secret-protected so strangers can't
+    // spam the configured chat.
+    if (req.method === "GET" && url.pathname === "/bot/test") {
+      const secret = String(url.searchParams.get("secret") ?? "");
+      const cfg = await store.get<{ secret?: string; botToken?: string; chatId?: string }>("config");
+      if (!cfg?.botToken || !cfg.chatId) {
+        return json(res, 400, {
+          ok: false,
+          detail: "توکن ربات/چت‌آیدی هنوز روی سرور ثبت نشده — اول دکمه «همگام‌سازی پیکربندی اسکنر» را بزنید",
+        });
+      }
+      if (!secret || cfg.secret !== secret) {
+        return json(res, 403, {
+          ok: false,
+          detail: "راز نصب (secret) مطابقت ندارد — از همان گوشی که پیکربندی را ثبت کرده این تست را بزنید",
+        });
+      }
+      const sent = await sendTelegram(
+        { botToken: cfg.botToken, chatId: cfg.chatId },
+        "✅ <b>پیام تست سرور PomPay</b>\n\nمسیر اعلان‌های ۲۴ ساعته (حتی با برنامه بسته) سالم است."
+      );
+      const lastErr = await getLastTelegramError();
+      if (sent) {
+        return json(res, 200, { ok: true, detail: "پیام تست ارسال شد" });
+      }
+      return json(res, 502, {
+        ok: false,
+        detail: "تلگرام پیام را نپذیرفت — توکن ربات یا چت‌آیدی همگام‌شده معتبر نیست",
+        error: lastErr?.error ?? null,
+      });
     }
 
     return json(res, 404, { ok: false, error: "not found" });

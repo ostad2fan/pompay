@@ -3,6 +3,7 @@ import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 import Constants from 'expo-constants';
 import { getServerUrl } from './scanServerApi';
+import { checkVpnStatus } from './vpnGuard';
 
 /**
  * pushService — native push registration bridge.
@@ -57,9 +58,9 @@ export async function ensureNotificationPermission(): Promise<boolean> {
  * called getDevicePushTokenAsync() which returns a raw FCM token the server
  * rejects (it expects the ExponentPushToken prefix).
  *
- * Requires extra.eas.projectId in app.json (see docs/03-PUSH-NOTIFICATIONS.md)
- * and a build with FCM (google-services.json). When unavailable it returns
- * null and the Telegram bot remains the "app closed" notification channel.
+ * Requires extra.eas.projectId in app.json and a build with FCM
+ * (google-services.json). When unavailable it returns null and the Telegram
+ * bot remains the "app closed" notification channel.
  */
 export async function getExpoPushToken(): Promise<string | null> {
   if (Platform.OS === 'web') return null;
@@ -79,13 +80,56 @@ export async function getExpoPushToken(): Promise<string | null> {
   }
 }
 
-/** Registers the device token with the scanner server (POST /push/register). */
-export async function registerPushOnServer(): Promise<boolean> {
+/** Detailed registration result — Persian diagnosis for each failure mode. */
+export interface PushRegisterResult {
+  ok: boolean;
+  /** Human-readable Persian reason (shown in Settings). */
+  error?: string;
+}
+
+/**
+ * Registers the device token with the scanner server (POST /push/register).
+ * v1.4.4: returns a DETAILED result so Settings can show WHY it failed
+ * (permission / FCM unreachable — usually VPN off in Iran / old APK build
+ * without google-services.json / server rejected).
+ */
+export async function registerPushOnServer(): Promise<PushRegisterResult> {
   try {
-    const serverUrl = await getServerUrl();
-    if (!serverUrl) return false;
+    if (Platform.OS === 'web') {
+      return { ok: false, error: 'پوش فقط روی نسخه اندروید (گوشی) کار می‌کند' };
+    }
+
+    const granted = await ensureNotificationPermission();
+    if (!granted) {
+      return {
+        ok: false,
+        error: 'اجازه نوتیفیکیشن داده نشد — از تنظیمات گوشی (Apps → Notifications) فعال کنید',
+      };
+    }
+
     const token = await getExpoPushToken();
-    if (!token) return false;
+    if (!token) {
+      // FCM/Google endpoints are unreachable from Iran without a VPN, and
+      // APKs built WITHOUT google-services.json can't get a token at all.
+      const vpn = await checkVpnStatus();
+      if (vpn === 'iran') {
+        return {
+          ok: false,
+          error:
+            'دریافت توکن پوش ناموفق بود: سرورهای گوگل (FCM) از IP ایران در دسترس نیستند — فیلترشکن را روشن کنید و دوباره بزنید',
+        };
+      }
+      return {
+        ok: false,
+        error:
+          'دریافت توکن پوش ناموفق بود — اگر فیلترشکن روشن است و باز خطا می‌دهد، یعنی این نسخه APK با فایل فایربیس ساخته نشده؛ نسخه ۱.۴.۴ یا جدیدتر را نصب کنید',
+      };
+    }
+
+    const serverUrl = await getServerUrl();
+    if (!serverUrl) {
+      return { ok: false, error: 'آدرس سرور اسکنر تنظیم نشده است' };
+    }
 
     const res = await fetch(`${serverUrl}/push/register`, {
       method: 'POST',
@@ -95,12 +139,12 @@ export async function registerPushOnServer(): Promise<boolean> {
     if (res.ok) {
       await AsyncStorage.setItem(PUSH_REGISTERED_KEY, '1');
       console.log('[Push] registered on server');
-      return true;
+      return { ok: true };
     }
-    return false;
+    return { ok: false, error: `سرور ثبت پوش را نپذیرفت (HTTP ${res.status})` };
   } catch (e) {
     console.log('[Push] register error:', e);
-    return false;
+    return { ok: false, error: 'خطای غیرمنتظره در ثبت پوش — اتصال اینترنت/سرور را چک کنید' };
   }
 }
 

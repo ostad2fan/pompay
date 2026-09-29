@@ -328,3 +328,49 @@ export async function ackBotCommands(ids: number[]): Promise<void> {
     // non-fatal — the command stays queued and will be re-answered later
   }
 }
+
+/**
+ * Asks the SERVER to send a test Telegram message with the synced bot config
+ * (GET /bot/test?secret=...). This verifies the exact server→Telegram path
+ * that runs 24/7 while the app is closed — the best one-button health check
+ * for «چرا نوتیف تلگرام نمی‌آید؟».
+ */
+export async function sendServerTelegramTest(): Promise<{
+  ok: boolean;
+  detail?: string;
+}> {
+  const serverUrl = await getServerUrl();
+  if (!serverUrl) return { ok: false, detail: 'آدرس سرور تنظیم نشده است' };
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20_000);
+    const res = await fetch(
+      `${serverUrl}/bot/test?secret=${encodeURIComponent(await getInstallSecret())}`,
+      { signal: controller.signal, headers: { Accept: 'application/json' } }
+    );
+    clearTimeout(timer);
+    const data = (await res.json().catch(() => null)) as {
+      ok?: boolean;
+      detail?: string;
+      error?: string;
+    } | null;
+    if (res.ok && data?.ok) return { ok: true, detail: data.detail };
+    if (res.status === 404) {
+      return {
+        ok: false,
+        detail:
+          'سرور شما نسخه قدیمی است — کد جدید سرور هنوز دیپلوی نشده (Railway را دوباره دیپلوی کنید)',
+      };
+    }
+    return {
+      ok: false,
+      detail:
+        data?.detail ?? data?.error ?? `سرور پاسخ داد: HTTP ${res.status} — توکن ربات/چت‌آیدی همگام‌سازی شده را چک کنید`,
+    };
+  } catch {
+    return {
+      ok: false,
+      detail: 'اتصال به سرور برقرار نشد — اینترنت/آدرس سرور را چک کنید',
+    };
+  }
+}
