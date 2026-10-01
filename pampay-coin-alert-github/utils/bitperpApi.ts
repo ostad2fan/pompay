@@ -283,9 +283,20 @@ export async function bitperpVerifyOtp(
 }
 
 /** Silent token rotation (called when the access token expired). */
+export interface BitperpRefreshResult {
+  ok: boolean;
+  tokens?: BitperpTokens;
+  error?: string;
+  /** 'invalid' — the server explicitly REJECTED the refresh token (401/403) → the user must re-login.
+   *  'transient' — network/timeout/5xx → the session is probably still good,
+   *  retry later (v1.4.7: previously ANY failure was reported as «نشست منقضی شده»
+   *  which mislabeled plain network hiccups as expired sessions). */
+  kind?: 'invalid' | 'transient';
+}
+
 export async function bitperpRefresh(
   refreshToken: string
-): Promise<{ ok: boolean; tokens?: BitperpTokens; error?: string }> {
+): Promise<BitperpRefreshResult> {
   for (const path of REFRESH_PATHS) {
     const r = await postJson<{ access_token?: string; refresh_token?: string }>(
       path,
@@ -295,11 +306,22 @@ export async function bitperpRefresh(
     if (r.ok && r.data && r.data.access_token && r.data.refresh_token) {
       return { ok: true, tokens: { accessToken: r.data.access_token, refreshToken: r.data.refresh_token } };
     }
-    if (r.status !== 0) {
-      return { ok: false, error: r.errorDetail ?? 'نشست منقضی شده است' };
+    if (r.status === 0) {
+      // Network/timeout — the session may still be alive; do NOT claim expiry.
+      return { ok: false, kind: 'transient', error: r.errorDetail ?? 'خطای شبکه هنگام تمدید نشست' };
     }
+    if (r.status === 401 || r.status === 403) {
+      return { ok: false, kind: 'invalid', error: r.errorDetail ?? 'نشست منقضی شده است' };
+    }
+    // Other HTTP statuses (400/422/5xx…): likely a body-level rejection — treat
+    // FastAPI validation answers (422) as invalid (wrong payload shape), and
+    // everything else as transient to avoid false «session expired» reports.
+    if (r.status === 400 || r.status === 422) {
+      return { ok: false, kind: 'invalid', error: r.errorDetail ?? 'نشست منقضی شده است' };
+    }
+    return { ok: false, kind: 'transient', error: r.errorDetail ?? 'خطای گذرا در تمدید نشست' };
   }
-  return { ok: false, error: 'نشست منقضی شده است' };
+  return { ok: false, kind: 'transient', error: 'مسیر تمدید نشست پیدا نشد' };
 }
 
 // ---------------------------------------------------------------------------
@@ -329,8 +351,23 @@ export interface BitperpAccount {
   positions: BitperpPosition[];
   /** True when the access token was rejected (401) → refresh needed. */
   authFailed: boolean;
+  /** v1.4.7 — HTTP 200 with {code!=0,msg} business error (previously silently
+   *  ignored → user saw an EMPTY wallet instead of the exchange's message). */
+  errorMsg?: string;
   /** Raw response payloads for debugging. */
   raw: { fundBalance?: unknown; balance?: unknown; perpBalance?: unknown; positions?: unknown };
+}
+
+/** Extract a business-level error ({code, msg}) from an HTTP-200 body. */
+function businessError(data: unknown): string | undefined {
+  if (!data || typeof data !== 'object') return undefined;
+  const rec = data as { code?: unknown; msg?: unknown; message?: unknown; status?: unknown };
+  const code = rec.code ?? rec.status;
+  if (typeof code === 'number' && code !== 0) {
+    const msg = typeof rec.msg === 'string' ? rec.msg : typeof rec.message === 'string' ? rec.message : '';
+    return msg ? `${msg} (کد ${code})` : `کد خطای ${code}`;
+  }
+  return undefined;
 }
 
 function toNum(v: unknown): number {
@@ -354,6 +391,12 @@ export async function fetchBitperpAccount(accessToken: string): Promise<BitperpA
 
   const authFailed =
     fundRes.status === 401 || balanceRes.status === 401 || perpRes.status === 401;
+
+  // v1.4.7 — business errors inside HTTP-200 bodies (FastAPI {code, msg}).
+  const businessMsgs = [fundRes.data, balanceRes.data, perpRes.data]
+    .map((d) => businessError(d))
+    .filter(Boolean) as string[];
+  const errorMsg = authFailed ? undefined : businessMsgs[0];
 
   // ---- funding wallet ----
   let fundingUsdt = 0;
@@ -464,6 +507,7 @@ export async function fetchBitperpAccount(accessToken: string): Promise<BitperpA
     availableMargin,
     positions,
     authFailed,
+    errorMsg,
     raw: {
       fundBalance: fundRes.data,
       balance: balanceRes.data,

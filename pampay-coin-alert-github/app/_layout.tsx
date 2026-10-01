@@ -8,6 +8,7 @@ import { View } from "react-native";
 import { AppProvider, useApp } from "@/contexts/AppContext";
 import colors from "@/constants/colors";
 import UpdateBanner from "@/components/UpdateBanner";
+import StartupIpGate from "@/components/StartupIpGate";
 
 SplashScreen.preventAutoHideAsync();
 
@@ -39,6 +40,9 @@ function ThemedAppRoot() {
       {/* New-version banner slides over everything, top of the screen */}
       <UpdateBanner />
       <RootLayoutNav />
+      {/* v1.4.7 — full-screen Iran-IP gate: runs on every app open / resume.
+          Covers EVERYTHING (highest z-index) until the exit IP is non-Iran. */}
+      <StartupIpGate />
     </View>
   );
 }

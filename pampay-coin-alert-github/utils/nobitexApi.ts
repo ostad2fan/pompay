@@ -1,21 +1,24 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getServerUrl } from './scanServerApi';
+import { fetchArzinjaTomanPrice } from './arzinjaV2Api';
 
 const ALANCHAND_URL = 'https://alanchand.com/currencies-price/usd';
 const ALANCHAND_API_URL = 'https://api.alanchand.com?type=currency&symbols=usd';
-const NOBITEX_ORDERBOOK_API = 'https://api.nobitex.ir/v2/orderbook/USDTIRT';
-const NOBITEX_STATS_API = 'https://api.nobitex.ir/market/stats';
+/** v1.4.7 — api.nobitex.ir is DEAD (NXDOMAIN); Nobitex moved to apiv2.nobitex.ir. */
+const NOBITEX_ORDERBOOK_API = 'https://apiv2.nobitex.ir/v2/orderbook/USDTIRT';
+const NOBITEX_STATS_API = 'https://apiv2.nobitex.ir/market/stats';
 const WALLEX_API = 'https://api.wallex.ir/v1/markets';
 const TETHERLAND_API = 'https://api.tetherland.com/currencies';
 const CURRENCY_API = 'https://latest.currency-api.pages.dev/v1/currencies/usd.json';
 
 /**
- * Arzinja (Iranian exchange) — Nobitex-compatible API infrastructure.
- * The user's personal API keys give higher rate limits; the price endpoints
- * also work anonymously as a fallback.
+ * Arzinja (Iranian exchange) — v1.4.7: real API v2 (api-v2.arzinja.app),
+ * NOT Nobitex-compatible. Price data comes from the PUBLIC market endpoint
+ * (no auth); wallet balances use the signed endpoints in arzinjaV2Api.ts.
+ * Old base api.arzinja.ir no longer resolves (NXDOMAIN).
  */
-const ARZINJA_BASE = 'https://api.arzinja.ir';
-const ARZINJA_FALLBACK_BASE = 'https://api.nobitex.ir'; // same platform, mirrored
+const ARZINJA_BASE = 'https://api-v2.arzinja.app/api';
+const ARZINJA_FALLBACK_BASE = 'https://api-v2.arzinja.ir/api';
 const ARZINJA_DEFAULT_KEY = '70c505037afe7c40be8dd6b10ba92d73';
 const ARZINJA_DEFAULT_SECRET = '6986dce5b5d4f758da59b85d7102a7d7f05ebf30df320018610b8c9281319419';
 const SETTINGS_KEY = '@crypto_scanner_settings';
@@ -49,7 +52,7 @@ async function getArzinjaKeys(): Promise<{ key: string; secret: string }> {
   return { key, secret };
 }
 
-/** Exported so the wallet balance fetcher can reuse the same auth chain. */
+/** Exported for the wallet balance fetcher (v2 signed requests — kept for compatibility). */
 export async function arzinjaAuthHeaders(): Promise<Array<Record<string, string>>> {
   const { key, secret } = await getArzinjaKeys();
   return [
@@ -249,9 +252,11 @@ let arzinjaPriceCache: { at: number; price: number } | null = null;
 let arzinjaBackoffUntil = 0;
 
 /**
- * Live USDT/Toman from Arzinja (Nobitex-compatible): orderbook last trade
- * price first (most "real-time"), then market stats. Cached for 4 minutes so
- * the 5-minute refresh cycle hits the API at most once per cycle.
+ * Live USDT/Toman from Arzinja — v1.4.7: the PUBLIC v2 market endpoint
+ * (api-v2.arzinja.app/v1/market/all-market → USDTIRT.stats.lastPrice, already
+ * in Toman; no auth needed). The old api.arzinja.ir endpoints are dead
+ * (NXDOMAIN), which silently killed this whole source. Cached for 4 minutes
+ * so the 5-minute refresh cycle hits the API at most once per cycle.
  */
 async function tryArzinja(): Promise<number | null> {
   if (arzinjaPriceCache && Date.now() - arzinjaPriceCache.at < 240_000) {
@@ -259,62 +264,15 @@ async function tryArzinja(): Promise<number | null> {
   }
   if (Date.now() < arzinjaBackoffUntil) return null;
 
-  const authVariants = await arzinjaAuthHeaders();
-  const bases = [ARZINJA_BASE, ARZINJA_FALLBACK_BASE];
-
-  for (const base of bases) {
-    // 1) orderbook — freshest single price
-    for (const headers of authVariants) {
-      try {
-        console.log(`[ArzinjaAPI] Trying ${base}/v2/orderbook/USDTIRT...`);
-        const response = await fetchWithTimeout(`${base}/v2/orderbook/USDTIRT`, { headers }, 9000);
-        if (response.ok) {
-          const data = await response.json();
-          const raw = parseFloat(data?.lastTradePrice);
-          const price = raw / 10; // Rial -> Toman
-          if (price > 10000 && price < 500000) {
-            console.log('[ArzinjaAPI] Orderbook price (Toman):', price);
-            arzinjaPriceCache = { at: Date.now(), price };
-            return price;
-          }
-          if (raw > 10000 && raw < 500000) {
-            console.log('[ArzinjaAPI] Orderbook price already Toman:', raw);
-            arzinjaPriceCache = { at: Date.now(), price: raw };
-            return raw;
-          }
-        }
-      } catch {
-        // network/DNS failure — try the next variant/base
-      }
+  try {
+    const price = await fetchArzinjaTomanPrice();
+    if (price !== null && price > 10_000 && price < 2_000_000) {
+      console.log('[ArzinjaAPI] Market price (Toman):', price);
+      arzinjaPriceCache = { at: Date.now(), price };
+      return price;
     }
-
-    // 2) market stats
-    for (const headers of authVariants) {
-      try {
-        const response = await fetchWithTimeout(
-          `${base}/market/stats`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', ...headers },
-            body: JSON.stringify({ srcCurrency: 'usdt', dstCurrency: 'rls' }),
-          },
-          9000
-        );
-        if (response.ok) {
-          const data = await response.json();
-          const stats = data?.stats?.['usdt-rls'];
-          const rawLatest = parseFloat(stats?.latest ?? stats?.lastTradePrice ?? '0');
-          const price = rawLatest / 10;
-          if (price > 10000 && price < 500000) {
-            console.log('[ArzinjaAPI] Stats price (Toman):', price);
-            arzinjaPriceCache = { at: Date.now(), price };
-            return price;
-          }
-        }
-      } catch {
-        // try the next variant/base
-      }
-    }
+  } catch {
+    // network/DNS failure — fall through to the backoff below
   }
 
   // All Arzinja attempts failed — back off 5 minutes so the fallback chain

@@ -99,6 +99,80 @@ export async function checkVpnStatus(force = false): Promise<VpnStatus> {
   return inflight;
 }
 
+// ---------------------------------------------------------------------------
+// v1.4.7 — full IP info (address + country) for the STARTUP gate screen
+// («IP فعلی شما X، کشور Y»). Providers are the same as checkVpnStatus but
+// here the raw answer (ip + country) is kept for display.
+// ---------------------------------------------------------------------------
+
+export interface IpInfo {
+  status: VpnStatus;
+  /** The public exit IPv4/IPv6 as the provider saw it. */
+  ip?: string;
+  /** 2-letter country code, uppercase (e.g. 'DE'). */
+  country?: string;
+  /** Persian country name for the common exit countries ('آلمان'…). */
+  countryNameFa?: string;
+}
+
+const COUNTRY_FA: Record<string, string> = {
+  IR: 'ایران',
+  DE: 'آلمان',
+  NL: 'هلند',
+  US: 'آمریکا',
+  GB: 'انگلستان',
+  FR: 'فرانسه',
+  TR: 'ترکیه',
+  AE: 'امارات',
+  SE: 'سوئد',
+  FI: 'فنلاند',
+  CH: 'سوئیس',
+  CA: 'کانادا',
+  AT: 'اتریش',
+  LU: 'لوکزامبورگ',
+  SG: 'سنگاپور',
+  JP: 'ژاپن',
+  RU: 'روسیه',
+  KZ: 'قزاقستان',
+};
+
+/** Reads the ip+country from the SAME providers used by checkVpnStatus. */
+export async function getIpInfo(force = false): Promise<IpInfo> {
+  if (!force) {
+    const s = await checkVpnStatus();
+    if (s !== 'unknown' && ipInfoCache && Date.now() - ipInfoCache.at < CACHE_MS) {
+      return ipInfoCache.info;
+    }
+  }
+  for (const p of PROVIDERS) {
+    const data = (await fetchWithTimeout(p.url, 5_000)) as Record<string, unknown> | null;
+    if (!data) continue;
+    const ip =
+      typeof data.ip === 'string'
+        ? data.ip
+        : typeof (data as { query?: unknown }).query === 'string'
+          ? (data as { query: string }).query
+          : undefined;
+    const country =
+      p.extract(data) ?? (typeof data.country_code === 'string' ? (data.country_code as string) : undefined);
+    if (country) {
+      const code = country.toUpperCase();
+      const info: IpInfo = {
+        status: code === 'IR' ? 'iran' : 'vpn',
+        ip,
+        country: code,
+        countryNameFa: COUNTRY_FA[code],
+      };
+      ipInfoCache = { at: Date.now(), info };
+      cache = { at: Date.now(), status: info.status };
+      return info;
+    }
+  }
+  return { status: 'unknown' };
+}
+
+let ipInfoCache: { at: number; info: IpInfo } | null = null;
+
 /**
  * The exchanges whose APIs are unreachable (or actively risky) from an
  * Iranian IP — used to decide whether the warning is relevant.

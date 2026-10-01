@@ -197,6 +197,12 @@ export async function getInstallSecret(): Promise<string> {
   }
 }
 
+export interface ScanConfigSyncResult {
+  ok: boolean;
+  /** v1.4.7 — precise Persian reason (server down vs VPN off vs bad token). */
+  reason?: string;
+}
+
 /**
  * Pushes the scan configuration to the server (bot token, chat id, GainzAlgo
  * flag, the user's custom indicators and the fast-cycle flags: pump/dump
@@ -214,9 +220,11 @@ export async function syncScanConfig(params: {
   memeEnabled?: boolean;
   preListingEnabled?: boolean;
   volumeThreshold?: number;
-}): Promise<boolean> {
+}): Promise<ScanConfigSyncResult> {
   const serverUrl = await getServerUrl();
-  if (!serverUrl || !params.botToken || !params.chatId) return false;
+  if (!serverUrl || !params.botToken || !params.chatId) {
+    return { ok: false, reason: 'توکن ربات تلگرام یا چت‌آیدی تنظیم نشده است — ابتدا آن‌ها را در همین صفحه وارد کنید' };
+  }
   try {
     const indicators: UserIndicator[] = await getUserIndicators();
     // v1.4.5: 12s timeout — previously hung for minutes when the server was down.
@@ -248,14 +256,34 @@ export async function syncScanConfig(params: {
     }
     if (!res.ok) {
       console.log(`[ScanServer] config sync failed: ${res.status}`);
-      return false;
+      if (res.status === 502 || res.status === 503 || res.status === 504) {
+        return {
+          ok: false,
+          reason: 'سرور خاموش/کرش است (خطای 502 از Railway) — آدرس درست است؛ سرویس را در پنل Railway دوباره دیپلوی کنید',
+        };
+      }
+      if (res.status === 404) {
+        return {
+          ok: false,
+          reason: 'این آدرس سرور ما نیست (404) — آدرس سرور اسکنر را دقیق چک کنید',
+        };
+      }
+      return { ok: false, reason: `سرور پیکربندی را نپذیرفت (HTTP ${res.status}) — آدرس و توکن ربات/چت‌آیدی را چک کنید` };
     }
     const data = (await res.json()) as { scanned?: boolean };
     console.log(`[ScanServer] config synced (catchupScan=${!!data.scanned})`);
-    return true;
+    return { ok: true };
   } catch (e) {
     console.log('[ScanServer] config sync error:', e);
-    return false;
+    // v1.4.7 — same smart diagnosis as the connection test: decide whether the
+    // phone's internet is down or the Railway service itself is unresponsive.
+    const internetUp = await probeInternet();
+    return {
+      ok: false,
+      reason: internetUp
+        ? 'اینترنت شما سالم است اما سرور پاسخ نمی‌دهد — سرور Railway خاموش یا معلق شده؛ از پنل Railway سرویس را Redeploy/Restart کنید'
+        : 'اینترنت گوشی یا فیلترشکن قطع است — فیلترشکن را روشن کنید و دوباره امتحان کنید',
+    };
   }
 }
 

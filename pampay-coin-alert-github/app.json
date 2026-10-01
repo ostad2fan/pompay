@@ -2,7 +2,7 @@
   "expo": {
     "name": "ارزهای پامپی و دامپی",
     "slug": "pampay-coin-alert",
-    "version": "1.4.6",
+    "version": "1.4.7",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "pampaycoin",
@@ -23,7 +23,7 @@
         "backgroundColor": "#ffffff"
       },
       "package": "com.trademaster.pampaycoin",
-      "versionCode": 11,
+      "versionCode": 12,
       "permissions": [
         "android.permission.INTERNET",
         "android.permission.POST_NOTIFICATIONS",

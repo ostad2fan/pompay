@@ -4,7 +4,9 @@
 // graceful fallback to the public market stats endpoint.
 // Ported 1:1 from the Cloudflare Worker version (WebCrypto is global in Node 20+).
 
-const NOBITEX_STATS_URL = "https://api.nobitex.ir/market/stats";
+// v1.4.7 — api.nobitex.ir no longer resolves (NXDOMAIN); Nobitex moved to
+// apiv2.nobitex.ir (verified live: market/stats → 200).
+const NOBITEX_STATS_URL = "https://apiv2.nobitex.ir/market/stats";
 const STATS_PATH = "/market/stats";
 const STATS_BODY = JSON.stringify({ srcCurrency: "usdt", dstCurrency: "rls" });
 

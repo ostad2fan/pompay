@@ -1103,7 +1103,7 @@ export default function SettingsScreen() {
           onPress={async () => {
             setServerBusy(true);
             try {
-              const ok = await syncScanConfig({
+              const syncRes = await syncScanConfig({
                 botToken: (settings.telegramBotToken || '').trim(),
                 chatId: (settings.telegramChatId || '').trim(),
                 gainzAlgoEnabled: settings.gainzAlgoNotifications !== false,
@@ -1111,7 +1111,11 @@ export default function SettingsScreen() {
                 hookEnabled: settings.hookReversalNotifications !== false,
                 hookTimeframes: settings.hookTimeframes ?? ['4h', '1d'],
               });
-              setServerStatus(ok ? '✅ پیکربندی اسکنر روی سرور همگام شد' : '❌ همگام‌سازی ناموفق (آدرس/توکن را چک کنید)');
+              setServerStatus(
+                syncRes.ok
+                  ? '✅ پیکربندی اسکنر روی سرور همگام شد'
+                  : `❌ همگام‌سازی ناموفق — ${syncRes.reason ?? 'آدرس یا توکن را چک کنید'}`
+              );
             } finally {
               setServerBusy(false);
             }

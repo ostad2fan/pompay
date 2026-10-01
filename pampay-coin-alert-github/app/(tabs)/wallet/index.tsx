@@ -35,9 +35,10 @@ import { EXCHANGE_LIST } from '@/constants/exchanges';
 import { ExchangeId } from '@/types/crypto';
 import DropdownPicker from '@/components/DropdownPicker';
 import VpnWarningBanner from '@/components/VpnWarningBanner';
-import { isForeignExchange } from '@/utils/vpnGuard';
+import { isForeignExchange, checkVpnStatus, VpnStatus } from '@/utils/vpnGuard';
 import { useApp } from '@/contexts/AppContext';
-import { fetchUsdtTomanPrice, formatToman, arzinjaAuthHeaders } from '@/utils/nobitexApi';
+import { fetchUsdtTomanPrice, formatToman } from '@/utils/nobitexApi';
+import { fetchArzinjaBalances } from '@/utils/arzinjaV2Api';
 import {
   bitperpRequestOtp,
   bitperpVerifyOtp,
@@ -1205,23 +1206,28 @@ async function fetchOkxPeriodPnl(wallet: ExchangeWallet, days: PnlPeriodDays): P
 }
 
 // ---------------------------------------------------------------------------
-// Iranian exchanges (Arzinja / Nobitex — same Nobitex-compatible platform)
+// Nobitex (نوبیتکس) — v1.4.7: apiv2.nobitex.ir (old api.nobitex.ir is NXDOMAIN).
+// Arzinja moved to its OWN v2 API (arzinjaV2Api.ts) and no longer shares this
+// fetcher — the two platforms are NOT compatible.
 // ---------------------------------------------------------------------------
 
 async function fetchNobitexBalance(wallet: ExchangeWallet): Promise<WalletBalance[]> {
   const balances: WalletBalance[] = [];
-  const bases = ['https://api.arzinja.ir', 'https://api.nobitex.ir'];
+  const bases = ['https://apiv2.nobitex.ir'];
 
-  // v1.4.5 fix — the wallet's OWN apiKey/apiSecret (what the user typed in the
-  // Add-Exchange form) must be tried FIRST. Previously this fetcher only used
-  // the global/project Arzinja keys, so a personal API key added in the wallet
-  // form was silently ignored and balance fetching failed even with valid keys.
+  // The wallet's OWN apiKey/apiSecret — a Nobitex API token is a single string,
+  // so both "Token key" and "Token key:secret" shapes are tried (the user may
+  // paste the whole token into either field).
   const authVariants: Array<Record<string, string>> = [];
-  if (wallet.apiKey?.trim() && wallet.apiSecret?.trim()) {
-    authVariants.push({ Authorization: `Token ${wallet.apiKey.trim()}:${wallet.apiSecret.trim()}` });
-    authVariants.push({ Authorization: `ApiKey ${wallet.apiKey.trim()}:${wallet.apiSecret.trim()}` });
+  const k = wallet.apiKey?.trim() ?? '';
+  const s = wallet.apiSecret?.trim() ?? '';
+  if (k && s) {
+    authVariants.push({ Authorization: `Token ${k}:${s}` });
+    authVariants.push({ Authorization: `Token ${k}` });
+    authVariants.push({ Authorization: `ApiKey ${k}:${s}` });
+  } else if (k) {
+    authVariants.push({ Authorization: `Token ${k}` });
   }
-  for (const h of await arzinjaAuthHeaders()) authVariants.push(h);
 
   let walletsPayload: unknown = null;
   let lastError = 'unknown';
@@ -1270,7 +1276,7 @@ async function fetchNobitexBalance(wallet: ExchangeWallet): Promise<WalletBalanc
 
   if (!walletsPayload) {
     throw new Error(
-      `دریافت موجودی ${wallet.exchangeName} ناموفق بود (${lastError}). کلید API را بررسی کنید و مطمئن شوید دسترسی «خواندن» فعال است.`
+      `دریافت موجودی ${wallet.exchangeName} ناموفق بود (${lastError}). توکن API نوبیتکس را از پنل نوبیتکس → بخش API بسازید و دقیقاً همان توکن را وارد کنید.`
     );
   }
 
@@ -1320,8 +1326,82 @@ async function fetchNobitexBalance(wallet: ExchangeWallet): Promise<WalletBalanc
 }
 
 // ---------------------------------------------------------------------------
+// Arzinja (ارزینجا) — v1.4.7: the REAL API v2 (api-v2.arzinja.app, signed
+// X-ARZ-* headers). The previous «Nobitex-compatible» calls hit a domain that
+// no longer resolves (api.arzinja.ir → NXDOMAIN) which is exactly why the
+// wallet always failed while the key itself was perfectly valid + read-only.
+// ---------------------------------------------------------------------------
+
+async function fetchArzinjaWalletBalance(wallet: ExchangeWallet): Promise<WalletBalance[]> {
+  const rows = await fetchArzinjaBalances(wallet.apiKey, wallet.apiSecret);
+  if (rows.length === 0) return [];
+
+  // Fiat (IRT) rows are priced at the live tether rate, like the Toman row
+  // of the Nobitex fetcher above.
+  let usdtToToman = 0;
+  try {
+    usdtToToman = (await fetchUsdtTomanPrice()).usdtToToman;
+  } catch {}
+
+  const priceMap = await getUsdPriceMap().catch(() => ({}) as Record<string, number>);
+
+  const balances: WalletBalance[] = [];
+  for (const row of rows) {
+    if (row.isFiat || row.asset === 'IRT' || row.asset === 'IRR') {
+      const toman = row.asset === 'IRR' ? row.total / 10 : row.total;
+      const valueUsd = usdtToToman > 0 ? toman / usdtToToman : 0;
+      if (toman <= 0) continue;
+      balances.push({
+        asset: 'تومان',
+        free: row.asset === 'IRR' ? row.free / 10 : row.free,
+        locked: row.asset === 'IRR' ? row.locked / 10 : row.locked,
+        total: toman,
+        valueUsd,
+        section: 'spot',
+      });
+      continue;
+    }
+    const assetName = row.asset === 'USDT' ? 'تتر' : row.asset;
+    const stable = row.asset === 'USDT' ? row.total : stableCoinValueUsd(row.asset, row.total);
+    const valueUsd =
+      row.valueUsd > 0
+        ? row.valueUsd
+        : stable !== null
+          ? stable
+          : (priceMap[`${row.asset}USDT`] ?? 0) * row.total;
+    balances.push({
+      asset: assetName,
+      free: row.free,
+      locked: row.locked,
+      total: row.total,
+      valueUsd,
+      section: 'spot',
+    });
+  }
+  return balances;
+}
+
+// ---------------------------------------------------------------------------
 // BitPerp (بیت‌پرپ) — JWT auth (email OTP), auto-refresh, balances + PnL
 // ---------------------------------------------------------------------------
+
+/**
+ * v1.4.7 — the wallet object is MUTATED after a successful token refresh
+ * (passphrase=access, apiSecret=refresh) IN ADDITION to persisting to
+ * AsyncStorage. Previously only AsyncStorage was updated, but the in-memory
+ * `wallets` react-query cache kept the OLD (already-consumed, single-use)
+ * refresh token — every subsequent balance fetch then failed the rotation
+ * and wrongly reported «نشست منقضی شده» even though the session was alive.
+ * Mutating the shared object keeps the session stable for the whole app run.
+ */
+async function bitperpRotateTokens(
+  wallet: ExchangeWallet,
+  tokens: { accessToken: string; refreshToken: string }
+): Promise<void> {
+  wallet.passphrase = tokens.accessToken;
+  wallet.apiSecret = tokens.refreshToken;
+  await persistBitperpTokens(wallet.id, tokens);
+}
 
 async function fetchBitperpBalance(wallet: ExchangeWallet): Promise<WalletBalance[]> {
   let account = await fetchBitperpAccount(wallet.passphrase ?? '');
@@ -1329,8 +1409,14 @@ async function fetchBitperpBalance(wallet: ExchangeWallet): Promise<WalletBalanc
   if (account.authFailed && wallet.apiSecret) {
     const refresh = await bitperpRefresh(wallet.apiSecret);
     if (refresh.ok && refresh.tokens) {
-      await persistBitperpTokens(wallet.id, refresh.tokens);
+      await bitperpRotateTokens(wallet, refresh.tokens);
       account = await fetchBitperpAccount(refresh.tokens.accessToken);
+    } else if (refresh.kind === 'transient') {
+      // v1.4.7 — network hiccup ≠ expired session. The web app does the same
+      // (keeps the session, surfaces a retryable network error).
+      throw new Error(
+        `اتصال به بیت‌پرپ برقرار نشد (${refresh.error ?? 'خطای شبکه'}) — فیلترشکن/اینترنت را چک کنید و دوباره تازه‌سازی بزنید`
+      );
     }
   }
 
@@ -1338,6 +1424,12 @@ async function fetchBitperpBalance(wallet: ExchangeWallet): Promise<WalletBalanc
     throw new Error(
       'نشست BitPerp منقضی شده است — صرافی «بیت‌پرپ» را از لیست حذف کنید و دوباره با ایمیل و کد یکبارمصرف اضافه کنید (دکمه «دریافت کد» در فرم افزودن).'
     );
+  }
+
+  // v1.4.7 — HTTP 200 with a business error body: show the exchange's own
+  // message instead of a silently-empty wallet.
+  if (account.errorMsg) {
+    throw new Error(`بیت‌پرپ خطا برگرداند: ${account.errorMsg}`);
   }
 
   const balances: WalletBalance[] = [];
@@ -1400,9 +1492,20 @@ async function fetchBitperpPeriodPnl(wallet: ExchangeWallet, days: PnlPeriodDays
   if (history.authFailed && wallet.apiSecret) {
     const refresh = await bitperpRefresh(wallet.apiSecret);
     if (refresh.ok && refresh.tokens) {
-      await persistBitperpTokens(wallet.id, refresh.tokens);
+      await bitperpRotateTokens(wallet, refresh.tokens);
       access = refresh.tokens.accessToken;
       history = await fetchBitperpPositionHistory(access);
+    } else if (refresh.kind === 'transient') {
+      return {
+        periodDays: days,
+        supported: false,
+        unavailableReason: `اتصال به بیت‌پرپ برقرار نشد (${refresh.error ?? 'خطای شبکه'}) — اینترنت/فیلترشکن را چک کنید`,
+        realizedPnl: 0,
+        fundingFees: 0,
+        commissions: 0,
+        unrealizedPnl: 0,
+        closedCount: 0,
+      };
     }
   }
   if (history.authFailed) {
@@ -1482,8 +1585,28 @@ async function fetchPeriodPnl(wallet: ExchangeWallet, days: PnlPeriodDays): Prom
 // Balance dispatcher (with snapshot caching handled by the react-query layer)
 // ---------------------------------------------------------------------------
 
+/**
+ * v1.4.7 — IRAN-IP HARD GATE. Every balance fetch passes through here first.
+ * When the phone's exit IP is Iranian AND the exchange is a foreign one
+ * (Binance/Bybit/OKX/BitPerp/MEXC/…), the request is REFUSED before a single
+ * byte leaves the phone — the user's exchange credentials must never touch
+ * geo-blocked endpoints. The wallet UI shows the «فیلترشکن را وصل کنید» card
+ * instead. Iranian exchanges (Arzinja/Nobitex/Iranicart) are unaffected.
+ */
+export const IRAN_GATE_ERROR = 'IRAN_IP_BLOCKED';
+
+async function assertNotIranFor(wallet: ExchangeWallet): Promise<void> {
+  if (!isForeignExchange(wallet.exchangeId)) return;
+  const status = await checkVpnStatus();
+  if (status === 'iran') {
+    throw new Error(IRAN_GATE_ERROR);
+  }
+}
+
 async function fetchExchangeBalance(wallet: ExchangeWallet): Promise<ExchangeBalanceData> {
   console.log('[Wallet] Fetching balance for', wallet.exchangeName, wallet.exchangeId);
+
+  await assertNotIranFor(wallet);
 
   let balances: WalletBalance[] = [];
   let account: BinanceFullAccount | null = null;
@@ -1501,6 +1624,8 @@ async function fetchExchangeBalance(wallet: ExchangeWallet): Promise<ExchangeBal
         balances = await fetchOkxBalance(wallet);
         break;
       case 'arzinja':
+        balances = await fetchArzinjaWalletBalance(wallet);
+        break;
       case 'nobitex':
         balances = await fetchNobitexBalance(wallet);
         break;
@@ -1612,6 +1737,55 @@ export default function WalletScreen() {
   const usdtToToman = tomanQuery.data?.usdtToToman ?? 0;
   const wallets = walletsQuery.data ?? [];
 
+  // v1.4.7 — IRAN-IP HARD GATE STATE. Polled every 60s while foreign
+  // exchanges are connected; shared by the queries (enabled flag), the
+  // per-exchange gate cards and the auto-refresh-on-VPN logic below.
+  const [vpnStatus, setVpnStatus] = useState<VpnStatus>('unknown');
+  const [vpnChecking, setVpnChecking] = useState(false);
+
+  const recheckVpn = useCallback(async (force = false) => {
+    setVpnChecking(true);
+    try {
+      setVpnStatus(await checkVpnStatus(force));
+    } finally {
+      setVpnChecking(false);
+    }
+  }, []);
+
+  const hasForeignWallet = useMemo(
+    () => wallets.some((w) => isForeignExchange(w.exchangeId)),
+    [wallets]
+  );
+
+  useEffect(() => {
+    if (!hasForeignWallet) return;
+    void recheckVpn();
+    const timer = setInterval(() => void recheckVpn(), 60_000);
+    return () => clearInterval(timer);
+  }, [hasForeignWallet, recheckVpn]);
+
+  // When the VPN comes back ON (status flips to 'vpn'), every foreign
+  // balance query is invalidated so the wallets refresh themselves without a
+  // manual pull — exactly the requested behavior.
+  const prevVpnRef = useRef<VpnStatus>('unknown');
+  useEffect(() => {
+    if (prevVpnRef.current === 'iran' && vpnStatus === 'vpn') {
+      wallets.forEach((w) => {
+        if (isForeignExchange(w.exchangeId)) {
+          queryClient.invalidateQueries({ queryKey: ['exchange-balance', w.id] });
+          queryClient.invalidateQueries({ queryKey: ['exchange-pnl', w.id] });
+        }
+      });
+    }
+    prevVpnRef.current = vpnStatus;
+  }, [vpnStatus, wallets, queryClient]);
+
+  // While the exit IP is Iranian, foreign-exchange queries are DISABLED —
+  // react-query will not auto-refetch, poll or refetch-on-mount them (the
+  // cached snapshot stays visible, but NO request leaves the phone). The
+  // queryFn itself double-guards via assertNotIranFor().
+  const foreignBlocked = vpnStatus === 'iran' && hasForeignWallet;
+
   // v1.4.3 — load the persisted balance snapshots BEFORE the queries mount so
   // the whole portfolio (all exchanges + totals) appears INSTANTLY on screen
   // entry, then silently refreshes in the background (no manual refresh, no
@@ -1650,8 +1824,8 @@ export default function WalletScreen() {
           },
           initialData: balanceCaches[w.id] ?? undefined,
           initialDataUpdatedAt: balanceCaches[w.id]?.lastUpdated,
-          refetchInterval: refreshMs,
-          refetchOnMount: 'always' as const,
+          refetchInterval: foreignBlocked && isForeignExchange(w.exchangeId) ? false : refreshMs,
+          refetchOnMount: foreignBlocked && isForeignExchange(w.exchangeId) ? false : 'always',
           staleTime: 30_000,
           retry: 1,
         }))
@@ -1835,10 +2009,8 @@ export default function WalletScreen() {
 
   // هشدار فیلترشکن فقط وقتی معنی دارد که صرافی خارجی متصل است (یا در حال
   // افزودن آن هستیم) — صرافی‌های ایرانی با IP ایران مشکلی ندارند.
-  const hasForeignWallet = useMemo(
-    () => wallets.some((w) => isForeignExchange(w.exchangeId)),
-    [wallets]
-  );
+  // v1.4.7: نمایش بنر + کارت گیت داخل هر صرافی خارجی (hasForeignWallet
+  // بالاتر در کامپوننت تعریف شده و توسط کوئری‌ها هم استفاده می‌شود).
 
   return (
     <ScrollView
@@ -1928,6 +2100,14 @@ export default function WalletScreen() {
             )}
 
             <Text style={styles.portfolioSub}>{wallets.length} صرافی متصل</Text>
+
+            {/* ── v1.4.7: سود/زیان دوره‌ای کل پرتفوی (مجموع همه صرافی‌ها) ── */}
+            {wallets.length > 0 && (
+              <TotalPnlPeriodSection
+                wallets={wallets}
+                foreignBlocked={foreignBlocked}
+              />
+            )}
           </View>
 
       {/* ── کارت هر صرافی — با فلش باز/بسته می‌شود؛ سربرگ‌های داخلی ── */}
@@ -1938,11 +2118,18 @@ export default function WalletScreen() {
           isExpanded={expandedWallet === wallet.id}
           usdtToToman={usdtToToman}
           balanceQuery={balanceQueries[idx]}
+          vpnStatus={vpnStatus}
+          vpnChecking={vpnChecking}
+          onRecheckVpn={() => void recheckVpn(true)}
           onToggle={() => setExpandedWallet(expandedWallet === wallet.id ? null : wallet.id)}
           onRemove={() => handleRemoveWallet(wallet.id, wallet.exchangeName)}
-          onRefresh={() =>
-            queryClient.invalidateQueries({ queryKey: ['exchange-balance', wallet.id] })
-          }
+          onRefresh={() => {
+            if (foreignBlocked && isForeignExchange(wallet.exchangeId)) {
+              void recheckVpn(true);
+              return;
+            }
+            queryClient.invalidateQueries({ queryKey: ['exchange-balance', wallet.id] });
+          }}
         />
       ))}
 
@@ -2131,6 +2318,10 @@ interface WalletItemProps {
   isExpanded: boolean;
   usdtToToman: number;
   balanceQuery: ReturnType<typeof useQuery<ExchangeBalanceData>>;
+  /** v1.4.7 — exit-IP status drives the per-exchange Iran gate card. */
+  vpnStatus: VpnStatus;
+  vpnChecking: boolean;
+  onRecheckVpn: () => void;
   onToggle: () => void;
   onRemove: () => void;
   onRefresh: () => void;
@@ -2141,6 +2332,9 @@ function WalletItem({
   isExpanded,
   usdtToToman,
   balanceQuery,
+  vpnStatus,
+  vpnChecking,
+  onRecheckVpn,
   onToggle,
   onRemove,
   onRefresh,
@@ -2155,6 +2349,15 @@ function WalletItem({
   const isLoading = balanceQuery?.isLoading ?? false;
   const isFetching = balanceQuery?.isFetching ?? false;
   const hasError = !!balanceQuery?.error;
+
+  // v1.4.7 — IRAN GATE for THIS exchange: foreign exchange + Iranian exit IP.
+  const foreignExchange = isForeignExchange(wallet.exchangeId);
+  const iranGated = foreignExchange && vpnStatus === 'iran';
+  // The gate swallows any query error while active (the real reason IS the
+  // gate — showing «خطا در دریافت موجودی» under it would be misleading).
+  const gateError =
+    balanceQuery?.error instanceof Error && balanceQuery.error.message === IRAN_GATE_ERROR;
+  const showBalanceError = hasError && !iranGated && !gateError;
 
   // Only the sections that actually hold something get a tab.
   const presentSections = useMemo(() => {
@@ -2263,14 +2466,35 @@ function WalletItem({
 
       {isExpanded && (
         <View style={styles.walletExpanded}>
-          {isLoading && !data && (
+          {/* ── v1.4.7: گیت سخت ایران — هیچ درخواستی به این صرافی زده نمی‌شود ── */}
+          {iranGated && (
+            <View style={styles.iranGateCard}>
+              <ShieldAlert size={18} color={colors.dark.orange} />
+              <View style={styles.iranGateTextCol}>
+                <Text style={styles.iranGateTitle}>فیلترشکن را وصل کنید</Text>
+                <Text style={styles.iranGateBody}>
+                  IP فعلی گوشی ایران است. برای امنیت حساب‌تان، با IP ایران هیچ اطلاعاتی از
+                  این صرافی خوانده نمی‌شود (نه موجودی و نه سود/زیان). فیلترشکن را روشن کنید —
+                  به‌محض وصل شدن، موجودی خودکار تازه می‌شود.
+                </Text>
+                <Pressable style={styles.iranGateBtn} onPress={onRecheckVpn} disabled={vpnChecking}>
+                  <RefreshCw size={12} color={colors.dark.orange} />
+                  <Text style={styles.iranGateBtnText}>
+                    {vpnChecking ? 'در حال بررسی...' : 'بررسی مجدد فیلترشکن'}
+                  </Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
+
+          {isLoading && !data && !iranGated && (
             <View style={styles.balanceLoading}>
               <ActivityIndicator size="small" color={colors.dark.accent} />
               <Text style={styles.balanceLoadingText}>دریافت موجودی...</Text>
             </View>
           )}
 
-          {hasError && (
+          {showBalanceError && (
             <View style={styles.balanceError}>
               <ShieldAlert size={14} color={colors.dark.red} />
               <Text style={styles.balanceErrorText}>
@@ -2325,6 +2549,9 @@ function WalletItem({
                   </Pressable>
                 ))}
               </ScrollView>
+
+              {/* ── v1.4.7: PnL دوره‌ای — بالای لیست ارزها (قبل از ردیف‌ها) ── */}
+              <PnlPeriodSection wallet={wallet} iranGated={iranGated} />
 
               {activeSection === 'all' ? (
                 <>
@@ -2388,9 +2615,6 @@ function WalletItem({
                     </View>
                   )}
                   {data.pnlNote && <Text style={styles.pnlNote}>{data.pnlNote}</Text>}
-
-                  {/* PnL دوره‌ای ۳۰/۹۰/۱۸۰/۳۶۰ روز — دقیقاً از خود صرافی */}
-                  <PnlPeriodSection wallet={wallet} />
                 </>
               ) : (
                 <>
@@ -2617,13 +2841,16 @@ function FuturesPositionRow({ pos }: { pos: FuturesPosition }) {
 // PnL period selector + result (exchange-native numbers)
 // ---------------------------------------------------------------------------
 
-function PnlPeriodSection({ wallet }: { wallet: ExchangeWallet }) {
+function PnlPeriodSection({ wallet, iranGated }: { wallet: ExchangeWallet; iranGated?: boolean }) {
   const [period, setPeriod] = useState<PnlPeriodDays>(30);
   const pnlQuery = useQuery({
     queryKey: ['exchange-pnl', wallet.id, period],
     queryFn: () => fetchPeriodPnl(wallet, period),
     staleTime: 5 * 60_000,
     retry: 0,
+    // v1.4.7 — the PnL endpoints hit the exchange API too: they are fully
+    // disabled while the exit IP is Iranian (same hard gate as balances).
+    enabled: !iranGated,
   });
   const pnl = pnlQuery.data;
 
@@ -2637,6 +2864,12 @@ function PnlPeriodSection({ wallet }: { wallet: ExchangeWallet }) {
         )}
       </View>
 
+      {iranGated ? (
+        <Text style={styles.pnlNote}>
+          🔒 با IP ایران، سود/زیان این صرافی خوانده نمی‌شود — فیلترشکن را وصل کنید.
+        </Text>
+      ) : (
+        <>
       <View style={styles.pnlChipsRow}>
         {PNL_PERIODS.map((p) => {
           const active = period === p;
@@ -2733,6 +2966,189 @@ function PnlPeriodSection({ wallet }: { wallet: ExchangeWallet }) {
             </Text>
           </View>
           {pnl.note && <Text style={styles.pnlNote}>{pnl.note}</Text>}
+        </View>
+      )}
+        </>
+      )}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v1.4.7 — Total Portfolio PnL with periods (مجموع همه صرافی‌ها)
+// Aggregates the exchange-native period PnL of every wallet that supports it
+// (Binance / Bybit / OKX / BitPerp) into one card in the portfolio header.
+// ---------------------------------------------------------------------------
+
+const PERIOD_PNL_EXCHANGES: ReadonlySet<string> = new Set(['binance', 'bybit', 'okx', 'bitperp']);
+
+function TotalPnlPeriodSection({
+  wallets,
+  foreignBlocked,
+}: {
+  wallets: ExchangeWallet[];
+  foreignBlocked: boolean;
+}) {
+  const [period, setPeriod] = useState<PnlPeriodDays>(30);
+
+  // Only exchanges whose API actually provides period PnL.
+  const supportedWallets = useMemo(
+    () => wallets.filter((w) => PERIOD_PNL_EXCHANGES.has(w.exchangeId)),
+    [wallets]
+  );
+
+  const pnlQueries = useQueries({
+    queries: supportedWallets.map((w) => ({
+      queryKey: ['exchange-pnl', w.id, period] as const,
+      queryFn: () => fetchPeriodPnl(w, period),
+      staleTime: 5 * 60_000,
+      retry: 0,
+      // Same Iran hard gate: foreign exchange PnL endpoints stay untouched.
+      enabled: !(foreignBlocked && isForeignExchange(w.exchangeId)),
+    })),
+  });
+
+  const aggregate = useMemo(() => {
+    let realized = 0;
+    let funding = 0;
+    let commissions = 0;
+    let unrealized = 0;
+    let closed = 0;
+    let supportedCount = 0;
+    let loading = false;
+    supportedWallets.forEach((w, i) => {
+      const q = pnlQueries[i];
+      const pnl = q?.data;
+      if (!pnl) {
+        if (q?.isFetching) loading = true;
+        return;
+      }
+      if (pnl.supported) {
+        supportedCount++;
+        realized += pnl.realizedPnl;
+        funding += pnl.fundingFees;
+        commissions += pnl.commissions;
+        unrealized += pnl.unrealizedPnl;
+        closed += pnl.closedCount;
+      }
+    });
+    return { realized, funding, commissions, unrealized, closed, supportedCount, loading };
+  }, [supportedWallets, pnlQueries]);
+
+  if (supportedWallets.length === 0) return null;
+
+  const total = aggregate.realized + aggregate.funding + aggregate.commissions;
+
+  return (
+    <View style={styles.pnlSection}>
+      <View style={styles.pnlSectionHeader}>
+        <TrendingUp size={14} color={colors.dark.accent} />
+        <Text style={styles.pnlSectionTitle}>سود/زیان دوره‌ای کل دارایی‌ها (مجموع صرافی‌ها)</Text>
+        {aggregate.loading && (
+          <ActivityIndicator size="small" color={colors.dark.accent} />
+        )}
+      </View>
+
+      <View style={styles.pnlChipsRow}>
+        {PNL_PERIODS.map((p) => {
+          const active = period === p;
+          return (
+            <Pressable
+              key={p}
+              style={[styles.pnlChip, active && styles.pnlChipActive]}
+              onPress={() => setPeriod(p)}
+            >
+              <Text style={[styles.pnlChipText, active && styles.pnlChipTextActive]}>
+                {PNL_PERIOD_LABEL[p]}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {foreignBlocked ? (
+        <Text style={styles.pnlNote}>
+          🔒 با IP ایران، سود/زیان صرافی‌های خارجی خوانده نمی‌شود — فیلترشکن را وصل کنید.
+        </Text>
+      ) : aggregate.supportedCount === 0 && !aggregate.loading ? (
+        <Text style={styles.pnlNote}>
+          ℹ️ سود/زیان دوره‌ای از API خود صرافی‌ها خوانده می‌شود و برای بایننس، بای‌بیت، OKX و
+          بیت‌پرپ فعال است — هنوز هیچ‌کدام متصل نیستند یا داده‌ای برنگردانده‌اند.
+        </Text>
+      ) : (
+        <View style={styles.pnlResult}>
+          <View style={styles.pnlRow}>
+            <Text style={styles.pnlRowLabel}>سود/زیان محقق‌شده ({aggregate.closed} معامله بسته):</Text>
+            <Text
+              style={[
+                styles.pnlRowValue,
+                { color: aggregate.realized > 0 ? colors.dark.green : aggregate.realized < 0 ? colors.dark.red : colors.dark.text },
+              ]}
+            >
+              {formatSignedUsd(aggregate.realized)}
+            </Text>
+          </View>
+          {aggregate.funding !== 0 && (
+            <View style={styles.pnlRow}>
+              <Text style={styles.pnlRowLabel}>کارمزد فاندینگ:</Text>
+              <Text
+                style={[
+                  styles.pnlRowValue,
+                  { color: aggregate.funding > 0 ? colors.dark.green : colors.dark.red },
+                ]}
+              >
+                {formatSignedUsd(aggregate.funding)}
+              </Text>
+            </View>
+          )}
+          {aggregate.commissions !== 0 && (
+            <View style={styles.pnlRow}>
+              <Text style={styles.pnlRowLabel}>کارمزد معاملات:</Text>
+              <Text
+                style={[
+                  styles.pnlRowValue,
+                  { color: aggregate.commissions > 0 ? colors.dark.green : colors.dark.red },
+                ]}
+              >
+                {formatSignedUsd(aggregate.commissions)}
+              </Text>
+            </View>
+          )}
+          <View style={styles.pnlRow}>
+            <Text style={styles.pnlRowLabel}>سود/زیان پوزیشن‌های باز (لحظه‌ای):</Text>
+            <Text
+              style={[
+                styles.pnlRowValue,
+                { color: aggregate.unrealized > 0 ? colors.dark.green : aggregate.unrealized < 0 ? colors.dark.red : colors.dark.text },
+              ]}
+            >
+              {formatSignedUsd(aggregate.unrealized)}
+            </Text>
+          </View>
+          <View style={[styles.pnlRow, styles.pnlTotalRow]}>
+            <Text style={styles.pnlTotalLabel}>
+              مجموع دوره {PNL_PERIOD_LABEL[period]} ({aggregate.supportedCount} صرافی):
+            </Text>
+            <Text
+              style={[
+                styles.pnlTotalValue,
+                {
+                  color:
+                    total > 0
+                      ? colors.dark.green
+                      : total < 0
+                        ? colors.dark.red
+                        : colors.dark.text,
+                },
+              ]}
+            >
+              {formatSignedUsd(total)}
+            </Text>
+          </View>
+          <Text style={styles.pnlNote}>
+            مجموع سود/زیان بایننس، بای‌بیت، OKX و بیت‌پرپ در {PNL_PERIOD_LABEL[period]} انتخابی — دقیقاً از
+            API خود صرافی‌ها
+          </Text>
         </View>
       )}
     </View>
@@ -2982,6 +3398,50 @@ const styles = createThemedStyles(() => StyleSheet.create({
     color: colors.dark.red,
     flex: 1,
     textAlign: 'right',
+  },
+  // ── v1.4.7: کارت گیت ایران (فیلترشکن خاموش) ──
+  iranGateCard: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    backgroundColor: colors.dark.orangeDim,
+    borderWidth: 1,
+    borderColor: colors.dark.orange + '66',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 10,
+  },
+  iranGateTextCol: {
+    flex: 1,
+    gap: 4,
+  },
+  iranGateTitle: {
+    fontSize: 13,
+    fontWeight: '800' as const,
+    color: colors.dark.orange,
+    textAlign: 'right',
+  },
+  iranGateBody: {
+    fontSize: 11,
+    lineHeight: 18,
+    color: colors.dark.orange,
+    textAlign: 'right',
+  },
+  iranGateBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    alignSelf: 'flex-start',
+    backgroundColor: colors.dark.orange + '22',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    marginTop: 4,
+  },
+  iranGateBtnText: {
+    fontSize: 11,
+    fontWeight: '700' as const,
+    color: colors.dark.orange,
   },
   balanceList: {
     gap: 8,
