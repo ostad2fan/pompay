@@ -65,6 +65,11 @@ export async function setServerUrl(url: string): Promise<void> {
  * v1.4.5: per-path timeout cut to 6s (was 12s → 36s total "delay") and
  * distinguishes WHY the check failed — a 502/503 from Railway means the
  * server service is DOWN and must be redeployed, not a wrong URL.
+ * v1.4.6: when ALL paths time out at network level, an INTERNET PROBE
+ * (binance / google / github in parallel) decides between the two very
+ * different causes: «سرور خاموش است» vs «اینترنت/فیلترشکن شما قطع است» —
+ * previously the app always blamed the user's internet, which was wrong
+ * whenever the Railway service itself was hung (TLS opens, no answer).
  */
 export interface ServerTestResult {
   ok: boolean;
@@ -73,6 +78,32 @@ export interface ServerTestResult {
   via?: string;
   /** v1.4.5 — human-readable Persian reason for settings display. */
   reason?: string;
+}
+
+/** Any of these answering = the phone's internet (incl. VPN) works. */
+async function probeInternet(): Promise<boolean> {
+  const probes = [
+    'https://api.binance.com/api/v3/ping',
+    'https://www.google.com/generate_204',
+    'https://raw.githubusercontent.com/ostad2fan/pompay/main/README.md',
+  ];
+  const results = await Promise.all(
+    probes.map(async (u) => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 4_000);
+        try {
+          const res = await fetch(u, { method: 'GET', signal: controller.signal });
+          return res.ok || res.status === 204;
+        } finally {
+          clearTimeout(timer);
+        }
+      } catch {
+        return false;
+      }
+    })
+  );
+  return results.some(Boolean);
 }
 
 export async function testServerUrl(url: string): Promise<ServerTestResult> {
@@ -135,10 +166,21 @@ export async function testServerUrl(url: string): Promise<ServerTestResult> {
   if (sawOtherHttp) {
     return { ok: false, latencyMs, reason: 'سرور پاسخ خطا داد — بعداً دوباره امتحان کنید' };
   }
+  // All paths timed out / unreachable — distinguish server-side vs client-side.
+  const internetUp = await probeInternet();
+  if (internetUp) {
+    return {
+      ok: false,
+      latencyMs,
+      reason:
+        'اینترنت شما سالم است اما سرور پاسخ نمی‌دهد — سرور Railway خاموش یا معلق شده؛ از پنل Railway سرویس را Redeploy/Restart کنید',
+    };
+  }
   return {
     ok: false,
     latencyMs,
-    reason: 'اتصال به آدرس برقرار نشد — اینترنت گوشی (یا فیلترشکن) و آدرس سرور را چک کنید',
+    reason:
+      'اینترنت گوشی یا فیلترشکن قطع است — فیلترشکن را روشن کنید و دوباره تست بزنید (اگر با فیلترشکن روشن هم همین خطا آمد، آدرس سرور را چک کنید)',
   };
 }
 
@@ -451,9 +493,14 @@ export async function sendServerTelegramTest(): Promise<{
         data?.detail ?? data?.error ?? `سرور پاسخ داد: HTTP ${res.status} — توکن ربات/چت‌آیدی همگام‌سازی شده را چک کنید`,
     };
   } catch {
+    // v1.4.6 — the internet probe tells the user WHICH side is broken
+    // (the Railway service hanging vs. the phone's own connection).
+    const internetUp = await probeInternet();
     return {
       ok: false,
-      detail: 'اتصال به سرور برقرار نشد — سرور خاموش است (در Railway ری‌دپلوی کنید) یا اینترنت را چک کنید',
+      detail: internetUp
+        ? 'اینترنت شما سالم است اما سرور پاسخ نمی‌دهد — سرور Railway خاموش یا معلق شده؛ از پنل Railway سرویس را Redeploy/Restart کنید'
+        : 'اینترنت گوشی یا فیلترشکن قطع است — فیلترشکن را روشن کنید و دوباره تست بزنید',
     };
   }
 }

@@ -45,6 +45,7 @@ import {
   fetchBitperpAccount,
   fetchBitperpPositionHistory,
 } from '@/utils/bitperpApi';
+import { fetchForeignExchangeBalance } from '@/utils/foreignExchangeBalances';
 
 interface ExchangeWallet {
   id: string;
@@ -274,7 +275,11 @@ async function binanceSigned<T>(
   url: string,
   wallet: ExchangeWallet,
   extra: Record<string, string> = {},
-  method: 'GET' | 'POST' = 'GET'
+  method: 'GET' | 'POST' = 'GET',
+  /** v1.4.6: when true (main spot-account call only), AUTH failures throw a
+   * precise Persian error instead of silently returning null — the wallet card
+   * then says WHY (invalid key) instead of showing a wrong empty portfolio. */
+  required = false
 ): Promise<T | null> {
   try {
     const params = new URLSearchParams({ timestamp: String(Date.now()), recvWindow: '10000', ...extra });
@@ -284,12 +289,27 @@ async function binanceSigned<T>(
       headers: { 'X-MBX-APIKEY': wallet.apiKey },
     });
     if (!res.ok) {
-      const errData = await res.json().catch(() => null);
+      const errData = (await res.json().catch(() => null)) as { code?: number; msg?: string } | null;
       console.log(`[Wallet] Binance ${url} -> ${res.status}`, errData);
+      if (
+        required &&
+        (res.status === 401 || res.status === 403 || errData?.code === -2014 || errData?.code === -2015)
+      ) {
+        throw new Error(
+          `کلید API بایننس معتبر نیست (${errData?.code ?? res.status}: ${errData?.msg ?? ''}) — کلید و Secret را در Binance → API Management بسازید و دسترسی «Enable Reading» بدهید`
+        );
+      }
       return null;
     }
     return (await res.json()) as T;
   } catch (e) {
+    // Re-throw our own precise Persian errors (thrown above inside try).
+    if (e instanceof Error && /کلید|اتصال/.test(e.message)) throw e;
+    if (required) {
+      throw new Error(
+        `اتصال به بایننس برقرار نشد — اینترنت/فیلترشکن را چک کنید (${e instanceof Error ? e.message : String(e)})`
+      );
+    }
     console.log(`[Wallet] Binance ${url} error:`, e);
     return null;
   }
@@ -407,7 +427,10 @@ async function fetchBinanceFullAccount(wallet: ExchangeWallet): Promise<BinanceF
     await Promise.all([
       binanceSigned<{ balances?: Array<{ asset: string; free: string; locked: string }> }>(
         'https://api.binance.com/api/v3/account',
-        wallet
+        wallet,
+        {},
+        'GET',
+        true // required: invalid key → precise Persian error (v1.4.6)
       ),
       // Paginated → every earn product shows, not just the first page of 10.
       binanceEarnRows<{ asset?: string; totalAmount?: string; totalInUSDT?: string }>(
@@ -711,7 +734,22 @@ async function fetchBybitBalance(wallet: ExchangeWallet): Promise<WalletBalance[
     );
 
     if (response.ok) {
-      const data = await response.json();
+      const data = (await response.json()) as {
+        retCode?: number;
+        retMsg?: string;
+        result?: { list?: Array<{ coin?: Array<{ coin?: string; walletBalance?: string; availableToWithdraw?: string; usdValue?: string }> }> };
+      };
+      // v1.4.6 — Bybit answers HTTP 200 with retCode !== 0 on auth failures;
+      // surfacing the exact error instead of a silent empty portfolio.
+      if (Number(data?.retCode ?? 0) !== 0) {
+        const code = Number(data?.retCode ?? 0);
+        const isAuth = [10003, 10005, 10007, 10013].includes(code);
+        throw new Error(
+          isAuth
+            ? `کلید بای‌بیت معتبر نیست (کد ${code}: ${data?.retMsg ?? ''}) — کلید و Secret را در Bybit → API بسازید و دسترسی read-only بدهید`
+            : `خطای Bybit (کد ${code}): ${data?.retMsg ?? ''}`
+        );
+      }
       const accounts = data?.result?.list;
       if (Array.isArray(accounts)) {
         for (const account of accounts) {
@@ -722,7 +760,7 @@ async function fetchBybitBalance(wallet: ExchangeWallet): Promise<WalletBalance[
               const free = parseFloat(c.availableToWithdraw || '0');
               if (total > 0.0001) {
                 balances.push({
-                  asset: c.coin,
+                  asset: c.coin ?? '',
                   free,
                   locked: total - free,
                   total,
@@ -734,10 +772,16 @@ async function fetchBybitBalance(wallet: ExchangeWallet): Promise<WalletBalance[
         }
       }
     } else {
-      console.log('[Wallet] Bybit error:', response.status);
+      throw new Error(
+        `خطای شبکه بای‌بیت (HTTP ${response.status}) — اینترنت/فیلترشکن را چک کنید`
+      );
     }
   } catch (e) {
-    console.log('[Wallet] Bybit fetch error:', e);
+    // v1.4.6 — re-throw our precise Persian errors; wrap network errors.
+    if (e instanceof Error && /بای‌بیت|Bybit|اتصال/.test(e.message)) throw e;
+    throw new Error(
+      `اتصال به بای‌بیت برقرار نشد — اینترنت/فیلترشکن را چک کنید (${e instanceof Error ? e.message : String(e)})`
+    );
   }
 
   // Funding wallet — the UNIFIED query above misses the funding balance.
@@ -962,7 +1006,23 @@ async function fetchOkxBalance(wallet: ExchangeWallet): Promise<WalletBalance[]>
     });
 
     if (response.ok) {
-      const data = await response.json();
+      const data = (await response.json()) as {
+        code?: string;
+        msg?: string;
+        data?: Array<{ details?: Array<{ ccy?: string; cashBal?: string; availBal?: string; eqUsd?: string }> }>;
+      };
+      // v1.4.6 — OKX answers HTTP 200 even for auth failures (code !== '0');
+      // previously this silently returned an EMPTY portfolio which looked like
+      // «no assets» with no explanation. Now the exact OKX error is surfaced.
+      if (String(data?.code ?? '0') !== '0') {
+        const code = String(data?.code ?? '');
+        const isAuth = ['50113', '50110', '50111', '50112'].includes(code);
+        throw new Error(
+          isAuth
+            ? `کلید OKX معتبر نیست (کد ${code}: ${data?.msg ?? ''}) — کلید/Secret/Passphrase را چک کنید؛ Passphrase همان رمز دلخواهی است که موقع ساخت کلید در OKX وارد کردید`
+            : `خطای OKX (کد ${code}): ${data?.msg ?? ''}`
+        );
+      }
       const details = data?.data?.[0]?.details;
       if (Array.isArray(details)) {
         for (const d of details) {
@@ -970,7 +1030,7 @@ async function fetchOkxBalance(wallet: ExchangeWallet): Promise<WalletBalance[]>
           const free = parseFloat(d.availBal || '0');
           if (total > 0.0001) {
             balances.push({
-              asset: d.ccy,
+              asset: d.ccy ?? '',
               free,
               locked: total - free,
               total,
@@ -980,10 +1040,15 @@ async function fetchOkxBalance(wallet: ExchangeWallet): Promise<WalletBalance[]>
         }
       }
     } else {
-      console.log('[Wallet] OKX error:', response.status);
+      throw new Error(
+        `خطای شبکه OKX (HTTP ${response.status}) — اینترنت/فیلترشکن را چک کنید`
+      );
     }
   } catch (e) {
-    console.log('[Wallet] OKX fetch error:', e);
+    if (e instanceof Error && e.message.includes('OKX')) throw e;
+    throw new Error(
+      `اتصال به OKX برقرار نشد — اینترنت/فیلترشکن را چک کنید (${e instanceof Error ? e.message : String(e)})`
+    );
   }
 
   // Funding wallet — the trading-account query above misses funding assets.
@@ -1442,10 +1507,27 @@ async function fetchExchangeBalance(wallet: ExchangeWallet): Promise<ExchangeBal
       case 'bitperp':
         balances = await fetchBitperpBalance(wallet);
         break;
-      default:
-        throw new Error(
-          `صرافی ${wallet.exchangeName} فعلاً پشتیبانی نمی‌شود. فقط Binance، Bybit، OKX، BitPerp، Nobitex و Arzinja پشتیبانی می‌شوند.`
-        );
+      default: {
+        // v1.4.6 — EVERY other exchange in the list now fetches real balances
+        // (MEXC, KuCoin, Bitget, Gate, HTX/Huobi, Toobit, BingX, BitMart,
+        // SuperEx, CoinEx, Phemex, LBank, XT, Bitunix, KCEX, Iranicart, …).
+        // Precise Persian errors are thrown by the module itself.
+        const foreign = await fetchForeignExchangeBalance(wallet.exchangeId, {
+          apiKey: wallet.apiKey,
+          apiSecret: wallet.apiSecret,
+          passphrase: wallet.passphrase,
+          exchangeName: wallet.exchangeName,
+        });
+        balances = foreign.map((b) => ({
+          asset: b.asset,
+          free: b.free,
+          locked: b.locked,
+          total: b.total,
+          valueUsd: b.valueUsd,
+          section: b.section ?? 'spot',
+        }));
+        break;
+      }
     }
   } catch (e) {
     console.log('[Wallet] Fetch error:', e);
@@ -1622,7 +1704,10 @@ export default function WalletScreen() {
     []
   );
 
-  const needsPassphrase = selectedExchange === 'okx' || selectedExchange === 'kucoin';
+  const needsPassphrase =
+    selectedExchange === 'okx' ||
+    selectedExchange === 'kucoin' ||
+    selectedExchange === 'bitget';
   const isBitperp = selectedExchange === 'bitperp';
 
   const handleSendOtp = useCallback(async () => {
