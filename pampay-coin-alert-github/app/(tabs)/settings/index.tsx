@@ -33,6 +33,7 @@ import { useApp } from '@/contexts/AppContext';
 import { EXCHANGE_LIST, LEVERAGE_OPTIONS, EXCHANGES, RISK_REWARD_OPTIONS, TIMEFRAME_OPTIONS } from '@/constants/exchanges';
 import { ExchangeId, CustomIndicator } from '@/types/crypto';
 import DropdownPicker from '@/components/DropdownPicker';
+import IpStatusCard from '@/components/IpStatusCard';
 
 const POPULAR_COINS = [
   'BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE', 'ADA', 'AVAX', 'DOT', 'MATIC',
@@ -451,6 +452,9 @@ export default function SettingsScreen() {
       contentContainerStyle={styles.content}
       showsVerticalScrollIndicator={false}
     >
+      {/* ── v1.4.8: وضعیت IP — اول لیست تنظیمات ── */}
+      <IpStatusCard />
+
       <View style={styles.section}>
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionIcon}>🏦</Text>

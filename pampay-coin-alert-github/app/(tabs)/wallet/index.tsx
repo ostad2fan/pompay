@@ -47,6 +47,7 @@ import {
   fetchBitperpPositionHistory,
 } from '@/utils/bitperpApi';
 import { fetchForeignExchangeBalance } from '@/utils/foreignExchangeBalances';
+import { fetchForeignPeriodPnl } from '@/utils/foreignExchangePnl';
 
 interface ExchangeWallet {
   id: string;
@@ -356,6 +357,13 @@ interface MyTrade {
  * Approximate per-asset cost basis + unrealized PnL from spot trade history
  * (weighted-average method) — the same approach the Binance app uses for its
  * approximate PNL. Returns null for stablecoins / missing history.
+ *
+ * v1.4.8 fixes for «درصد سود/زیان همه ارزها نشان داده نمی‌شود»:
+ *   • PAGINATION: myTrades is walked backwards via fromId (up to 5 pages =
+ *     5000 trades) — assets with a long history previously only saw their
+ *     most recent 1000 trades, so avgCost came out wrong or null.
+ *   • QUOTE FALLBACK: if the asset has no USDT-pair trades, the FDUSD pair
+ *     is tried too (FDUSD ≈ 1:1 USD → exact USD cost basis).
  */
 async function computeAssetPnl(
   wallet: ExchangeWallet,
@@ -366,11 +374,32 @@ async function computeAssetPnl(
   const STABLES = ['USDT', 'USDC', 'BUSD', 'FDUSD', 'TUSD', 'DAI'];
   if (STABLES.includes(asset) || totalQty <= 0 || currentPrice <= 0) return null;
   try {
-    const trades = await binanceSigned<MyTrade[]>(
-      'https://api.binance.com/api/v3/myTrades',
-      wallet,
-      { symbol: `${asset}USDT`, limit: '1000' }
-    );
+    const quotes = ['USDT', 'FDUSD'];
+    let trades: MyTrade[] | null = null;
+    for (const quote of quotes) {
+      // Walk pages backwards via fromId (myTrades returns ascending ids).
+      const collected: MyTrade[] = [];
+      let fromId: number | undefined = undefined;
+      for (let page = 0; page < 5; page++) {
+        const extra: Record<string, string> = { limit: '1000' };
+        if (fromId !== undefined) extra.fromId = String(fromId);
+        const batch = await binanceSigned<MyTrade[]>(
+          'https://api.binance.com/api/v3/myTrades',
+          wallet,
+          { symbol: `${asset}${quote}`, ...extra }
+        );
+        if (!batch || batch.length === 0) break;
+        collected.push(...batch);
+        if (batch.length < 1000) break;
+        const firstId = batch[0]?.id;
+        if (typeof firstId !== 'number' || firstId <= 0) break;
+        fromId = firstId - 1;
+      }
+      if (collected.length > 0) {
+        trades = collected;
+        break;
+      }
+    }
     if (!trades || trades.length === 0) return null;
 
     let qty = 0;
@@ -577,25 +606,46 @@ async function fetchBinanceFullAccount(wallet: ExchangeWallet): Promise<BinanceF
   // ---- USD pricing for spot / earn / funding / alpha + per-asset PnL ----
   try {
     const priceMap = await getUsdPriceMap();
+    const derivedPrice = (asset: string): number => {
+      const direct = priceMap[`${asset}USDT`];
+      if (direct) return direct;
+      const viaBtc = priceMap[`${asset}BTC`];
+      if (viaBtc && priceMap['BTCUSDT']) return viaBtc * priceMap['BTCUSDT'];
+      const viaBnb = priceMap[`${asset}BNB`];
+      if (viaBnb && priceMap['BNBUSDT']) return viaBnb * priceMap['BNBUSDT'];
+      return 0;
+    };
     for (const bal of balances) {
       if (bal.valueUsd > 0) continue;
       const stable = stableCoinValueUsd(bal.asset, bal.total);
       if (stable !== null) {
         bal.valueUsd = stable;
-      } else if (priceMap[`${bal.asset}USDT`]) {
-        bal.valueUsd = bal.total * priceMap[`${bal.asset}USDT`];
+      } else {
+        const p = derivedPrice(bal.asset);
+        if (p) bal.valueUsd = bal.total * p;
       }
     }
 
     const priceOf = (asset: string): number => {
       const stable = stableCoinValueUsd(asset, 1);
       if (stable !== null) return 1;
-      return priceMap[`${asset}USDT`] ?? 0;
+      const direct = priceMap[`${asset}USDT`];
+      if (direct) return direct;
+      // v1.4.8 — assets without a USDT pair (BTC/BNB-quoted listings) get
+      // their price derived through the BTC/BNB pair so their VALUE and PnL%
+      // can still be shown.
+      const viaBtc = priceMap[`${asset}BTC`];
+      if (viaBtc && priceMap['BTCUSDT']) return viaBtc * priceMap['BTCUSDT'];
+      const viaBnb = priceMap[`${asset}BNB`];
+      if (viaBnb && priceMap['BNBUSDT']) return viaBnb * priceMap['BNBUSDT'];
+      return 0;
     };
     const nonFuturesAssets = new Set(
       balances.filter((b) => b.section !== 'futures').map((b) => b.asset)
     );
-    const assetList = Array.from(nonFuturesAssets).slice(0, 25);
+    // v1.4.8 — 25 → 40 assets (users with many holdings previously lost the
+    // PnL% of everything after the 25th asset).
+    const assetList = Array.from(nonFuturesAssets).slice(0, 40);
     const batchSize = 10;
     for (let i = 0; i < assetList.length; i += batchSize) {
       const batch = assetList.slice(i, i + batchSize);
@@ -695,15 +745,75 @@ async function fetchBinancePeriodPnl(wallet: ExchangeWallet, days: PnlPeriodDays
     }
   }
 
+  // ---- v1.4.8: SPOT realized PnL inside the window ----
+  // Previously this function ONLY read the futures income endpoint — a
+  // spot-only account answered with an EMPTY result («بایننس خالی نشان می‌دهد»).
+  // Now the spot trade history of every HELD asset (USDT & FDUSD pairs) is
+  // replayed: every SELL inside the window is valued against the running
+  // average buy cost (weighted-average method) → realized spot PnL + the
+  // USDT part of the spot commissions. Best-effort: trades of assets that
+  // were fully sold-and-removed (no current balance) can't be discovered via
+  // the symbol-scoped myTrades endpoint.
+  let spotRealized = 0;
+  let spotCommissions = 0;
+  let spotSells = 0;
+  try {
+    const spotAccount = await binanceSigned<{
+      balances?: Array<{ asset: string; free: string; locked: string }>;
+    }>('https://api.binance.com/api/v3/account', wallet);
+    const held = (spotAccount?.balances ?? [])
+      .map((b) => b.asset)
+      .filter((a) => !['USDT', 'USDC', 'BUSD', 'FDUSD', 'TUSD', 'DAI', 'BNB'].includes(a))
+      .slice(0, 15);
+
+    for (const asset of held) {
+      for (const quote of ['USDT', 'FDUSD']) {
+        const trades = await binanceSigned<MyTrade[]>(
+          'https://api.binance.com/api/v3/myTrades',
+          wallet,
+          { symbol: `${asset}${quote}`, startTime: String(startTime), limit: '1000' }
+        );
+        if (!trades || trades.length === 0) continue;
+
+        let qty = 0;
+        let cost = 0;
+        for (const t of trades) {
+          const q = parseFloat(t.qty);
+          const p = parseFloat(t.price);
+          // commission (USDT-quoted trades charge commission in the quote or
+          // BNB; only the quote part is USD-exact — BNB fees are ignored).
+          const comm = parseFloat(t.commission ?? '0');
+          if (t.commissionAsset === quote) spotCommissions -= comm;
+
+          if (t.isBuyer) {
+            qty += q;
+            cost += q * p;
+          } else {
+            const avg = qty > 0 ? cost / qty : 0;
+            const sellQty = Math.min(q, qty);
+            qty -= sellQty;
+            cost -= sellQty * avg;
+            spotRealized += (p - avg) * sellQty;
+            spotSells++;
+          }
+        }
+        break; // first quote with trades is enough
+      }
+    }
+  } catch (e) {
+    console.log('[Wallet] Spot period PnL (best-effort) failed:', e);
+  }
+
   return {
     periodDays: days,
     supported: true,
-    realizedPnl: realizedPnl + otherIncome,
+    realizedPnl: realizedPnl + otherIncome + spotRealized,
     fundingFees,
-    commissions,
+    commissions: commissions + spotCommissions,
     unrealizedPnl,
-    closedCount: income.filter((r) => r.incomeType === 'REALIZED_PNL').length,
-    note: 'دقیقاً از تاریخچه درآمد فیوچرز بایننس (همان اعداد بخش «PnL Analysis» بایننس)',
+    closedCount:
+      income.filter((r) => r.incomeType === 'REALIZED_PNL').length + spotSells,
+    note: 'فیوچرز: دقیقاً از درآمد بایننس (مثل PnL Analysis خود صرافی) + اسپات: فروش‌های داخل بازه بر اساس میانگین خرید (تقریبی)',
   };
 }
 // ---------------------------------------------------------------------------
@@ -1567,17 +1677,37 @@ async function fetchPeriodPnl(wallet: ExchangeWallet, days: PnlPeriodDays): Prom
       return fetchOkxPeriodPnl(wallet, days);
     case 'bitperp':
       return fetchBitperpPeriodPnl(wallet, days);
-    default:
+    default: {
+      // v1.4.8 — MEXC + Bitget closed-position history (foreignExchangePnl).
+      // Returns null for other exchanges → the note below applies.
+      const foreign = await fetchForeignPeriodPnl(
+        wallet.exchangeId,
+        { apiKey: wallet.apiKey, apiSecret: wallet.apiSecret, passphrase: wallet.passphrase },
+        days
+      );
+      if (foreign) {
+        return {
+          periodDays: days,
+          supported: true,
+          realizedPnl: foreign.realizedPnl,
+          fundingFees: foreign.fundingFees,
+          commissions: foreign.commissions,
+          unrealizedPnl: 0,
+          closedCount: foreign.closedCount,
+          note: `از تاریخچه پوزیشن‌های بسته‌شده فیوچرز ${wallet.exchangeName} در همین بازه`,
+        };
+      }
       return {
         periodDays: days,
         supported: false,
-        unavailableReason: `صرافی ${wallet.exchangeName} در API خود سود/زیان دوره‌ای ارائه نمی‌دهد — این قابلیت برای بایننس، بای‌بیت، OKX و بیت‌پرپ فعال است`,
+        unavailableReason: `صرافی ${wallet.exchangeName} در API خود سود/زیان دوره‌ای ارائه نمی‌دهد — این قابلیت برای بایننس، بای‌بیت، OKX، مکسی، بیتگت و بیت‌پرپ فعال است`,
         realizedPnl: 0,
         fundingFees: 0,
         commissions: 0,
         unrealizedPnl: 0,
         closedCount: 0,
       };
+    }
   }
 }
 
@@ -2359,6 +2489,16 @@ function WalletItem({
     balanceQuery?.error instanceof Error && balanceQuery.error.message === IRAN_GATE_ERROR;
   const showBalanceError = hasError && !iranGated && !gateError;
 
+  // v1.4.8 — per-exchange dust threshold. BitPerp's own wallet page shows
+  // even a 5-cent balance («۵ سنت موجودی دارم اما صفر می‌زند»), and any
+  // exchange whose TOTAL portfolio is under $1 also shows everything it has
+  // (hiding the whole wallet behind a $1-per-asset filter made it look empty).
+  const dustFilterUsd = useMemo(() => {
+    if (wallet.exchangeId === 'bitperp') return 0.0001;
+    if (data && data.totalValueUsd > 0 && data.totalValueUsd < 1) return 0.0001;
+    return DUST_FILTER_USD;
+  }, [wallet.exchangeId, data]);
+
   // Only the sections that actually hold something get a tab.
   const presentSections = useMemo(() => {
     if (!data) return [] as WalletSection[];
@@ -2387,20 +2527,20 @@ function WalletItem({
       }
     }
     return [...map.values()]
-      .filter((b) => b.valueUsd >= DUST_FILTER_USD)
+      .filter((b) => b.valueUsd >= dustFilterUsd)
       .sort((a, b) => b.valueUsd - a.valueUsd);
-  }, [data]);
+  }, [data, dustFilterUsd]);
 
   const sectionRows = useMemo(() => {
     if (!data || activeSection === 'all') return [] as WalletBalance[];
     return data.balances.filter(
-      (b) => (b.section ?? 'spot') === activeSection && b.valueUsd >= DUST_FILTER_USD
+      (b) => (b.section ?? 'spot') === activeSection && b.valueUsd >= dustFilterUsd
     );
-  }, [data, activeSection]);
+  }, [data, activeSection, dustFilterUsd]);
 
   const futuresPositions = useMemo(
-    () => (data?.futuresPositions ?? []).filter((pos) => pos.notionalUsd >= DUST_FILTER_USD),
-    [data]
+    () => (data?.futuresPositions ?? []).filter((pos) => pos.notionalUsd >= dustFilterUsd),
+    [data, dustFilterUsd]
   );
 
   const sectionTotalUsd = useMemo(
@@ -2560,7 +2700,7 @@ function WalletItem({
                   ))}
                   {aggregated.length === 0 && (
                     <Text style={styles.noBalance}>
-                      موجودی قابل نمایشی نیست (دارایی‌های زیر ۱ دلار مخفی می‌شوند)
+                      موجودی قابل نمایشی نیست (ارزهای کوچک زیر ۱ دلار مخفی می‌شوند — بجز بیت‌پرپ که همه موجودی‌ها حتی چند سنت را نشان می‌دهد)
                     </Text>
                   )}
 
@@ -2980,7 +3120,14 @@ function PnlPeriodSection({ wallet, iranGated }: { wallet: ExchangeWallet; iranG
 // (Binance / Bybit / OKX / BitPerp) into one card in the portfolio header.
 // ---------------------------------------------------------------------------
 
-const PERIOD_PNL_EXCHANGES: ReadonlySet<string> = new Set(['binance', 'bybit', 'okx', 'bitperp']);
+const PERIOD_PNL_EXCHANGES: ReadonlySet<string> = new Set([
+  'binance',
+  'bybit',
+  'okx',
+  'bitperp',
+  'mexc',
+  'bitget',
+]);
 
 function TotalPnlPeriodSection({
   wallets,
@@ -3072,8 +3219,8 @@ function TotalPnlPeriodSection({
         </Text>
       ) : aggregate.supportedCount === 0 && !aggregate.loading ? (
         <Text style={styles.pnlNote}>
-          ℹ️ سود/زیان دوره‌ای از API خود صرافی‌ها خوانده می‌شود و برای بایننس، بای‌بیت، OKX و
-          بیت‌پرپ فعال است — هنوز هیچ‌کدام متصل نیستند یا داده‌ای برنگردانده‌اند.
+          ℹ️ سود/زیان دوره‌ای از API خود صرافی‌ها خوانده می‌شود و برای بایننس، بای‌بیت، OKX، مکسی،
+          بیتگت و بیت‌پرپ فعال است — صرافی‌های دیگر هنوز در API خود این داده را ارائه نمی‌دهند.
         </Text>
       ) : (
         <View style={styles.pnlResult}>
@@ -3146,8 +3293,8 @@ function TotalPnlPeriodSection({
             </Text>
           </View>
           <Text style={styles.pnlNote}>
-            مجموع سود/زیان بایننس، بای‌بیت، OKX و بیت‌پرپ در {PNL_PERIOD_LABEL[period]} انتخابی — دقیقاً از
-            API خود صرافی‌ها
+            مجموع سود/زیان بایننس، بای‌بیت، OKX، مکسی، بیتگت و بیت‌پرپ در {PNL_PERIOD_LABEL[period]} انتخابی — دقیقاً از
+            API خود صرافی‌ها (صرافی‌های بدون این قابلیت در مجموع لحاظ نمی‌شوند)
           </Text>
         </View>
       )}

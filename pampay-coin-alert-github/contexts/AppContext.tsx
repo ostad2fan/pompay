@@ -36,6 +36,7 @@ import {
 } from '@/utils/hookReversalService';
 import { fetchServerSignals, fetchServerPumpDumpSignals, syncScanConfig } from '@/utils/scanServerApi';
 import { registerPushOnServer, ensureNotificationPermission } from '@/utils/pushService';
+import { checkVpnStatus } from '@/utils/vpnGuard';
 import { setThemeMode as applyPalette, getThemeMode, type ThemeMode } from '@/constants/colors';
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -215,6 +216,19 @@ export const [AppProvider, useApp] = createContextHook(() => {
   const scanMutation = useMutation({
     mutationFn: async () => {
       console.log('[AppContext] Starting full scan...');
+      // v1.4.8 — IRAN-IP GATE for the scanner itself: with an Iranian exit IP
+      // the Binance/scan APIs must not be touched at all — the user sees the
+      // exact reason instead of a network-error salad.
+      try {
+        const vpn = await checkVpnStatus();
+        if (vpn === 'iran') {
+          throw new Error(
+            'IP ایران شناسایی شد — اسکنر و همه اتصال‌های API قطع شد. فیلترشکن را روشن کنید و دوباره اسکن بزنید'
+          );
+        }
+      } catch (e) {
+        if (e instanceof Error && e.message.includes('IP ایران')) throw e;
+      }
       // 1) Direct Binance scan (fast when reachable from the phone).
       let results: TradeSignal[] = [];
       try {

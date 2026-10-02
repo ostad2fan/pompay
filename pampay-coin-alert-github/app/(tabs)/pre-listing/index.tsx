@@ -39,6 +39,7 @@ import colors from '@/constants/colors';
 import { createThemedStyles } from '@/utils/themeStyles';
 import { EXCHANGES } from '@/constants/exchanges';
 import { useApp } from '@/contexts/AppContext';
+import { useVpnGate } from '@/contexts/VpnGateContext';
 import { sendTelegramPreListingAlert } from '@/utils/telegramService';
 
 interface PreListingToken {
@@ -210,10 +211,15 @@ export default function PreListingScreen() {
   const countdownBarAnim = useRef(new Animated.Value(1)).current;
   const liveIndicator = useRef(new Animated.Value(0)).current;
 
+  // v1.4.8 — shared exit-IP state (15s poll): drives the Iran cut-off below.
+  const vpnGate = useVpnGate();
+
   const scanQuery = useQuery({
     queryKey: ['pre-listing-scan'],
     queryFn: fetchPreListingTokens,
-    refetchInterval: 3000,
+    refetchInterval: vpnGate.blocked ? false : 3000,
+    // v1.4.8 — with an Iranian exit IP the market APIs are cut completely.
+    enabled: !vpnGate.blocked,
     staleTime: 2000,
   });
 

@@ -1,157 +1,92 @@
 /**
- * StartupIpGate.tsx — v1.4.7 full-screen Iran-IP gate shown when the app opens.
+ * StartupIpGate.tsx — full-screen Iran-IP gate (v1.4.8 uses the shared
+ * VpnGateContext as its single source of truth).
  *
- * Behavior (exactly as requested):
- *   1. On cold start the phone's public exit IP + country are detected and
- *      SHOWN («IP فعلی شما X، کشور Y»).
- *   2. Iranian IP → «برای استفاده از برنامه فیلترشکن را روشن کنید» + a
- *      «تأیید و خروج» button that CLOSES the app, plus «بررسی مجدد» so the
- *      user can turn the VPN on and continue without restarting.
- *   3. Non-Iranian exit (VPN on) → green message + automatic entry.
- *   4. 'unknown' (all geo providers unreachable) → the app stays usable
- *      (gate can't brick the app when the check itself fails) — the in-app
- *      wallet banner + hard query gate still protect the exchange keys.
- *   5. Re-arms whenever the app comes back from the background
- *      (AppState 'active'), so switching the VPN off and reopening re-checks.
+ *   1. Cold start: IP + country are detected and shown
+ *      («IP فعلی شما X، کشور Y»).
+ *   2. Iranian IP → «برای استفاده از برنامه فیلترشکن را روشن کنید» +
+ *      «تأیید و خروج» (closes the app; the Android back button exits too) +
+ *      «بررسی مجدد» so the user can turn the VPN on and continue.
+ *   3. Non-Iranian exit → green message → automatic entry.
+ *   4. MID-SESSION VPN drop / IP change to Iran (v1.4.8): the gate RE-APPEARS
+ *      with «فیلترشکن خاموش شد» — every polling consumer (scanner, wallets,
+ *      market queries) is cut at the same moment via the shared context, and
+ *      this overlay blocks the whole UI until the VPN is re-checked.
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { View, Text, Pressable, StyleSheet, ActivityIndicator, BackHandler, AppState } from 'react-native';
-import { ShieldAlert, ShieldCheck, Globe, RefreshCw, LogOut } from 'lucide-react-native';
+import React, { useEffect } from 'react';
+import { View, Text, Pressable, StyleSheet, ActivityIndicator, BackHandler } from 'react-native';
+import { ShieldAlert, ShieldCheck, Globe, RefreshCw, LogOut, WifiOff } from 'lucide-react-native';
 import colors from '@/constants/colors';
 import { createThemedStyles } from '@/utils/themeStyles';
-import { getIpInfo, IpInfo } from '@/utils/vpnGuard';
+import { useVpnGate } from '@/contexts/VpnGateContext';
 
 export default function StartupIpGate() {
-  const [visible, setVisible] = useState(true);
-  const [checking, setChecking] = useState(true);
-  const [info, setInfo] = useState<IpInfo | null>(null);
-  const appState = useRef(AppState.currentState);
+  const { status, ip, countryNameFa, country, checking, reArmedAt, recheck } = useVpnGate();
 
-  const runCheck = useCallback(async (force: boolean) => {
-    setChecking(true);
-    try {
-      const result = await getIpInfo(force);
-      setInfo(result);
-      if (result.status === 'iran') {
-        setVisible(true); // blocked — gate stays
-      } else {
-        // Non-Iran (or unknown) → let the user in. A short beat shows the
-        // green status first so the message is actually readable.
-        setTimeout(() => setVisible(false), 1200);
-      }
-    } finally {
-      setChecking(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void runCheck(true);
-    const sub = AppState.addEventListener('change', (next) => {
-      const prev = appState.current;
-      appState.current = next;
-      // Coming back from background → re-verify the exit IP.
-      if (prev.match(/inactive|background/) && next === 'active') {
-        void runCheck(true);
-      }
-    });
-    return () => sub.remove();
-  }, [runCheck]);
+  const visible = status === 'iran';
 
   // While the blocking gate is up, the Android hardware back button exits
   // the app too (there is no "sneaking past" the gate).
   useEffect(() => {
-    if (!visible || info?.status !== 'iran') return;
+    if (!visible) return;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
       BackHandler.exitApp();
       return true;
     });
     return () => sub.remove();
-  }, [visible, info?.status]);
+  }, [visible]);
 
   if (!visible) return null;
 
-  const isIran = info?.status === 'iran';
-  const isOk = info?.status === 'vpn';
-  const countryLabel = info?.countryNameFa ?? info?.country ?? '—';
+  const countryLabel = countryNameFa ?? country ?? '—';
+  const midSession = reArmedAt !== null;
 
   return (
     <View style={styles.overlay}>
       <View style={styles.card}>
-        <View style={[styles.iconWrap, { backgroundColor: isIran ? colors.dark.orangeDim : isOk ? colors.dark.greenDim : colors.dark.surface }]}>
-          {checking ? (
-            <Globe size={30} color={colors.dark.accent} />
-          ) : isIran ? (
-            <ShieldAlert size={30} color={colors.dark.orange} />
+        <View style={[styles.iconWrap, { backgroundColor: colors.dark.orangeDim }]}>
+          {midSession ? (
+            <WifiOff size={30} color={colors.dark.orange} />
           ) : (
-            <ShieldCheck size={30} color={colors.dark.green} />
+            <ShieldAlert size={30} color={colors.dark.orange} />
           )}
         </View>
 
-        <Text style={styles.title}>بررسی IP برنامه</Text>
+        <Text style={styles.title}>
+          {midSession ? 'فیلترشکن خاموش شد / IP تغییر کرد' : 'بررسی IP برنامه'}
+        </Text>
 
-        {checking ? (
-          <>
-            <ActivityIndicator size="small" color={colors.dark.accent} />
-            <Text style={styles.body}>در حال تشخیص IP و کشور فعلی شما...</Text>
-          </>
-        ) : (
-          <>
-            <View style={styles.ipRow}>
-              <Text style={styles.ipLabel}>IP فعلی شما:</Text>
-              <Text style={styles.ipValue} selectable>
-                {info?.ip ?? 'نامشخص'}
-              </Text>
-            </View>
-            <View style={styles.ipRow}>
-              <Text style={styles.ipLabel}>کشور:</Text>
-              <Text style={styles.ipValue}>{countryLabel}</Text>
-            </View>
+        <View style={styles.ipRow}>
+          <Text style={styles.ipLabel}>IP فعلی شما:</Text>
+          <Text style={styles.ipValue} selectable>
+            {ip ?? 'نامشخص'}
+          </Text>
+        </View>
+        <View style={styles.ipRow}>
+          <Text style={styles.ipLabel}>کشور:</Text>
+          <Text style={styles.ipValue}>{countryLabel}</Text>
+        </View>
 
-            {isIran && (
-              <>
-                <Text style={styles.blockedMessage}>
-                  برای استفاده از برنامه فیلترشکن را روشن کنید. برنامه با IP ایران
-                  اجازه ورود ندارد؛ صرافی‌های خارجی هم IP ایران را مسدود می‌کنند و
-                  اتصال مستقیم می‌تواند امنیت حساب شما را به خطر بیندازد.
-                </Text>
-                <Pressable style={styles.exitBtn} onPress={() => BackHandler.exitApp()}>
-                  <LogOut size={14} color="#FFF" />
-                  <Text style={styles.exitBtnText}>تأیید و خروج از برنامه</Text>
-                </Pressable>
-                <Pressable style={styles.recheckBtn} onPress={() => void runCheck(true)}>
-                  <RefreshCw size={12} color={colors.dark.accent} />
-                  <Text style={styles.recheckBtnText}>
-                    فیلترشکن را وصل کردم — بررسی مجدد
-                  </Text>
-                </Pressable>
-              </>
-            )}
+        <Text style={styles.blockedMessage}>
+          {midSession
+            ? 'IP شما الان ایران تشخیص داده شد — اتصال همه بخش‌های برنامه (اسکنر، کیف پول‌ها و داده‌های بازار) همان لحظه قطع شد و این پیام تا زمان وصل شدن فیلترشکن نمایش داده می‌شود.'
+            : 'برای استفاده از برنامه فیلترشکن را روشن کنید. برنامه با IP ایران اجازه ورود ندارد؛ صرافی‌های خارجی هم IP ایران را مسدود می‌کنند و اتصال مستقیم می‌تواند امنیت حساب شما را به خطر بیندازد.'}
+        </Text>
 
-            {isOk && (
-              <Text style={styles.okMessage}>
-                ✓ اتصال از کشور {countryLabel} برقرار است — ورود به برنامه...
-              </Text>
-            )}
+        <Pressable style={styles.exitBtn} onPress={() => BackHandler.exitApp()}>
+          <LogOut size={14} color="#FFF" />
+          <Text style={styles.exitBtnText}>تأیید و خروج از برنامه</Text>
+        </Pressable>
 
-            {info?.status === 'unknown' && (
-              <>
-                <Text style={styles.unknownMessage}>
-                  تشخیص کشور در دسترس نبود (سرویس‌های تشخیص IP پاسخ ندادند).
-                  ورود انجام می‌شود؛ در بخش مدیریت دارایی، اگر IP ایران تشخیص داده
-                  شود، صرافی‌های خارجی به‌صورت خودکار مسدود می‌شوند.
-                </Text>
-                <Pressable style={styles.recheckBtn} onPress={() => void runCheck(true)}>
-                  <RefreshCw size={12} color={colors.dark.accent} />
-                  <Text style={styles.recheckBtnText}>بررسی مجدد</Text>
-                </Pressable>
-                <Pressable style={styles.enterBtn} onPress={() => setVisible(false)}>
-                  <Text style={styles.enterBtnText}>ادامه</Text>
-                </Pressable>
-              </>
-            )}
-          </>
-        )}
+        <Pressable style={styles.recheckBtn} onPress={() => void recheck()} disabled={checking}>
+          <RefreshCw size={12} color={colors.dark.accent} />
+          <Text style={styles.recheckBtnText}>
+            {checking ? 'در حال بررسی...' : 'فیلترشکن را وصل کردم — بررسی مجدد'}
+          </Text>
+        </Pressable>
+
+        {checking && <ActivityIndicator size="small" color={colors.dark.accent} />}
       </View>
     </View>
   );
@@ -185,11 +120,13 @@ const styles = createThemedStyles(() =>
       borderRadius: 30,
       alignItems: 'center',
       justifyContent: 'center',
+      backgroundColor: colors.dark.orangeDim,
     },
     title: {
       fontSize: 16,
       fontWeight: '800' as const,
       color: colors.dark.text,
+      textAlign: 'center',
     },
     ipRow: {
       flexDirection: 'row',
@@ -208,11 +145,6 @@ const styles = createThemedStyles(() =>
       fontWeight: '700' as const,
       color: colors.dark.text,
     },
-    body: {
-      fontSize: 12,
-      color: colors.dark.textSecondary,
-      textAlign: 'right',
-    },
     blockedMessage: {
       fontSize: 12,
       lineHeight: 20,
@@ -224,18 +156,6 @@ const styles = createThemedStyles(() =>
       borderColor: colors.dark.orange + '55',
       padding: 10,
       alignSelf: 'stretch',
-    },
-    okMessage: {
-      fontSize: 12,
-      lineHeight: 19,
-      color: colors.dark.green,
-      textAlign: 'right',
-    },
-    unknownMessage: {
-      fontSize: 11,
-      lineHeight: 17,
-      color: colors.dark.textSecondary,
-      textAlign: 'right',
     },
     exitBtn: {
       flexDirection: 'row',
@@ -268,19 +188,6 @@ const styles = createThemedStyles(() =>
       color: colors.dark.accent,
       fontSize: 12,
       fontWeight: '700' as const,
-    },
-    enterBtn: {
-      alignItems: 'center',
-      backgroundColor: colors.dark.accent,
-      borderRadius: 10,
-      paddingVertical: 10,
-      paddingHorizontal: 18,
-      alignSelf: 'stretch',
-    },
-    enterBtnText: {
-      color: '#FFF',
-      fontSize: 12,
-      fontWeight: '800' as const,
     },
   })
 );

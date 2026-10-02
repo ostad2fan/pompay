@@ -6,6 +6,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { StatusBar } from "expo-status-bar";
 import { View } from "react-native";
 import { AppProvider, useApp } from "@/contexts/AppContext";
+import { VpnGateProvider } from "@/contexts/VpnGateContext";
 import colors from "@/constants/colors";
 import UpdateBanner from "@/components/UpdateBanner";
 import StartupIpGate from "@/components/StartupIpGate";
@@ -56,7 +57,12 @@ export default function RootLayout() {
     <QueryClientProvider client={queryClient}>
       <GestureHandlerRootView>
         <AppProvider>
-          <ThemedAppRoot />
+          {/* v1.4.8 — one shared exit-IP poller (15s + on resume) feeding the
+              startup/mid-session gate, the settings IP card and every query
+              cut-off while the exit IP is Iranian. */}
+          <VpnGateProvider>
+            <ThemedAppRoot />
+          </VpnGateProvider>
         </AppProvider>
       </GestureHandlerRootView>
     </QueryClientProvider>

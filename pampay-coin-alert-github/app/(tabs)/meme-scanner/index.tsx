@@ -48,6 +48,7 @@ import {
 import { ExchangeId } from '@/types/crypto';
 import { EXCHANGES, EXCHANGE_LIST } from '@/constants/exchanges';
 import { scanMemeTokens, searchMemeToken } from '@/utils/memeApiService';
+import { useVpnGate } from '@/contexts/VpnGateContext';
 import { useApp } from '@/contexts/AppContext';
 import { sendTelegramMemeShortSignal } from '@/utils/telegramService';
 
@@ -101,6 +102,9 @@ export default function MemeScannerScreen() {
     staleTime: Infinity,
   });
 
+  // v1.4.8 — shared exit-IP state (15s poll): drives the Iran cut-off below.
+  const vpnGate = useVpnGate();
+
   const exchangeQuery = useQuery({
     queryKey: ['meme-exchanges'],
     queryFn: loadExchangeConfigs,
@@ -113,7 +117,9 @@ export default function MemeScannerScreen() {
   const scanQuery = useQuery({
     queryKey: ['meme-scan', filter],
     queryFn: () => scanMemeTokens(filter),
-    refetchInterval: 10000,
+    refetchInterval: vpnGate.blocked ? false : 10000,
+    // v1.4.8 — with an Iranian exit IP the market APIs are cut completely.
+    enabled: !vpnGate.blocked,
     staleTime: 5000,
   });
 
