@@ -1,8 +1,46 @@
-import { Tabs } from 'expo-router';
+import { Tabs, useRouter, usePathname } from 'expo-router';
 import { Radar, Settings, Fish, Wallet, Brain, Skull, Rocket, TrendingUp } from 'lucide-react-native';
+import { useEffect, useRef } from 'react';
+import { AppState } from 'react-native';
 import colors from '@/constants/colors';
 
+/** After this long in the background, re-opening the app returns to settings. */
+const RETURN_TO_SETTINGS_AFTER_MS = 15 * 60_000;
+
 export default function TabLayout() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const bootedOnce = useRef(false);
+  const backgroundedAt = useRef<number | null>(null);
+
+  useEffect(() => {
+    // v1.4.10 — «وقتی برنامه را باز می‌کنم بخش تنظیمات همیشه نشان داده شود»:
+    // every fresh app launch lands on the settings tab (where the IP-status
+    // card also lives), instead of the last-opened / scanner screen.
+    if (!bootedOnce.current) {
+      bootedOnce.current = true;
+      if (!/settings/.test(pathname ?? '')) {
+        router.replace('/(tabs)/settings');
+      }
+    }
+  }, [pathname, router]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'background' || state === 'inactive') {
+        backgroundedAt.current = Date.now();
+      } else if (state === 'active' && backgroundedAt.current !== null) {
+        const awayMs = Date.now() - backgroundedAt.current;
+        backgroundedAt.current = null;
+        if (awayMs >= RETURN_TO_SETTINGS_AFTER_MS) {
+          // Opening the app again after a long absence → back to settings.
+          router.replace('/(tabs)/settings');
+        }
+      }
+    });
+    return () => sub.remove();
+  }, [router]);
+
   return (
     <Tabs
       screenOptions={{

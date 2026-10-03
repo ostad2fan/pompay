@@ -31,10 +31,21 @@ APP_GRADLE = os.path.join(ANDROID, "app", "build.gradle")
 ROOT_GRADLE = os.path.join(ANDROID, "build.gradle")
 GRADLE_PROPS = os.path.join(ANDROID, "gradle.properties")
 
-KEYSTORE_REL = "../../apk/keystore/pampay-release-key.jks"
 STORE_PASS = "PomPay2026Release"
 KEY_ALIAS = "pampay"
 KEY_PASS = "PomPay2026Release"
+
+# v1.4.10 — the keystore lives at <root>/keystore/ in the current repo tree;
+# older trees kept it under <root>/apk/keystore/. Accept both.
+_KS_CANDIDATES = [
+    os.path.join(ROOT, "keystore", "pampay-release-key.jks"),
+    os.path.join(ROOT, "apk", "keystore", "pampay-release-key.jks"),
+]
+_KEYSTORE_PATH = next((p for p in _KS_CANDIDATES if os.path.isfile(p)), None)
+if _KEYSTORE_PATH is None:
+    print("!! keystore not found (looked in keystore/ and apk/keystore/)", file=sys.stderr)
+# Relative to android/app/ — gradle resolves it from the app module dir.
+KEYSTORE_REL = os.path.relpath(_KEYSTORE_PATH or _KS_CANDIDATES[0], os.path.join(ANDROID, "app"))
 
 GOOGLE_SERVICES_CLASSPATH = "com.google.gms:google-services:4.4.2"
 

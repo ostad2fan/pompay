@@ -25,6 +25,7 @@ import {
   getInstalledVersion,
   onUpdateInfoChanged,
   openApkDownload,
+  apkFileNameFor,
 } from '@/utils/appUpdate';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import colors from '@/constants/colors';
@@ -1225,12 +1226,29 @@ export default function SettingsScreen() {
           )}
         </View>
 
+        {/* v1.4.10 — آخرین نسخه موجود + نام فایلی که دانلود می‌شود، تا کاربر
+            همیشه بداند دقیقاً کدام نسخه را دانلود می‌کند. */}
+        {updateInfo ? (
+          <View style={styles.versionRow}>
+            <Text style={styles.versionLabel}>آخرین نسخه منتشرشده:</Text>
+            <Text style={[styles.versionValue, updateInfo.available && { color: colors.dark.accent, fontWeight: '800' }]}>
+              {updateInfo.latestVersion}
+            </Text>
+          </View>
+        ) : null}
+        {updateInfo?.available ? (
+          <View style={styles.versionRow}>
+            <Text style={styles.versionLabel}>فایل دانلودی:</Text>
+            <Text style={styles.versionValue}>{apkFileNameFor(updateInfo)}</Text>
+          </View>
+        ) : null}
+
         {updateInfo?.available && updateInfo.notes ? (
           <Text style={styles.updateNotes}>📝 {updateInfo.notes}</Text>
         ) : null}
 
         <Text style={styles.telegramHelpText}>
-          بررسی نسخه به‌صورت خودکار از گیت‌هاب انجام می‌شود؛ با انتشار نسخه جدید، بنر بالای برنامه ظاهر می‌شود و با زدن دکمه بروزرسانی، فایل APK جدید مستقیماً روی همین نسخه نصب می‌شود (بدون حذف نسخه قبلی).
+          بررسی نسخه به‌صورت خودکار از گیت‌هاب انجام می‌شود؛ با انتشار نسخه جدید، بنر بالای برنامه ظاهر می‌شود و با زدن دکمه بروزرسانی، فایل APK جدید (نام فایل شامل شماره نسخه است) مستقیماً روی همین نسخه نصب می‌شود (بدون حذف نسخه قبلی).
         </Text>
         <View style={styles.updateButtonsRow}>
           <Pressable

@@ -21,14 +21,24 @@ import { Linking, Platform } from 'react-native';
 import { getServerUrl } from './scanServerApi';
 
 /** Must match app.json «version» at release time. */
-export const APP_VERSION = '1.4.9';
-export const APP_VERSION_CODE = 14;
+export const APP_VERSION = '1.4.10';
+export const APP_VERSION_CODE = 15;
 
 const REPO_OWNER = 'ostad2fan';
 const REPO_NAME = 'pompay';
 const REPO_BRANCH = 'main';
 const REPO_DIR = 'pampay-coin-alert-github';
 const APK_NAME = 'PampDumpCoins-latest.apk';
+/**
+ * v1.4.10 — the APK now ALSO ships under a VERSIONED name
+ * (PampDumpCoins-v1.4.10.apk). The versioned URL is the primary download
+ * because it can NEVER collide with a cached older file: every release is a
+ * brand-new URL, so the browser/DownloadManager cannot serve the previous
+ * version «by mistake» (the #1 cause of «دکمه دانلود نسخه قدیمی می‌آورد» —
+ * jsDelivr sends cache-control max-age=604800 = 7 days on the fixed name).
+ * The fixed-name copy stays in the repo as a fallback for older app builds.
+ */
+const VERSIONED_APK_NAME = `PampDumpCoins-v${APP_VERSION}.apk`;
 
 /** Direct GitHub raw URL for version.json (blocked in Iran without VPN). */
 export const DEFAULT_UPDATE_URL =
@@ -151,7 +161,11 @@ async function fetchVersionJson(url: string): Promise<RawVersionJson> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12_000);
   try {
-    const res = await fetch(url, {
+    // v1.4.10 — cache-buster: CDNs and the Android WebView otherwise keep
+    // answering from cache for hours after a release, so the app would think
+    // it is up-to-date (or re-download an old APK).
+    const bust = url.includes('?') ? '&' : '?';
+    const res = await fetch(`${url}${bust}t=${Date.now()}`, {
       headers: { 'Cache-Control': 'no-cache', Accept: 'application/json' },
       signal: controller.signal,
     });
@@ -220,34 +234,46 @@ export async function dismissUpdate(version: string): Promise<void> {
   } catch {}
 }
 
-/**
- * Alternative download URLs for the same APK file. jsDelivr mirrors GitHub
- * files (up to 20MB) and is reachable from Iran; the Railway relay streams
- * the file as a last resort.
- */
-function apkFallbackUrls(apkUrl: string): string[] {
-  const urls = [apkUrl];
+/** The versioned (primary) and fixed-name (fallback) raw/CDN APK URLs. */
+function apkDownloadCandidates(apkUrl: string): string[] {
+  // Always start from the URL version.json gave us (versioned name since
+  // v1.4.10) + cache-buster so no layer can serve a stale copy.
+  const bust = (u: string) => `${u}${u.includes('?') ? '&' : '?'}v=${APP_VERSION_CODE}-${Date.now()}`;
+  const urls = [bust(apkUrl)];
+  const rawVersioned = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}/${REPO_DIR}/apk/${VERSIONED_APK_NAME}`;
+  const cdnVersioned = `https://cdn.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${VERSIONED_APK_NAME}`;
+  const fastlyVersioned = `https://fastly.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${VERSIONED_APK_NAME}`;
+  if (!/raw\.githubusercontent\.com/.test(apkUrl)) {
+    // CDN first (Iran-friendly), then raw, then fastly — all versioned.
+    urls.push(bust(cdnVersioned), bust(rawVersioned), bust(fastlyVersioned));
+  } else {
+    urls.push(bust(cdnVersioned), bust(fastlyVersioned));
+  }
+  // Last resorts: the fixed-name mirrors (kept in sync in the repo) + relay.
   const raw = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}/${REPO_DIR}/apk/${APK_NAME}`;
   const cdn = `https://cdn.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${APK_NAME}`;
   const fastly = `https://fastly.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${APK_NAME}`;
-  if (/raw\.githubusercontent\.com/.test(apkUrl)) {
-    // Prefer the CDN first (Iran-friendly), then raw, then fastly.
-    return [cdn, apkUrl, fastly];
-  }
   for (const alt of [cdn, raw, fastly]) {
-    if (!urls.includes(alt)) urls.push(alt);
+    if (!urls.some((u) => u.startsWith(alt))) urls.push(bust(alt));
   }
   return urls;
 }
 
+/** File name the browser will save — with the version visible. */
+export function apkFileNameFor(info: { latestVersion?: string } | null | undefined): string {
+  const v = info?.latestVersion ?? APP_VERSION;
+  return `PampDumpCoins-v${v}.apk`;
+}
+
 /**
- * Opens the APK URL → the browser downloads the file directly. Tries the
- * jsDelivr CDN mirror first when the primary URL is the (often blocked)
- * raw.githubusercontent.com, and falls back through the remaining mirrors
- * (ending with the Railway server relay) when a URL cannot be opened at all.
+ * Opens the APK URL → the browser downloads the file directly. The download
+ * filename carries the version (PampDumpCoins-v1.4.10.apk) and every URL
+ * gets a cache-buster so no cached older APK can ever be served. Falls back
+ * through the mirrors (ending with the Railway server relay) when a URL
+ * cannot be opened at all.
  */
 export async function openApkDownload(apkUrl: string): Promise<void> {
-  const candidates = [...apkFallbackUrls(apkUrl)];
+  const candidates = [...apkDownloadCandidates(apkUrl)];
   try {
     const serverUrl = await getServerUrl();
     if (serverUrl) candidates.push(`${serverUrl}/latest-apk`);

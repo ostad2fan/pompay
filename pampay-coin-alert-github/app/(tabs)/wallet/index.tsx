@@ -48,6 +48,7 @@ import {
 } from '@/utils/bitperpApi';
 import { fetchForeignExchangeBalance } from '@/utils/foreignExchangeBalances';
 import { fetchForeignPeriodPnl } from '@/utils/foreignExchangePnl';
+import { exchangeNow, markClockStale } from '@/utils/exchangeClock';
 
 interface ExchangeWallet {
   id: string;
@@ -272,6 +273,15 @@ function stableCoinValueUsd(asset: string, amount: number): number | null {
 /**
  * Signed Binance request helper (HMAC SHA256). Each section is optional — a
  * missing permission / unsupported endpoint never breaks the whole overview.
+ *
+ * v1.4.10:
+ *   1) The timestamp comes from Binance's own /api/v3/time (exchangeClock) —
+ *      «موجودی یافت نشد» روی گوشی‌هایی که ساعتشان با سرور بایننس اختلاف
+ *      دارد دیگر رخ نمی‌دهد (-1021 خارج از recvWindow بود).
+ *   2) On required calls, TRANSIENT failures (-1021 timestamp, 429, 5xx,
+ *      network) now THROW instead of returning null — react-query retries
+ *      them (1.2s / 2.4s backoff) and the card shows the real reason instead
+ *      of a fake «موجودی‌ای یافت نشد».
  */
 async function binanceSigned<T>(
   url: string,
@@ -284,7 +294,12 @@ async function binanceSigned<T>(
   required = false
 ): Promise<T | null> {
   try {
-    const params = new URLSearchParams({ timestamp: String(Date.now()), recvWindow: '10000', ...extra });
+    const ts = await exchangeNow('binance');
+    const params = new URLSearchParams({
+      timestamp: String(ts),
+      recvWindow: '30000',
+      ...extra,
+    });
     const signature = signBinanceQuery(params.toString(), wallet.apiSecret);
     const res = await fetch(`${url}?${params.toString()}&signature=${signature}`, {
       method,
@@ -299,6 +314,18 @@ async function binanceSigned<T>(
       ) {
         throw new Error(
           `کلید API بایننس معتبر نیست (${errData?.code ?? res.status}: ${errData?.msg ?? ''}) — کلید و Secret را در Binance → API Management بسازید و دسترسی «Enable Reading» بدهید`
+        );
+      }
+      // v1.4.10 — timestamp drift: re-sync the clock so the react-query retry
+      // fires with a correct stamp instead of the same wrong one.
+      if (errData?.code === -1021 || errData?.code === -1022) {
+        markClockStale('binance');
+      }
+      if (required) {
+        // Transient (429/5xx/-1021) on the MAIN call → throw so react-query
+        // retries with backoff; an empty success would lie to the user.
+        throw new Error(
+          `اتصال به بایننس موقتاً برقرار نشد (کد ${errData?.code ?? res.status}) — خودکار دوباره تلاش می‌شود`
         );
       }
       return null;

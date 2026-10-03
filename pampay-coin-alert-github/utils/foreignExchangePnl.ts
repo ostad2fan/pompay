@@ -19,6 +19,7 @@
  */
 
 import CryptoJS from 'crypto-js';
+import { exchangeNow, markClockStale } from './exchangeClock';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_PAGES = 10;
@@ -79,8 +80,40 @@ export interface ForeignPnlCredentials {
 }
 
 // ---------------------------------------------------------------------------
-// MEXC
+// MEXC — futures closed-position history (contract API v1).
+// v1.4.10: Request-Time now comes from MEXC's own /api/v3/time (see
+// exchangeClock.ts) — the old code trusted the phone clock and clock drift
+// produced timestamp/signature rejections.
 // ---------------------------------------------------------------------------
+
+async function mexcHistoryPage(
+  w: ForeignPnlCredentials,
+  page: number
+): Promise<{ body: Record<string, unknown> | null; status: number }> {
+  const params: Record<string, string> = { page: String(page), pageSize: '50' };
+  const qsSorted = Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join('&');
+  const ts = await exchangeNow('mexc');
+  const signature = CryptoJS.HmacSHA256(
+    `${w.apiKey}${ts}${qsSorted}`,
+    w.apiSecret
+  ).toString(CryptoJS.enc.Hex);
+
+  const res = await rawFetch(
+    `https://api.mexc.com/api/v1/private/position/list/history_positions?${qsSorted}`,
+    {
+      headers: {
+        ApiKey: w.apiKey,
+        'Request-Time': String(ts),
+        Signature: signature,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+  return { body: parseJson(res.text), status: res.status };
+}
 
 async function mexcPeriodPnl(w: ForeignPnlCredentials, days: number): Promise<ForeignPeriodPnl | null> {
   const windowStart = Date.now() - days * 86_400_000;
@@ -90,43 +123,31 @@ async function mexcPeriodPnl(w: ForeignPnlCredentials, days: number): Promise<Fo
   let closedCount = 0;
 
   for (let page = 1; page <= MAX_PAGES; page++) {
-    // MEXC sign string: apiKey + timestamp + business params SORTED + '&' joined.
-    const params: Record<string, string> = { page: String(page), pageSize: '50' };
-    const qsSorted = Object.keys(params)
-      .sort()
-      .map((k) => `${k}=${params[k]}`)
-      .join('&');
-    const ts = Date.now();
-    const signature = CryptoJS.HmacSHA256(
-      `${w.apiKey}${ts}${qsSorted}`,
-      w.apiSecret
-    ).toString(CryptoJS.enc.Hex);
-
-    const res = await rawFetch(
-      `https://api.mexc.com/api/v1/private/position/list/history_positions?${qsSorted}`,
-      {
-        headers: {
-          ApiKey: w.apiKey,
-          'Request-Time': String(ts),
-          Signature: signature,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-    const body = parseJson(res.text);
-    if (!body) throw new Error(`پاسخ نامعتبر از MEXC (HTTP ${res.status})`);
+    let { body, status } = await mexcHistoryPage(w, page);
+    // Timestamp rejection → re-sync the server clock, retry the page once.
+    const firstCode = String(body?.code ?? '');
+    if (body && (firstCode === '700003' || /timestamp/i.test(String(body?.message ?? '')))) {
+      markClockStale('mexc');
+      ({ body, status } = await mexcHistoryPage(w, page));
+    }
+    if (!body) throw new Error(`پاسخ نامعتبر از MEXC (HTTP ${status})`);
 
     // auth failures → precise Persian error
     const code = String(body.code ?? '');
     const message = String(body.message ?? body.msg ?? '');
     if (
-      res.status === 401 ||
+      status === 401 ||
       code === '401' ||
       code === '402' ||
       /expired|invalid|not\s*exist/i.test(message)
     ) {
       throw new Error(
         `کلید API مکسی معتبر نیست یا دسترسی «View Order Details» ندارد (${message || code}) — در MEXC → API Management کلید را با مجوز خواندن بسازید`
+      );
+    }
+    if (code === '700003') {
+      throw new Error(
+        `ساعت گوشی با سرور MEXC اختلاف دارد (کد 700003) — ساعت و تاریخ گوشی را «خودکار» تنظیم کنید و دوباره تلاش کنید`
       );
     }
     if (body.success === false && code !== '0' && code !== '200') {
@@ -161,10 +182,60 @@ async function mexcPeriodPnl(w: ForeignPnlCredentials, days: number): Promise<Fo
 
 // ---------------------------------------------------------------------------
 // Bitget
+// v1.4.10: 40085 = «حساب Unified Account» — classic v2 history-position is
+// rejected, so the SAME PnL is read from the UTA endpoint:
+//   GET /api/v3/position/history-position?category=USDT-FUTURES&limit=100
+//   rows: {cumRealisedPnl, netProfit, totalFunding, openFeeTotal, closeFeeTotal, updatedTime}
+//   pagination: data.cursor → next request idLessThan=cursor
+// The classic (v2) route stays first — classic accounts keep working as before.
 // ---------------------------------------------------------------------------
+
+async function bitgetSignedGet(
+  w: ForeignPnlCredentials,
+  pathWithQuery: string
+): Promise<{ body: Record<string, unknown> | null; status: number }> {
+  const ts = (await exchangeNow('bitget')).toString();
+  const signature = CryptoJS.enc.Base64.stringify(
+    CryptoJS.HmacSHA256(`${ts}GET${pathWithQuery}`, w.apiSecret)
+  );
+  const res = await rawFetch(`https://api.bitget.com${pathWithQuery}`, {
+    headers: {
+      'ACCESS-KEY': w.apiKey,
+      'ACCESS-SIGN': signature,
+      'ACCESS-TIMESTAMP': ts,
+      'ACCESS-PASSPHRASE': w.passphrase ?? '',
+      'Content-Type': 'application/json',
+      locale: 'en-US',
+    },
+  });
+  return { body: parseJson(res.text), status: res.status };
+}
+
+function bitgetAuthError(code: string, msg: string): Error | null {
+  if (code === '40037' || code === '40036' || code === '40038') {
+    return new Error(
+      `کلید Bitget معتبر نیست (${msg}) — کلید/Secret/Passphrase را چک کنید`
+    );
+  }
+  return null;
+}
 
 async function bitgetPeriodPnl(w: ForeignPnlCredentials, days: number): Promise<ForeignPeriodPnl | null> {
   const windowStart = Date.now() - days * 86_400_000;
+
+  // ---- classic (v2) first ----
+  const classic = await bitgetClassicPnl(w, windowStart);
+  if (classic.uta) {
+    // ---- UTA (v3): cursor-paginated position history ----
+    return bitgetUtaPnl(w, windowStart);
+  }
+  return classic.result;
+}
+
+async function bitgetClassicPnl(
+  w: ForeignPnlCredentials,
+  windowStart: number
+): Promise<{ uta: boolean; result: ForeignPeriodPnl | null }> {
   let realizedPnl = 0;
   let fundingFees = 0;
   let commissions = 0;
@@ -173,28 +244,17 @@ async function bitgetPeriodPnl(w: ForeignPnlCredentials, days: number): Promise<
   for (let pageNo = 1; pageNo <= MAX_PAGES; pageNo++) {
     const path = '/api/v2/mix/position/history-position';
     const qs = `productType=USDT-FUTURES&pageSize=50&pageNo=${pageNo}`;
-    const ts = Date.now().toString();
-    const signature = CryptoJS.enc.Base64.stringify(
-      CryptoJS.HmacSHA256(`${ts}GET${path}?${qs}`, w.apiSecret)
-    );
-    const res = await rawFetch(`https://api.bitget.com${path}?${qs}`, {
-      headers: {
-        'ACCESS-KEY': w.apiKey,
-        'ACCESS-SIGN': signature,
-        'ACCESS-TIMESTAMP': ts,
-        'ACCESS-PASSPHRASE': w.passphrase ?? '',
-        'Content-Type': 'application/json',
-        locale: 'en-US',
-      },
-    });
-    const body = parseJson(res.text);
-    if (!body) throw new Error(`پاسخ نامعتبر از Bitget (HTTP ${res.status})`);
+    const { body, status } = await bitgetSignedGet(w, `${path}?${qs}`);
+    if (!body) throw new Error(`پاسخ نامعتبر از Bitget (HTTP ${status})`);
 
     const code = String(body.code ?? '');
-    if (code === '40037' || code === '40036' || res.status === 401) {
-      throw new Error(
-        `کلید Bitget معتبر نیست (${String(body.msg ?? '')}) — کلید/Secret/Passphrase را چک کنید`
-      );
+    if (code === '40085') {
+      // Unified Trading Account → retry via the v3 UTA endpoint instead.
+      return { uta: true, result: null };
+    }
+    const authErr = bitgetAuthError(code, String(body.msg ?? ''));
+    if (authErr || status === 401) {
+      throw authErr ?? new Error('کلید Bitget معتبر نیست (401) — کلید/Secret/Passphrase را چک کنید');
     }
     if (code !== '00000') {
       throw new Error(`خطای Bitget در دریافت سود/زیان (کد ${code}): ${String(body.msg ?? '')}`);
@@ -219,6 +279,51 @@ async function bitgetPeriodPnl(w: ForeignPnlCredentials, days: number): Promise<
 
     // Pagination: stop when fewer than pageSize rows came back.
     if (rows.length < 50) break;
+  }
+
+  return { uta: false, result: { realizedPnl, fundingFees, commissions, closedCount } };
+}
+
+async function bitgetUtaPnl(
+  w: ForeignPnlCredentials,
+  windowStart: number
+): Promise<ForeignPeriodPnl | null> {
+  let realizedPnl = 0;
+  let fundingFees = 0;
+  let commissions = 0;
+  let closedCount = 0;
+  let cursor: string | undefined;
+
+  for (let round = 0; round < MAX_PAGES * 2; round++) {
+    const path = '/api/v3/position/history-position';
+    let qs = `category=USDT-FUTURES&limit=100`;
+    if (cursor) qs += `&idLessThan=${cursor}`;
+    const { body, status } = await bitgetSignedGet(w, `${path}?${qs}`);
+    if (!body) throw new Error(`پاسخ نامعتبر از Bitget UTA (HTTP ${status})`);
+
+    const code = String(body.code ?? '');
+    const authErr = bitgetAuthError(code, String(body.msg ?? ''));
+    if (authErr) throw authErr;
+    if (code !== '00000') {
+      throw new Error(`خطای Bitget UTA در دریافت سود/زیان (کد ${code}): ${String(body.msg ?? '')}`);
+    }
+
+    const data = (body.data ?? {}) as Record<string, unknown>;
+    const rows = Array.isArray(data.list) ? (data.list as Array<Record<string, unknown>>) : [];
+    if (rows.length === 0) break;
+
+    for (const r of rows) {
+      const closeMs = toMs(r.updatedTime ?? r.createdTime);
+      if (closeMs > 0 && closeMs < windowStart) continue;
+      realizedPnl += toNum(r.cumRealisedPnl ?? r.netProfit ?? r.pnl);
+      fundingFees += toNum(r.totalFunding ?? r.fundingFee ?? 0);
+      commissions += toNum(r.openFeeTotal ?? 0) + toNum(r.closeFeeTotal ?? 0);
+      closedCount++;
+    }
+
+    const next = String(data.cursor ?? '');
+    if (!next || rows.length < 100) break;
+    cursor = next;
   }
 
   return { realizedPnl, fundingFees, commissions, closedCount };

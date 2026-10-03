@@ -19,6 +19,7 @@ import {
   isUpdateDismissed,
   onUpdateInfoChanged,
   openApkDownload,
+  apkFileNameFor,
 } from '@/utils/appUpdate';
 
 const CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
@@ -110,7 +111,8 @@ export default function UpdateBanner() {
             <Text style={styles.title}>
               🎉 نسخه جدید {info.latestVersion} منتشر شد!
             </Text>
-            <Text style={styles.subtitle} numberOfLines={2}>
+            <Text style={styles.subtitle} numberOfLines={3}>
+              {`فایل دانلودی: ${apkFileNameFor(info)}\n`}
               {info.notes?.trim()
                 ? info.notes
                 : 'نسخه نصب‌شده شما قدیمی است. برای دریافت امکانات جدید، بروزرسانی کنید.'}
@@ -122,7 +124,9 @@ export default function UpdateBanner() {
             testID="update-banner-download"
           >
             <Download size={15} color="#0B0E11" />
-            <Text style={styles.downloadText}>دانلود</Text>
+            {/* v1.4.10 — شماره نسخه روی خود دکمه، تا کاربر بداند چه نسخه‌ای
+                دانلود می‌شود (نام فایل هم شامل نسخه است). */}
+            <Text style={styles.downloadText}>{`دانلود ${info.latestVersion}`}</Text>
           </Pressable>
           <Pressable onPress={handleClose} hitSlop={10} style={styles.closeBtn}>
             <X size={17} color={colors.dark.textSecondary} />

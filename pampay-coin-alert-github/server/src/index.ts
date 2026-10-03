@@ -306,28 +306,43 @@ setInterval(() => {
 // raw.githubusercontent.com is blocked on many Iranian ISPs. The app now
 // checks for updates via THIS server first (/latest-version) and downloads
 // the APK via /latest-apk when jsDelivr and GitHub are both unreachable.
+// v1.4.10: version.json is fetched with a cache-buster (GitHub raw caches 5
+// minutes upstream) and falls back to the jsDelivr CDN mirror when raw is
+// slow/unreachable — the relay itself caches for max 60 seconds so a fresh
+// release is visible almost immediately.
 
 const VERSION_JSON_URL =
   "https://raw.githubusercontent.com/ostad2fan/pompay/main/pampay-coin-alert-github/apk/version.json";
+const VERSION_JSON_CDN_URL =
+  "https://cdn.jsdelivr.net/gh/ostad2fan/pompay@main/pampay-coin-alert-github/apk/version.json";
 const APK_URL =
   "https://raw.githubusercontent.com/ostad2fan/pompay/main/pampay-coin-alert-github/apk/PampDumpCoins-latest.apk";
 
 let versionCache: { at: number; body: string } | null = null;
 
 async function fetchVersionJsonBody(): Promise<string> {
-  if (versionCache && Date.now() - versionCache.at < 5 * 60_000) {
+  // 60s only — a just-pushed release must show up almost immediately.
+  if (versionCache && Date.now() - versionCache.at < 60_000) {
     return versionCache.body;
   }
-  const res = await fetch(VERSION_JSON_URL, {
-    headers: { "User-Agent": "pompay-server", Accept: "application/json" },
-  });
-  if (!res.ok) {
-    if (versionCache) return versionCache.body;
-    throw new Error(`github ${res.status}`);
+  const bust = `?t=${Date.now()}`;
+  for (const url of [`${VERSION_JSON_URL}${bust}`, `${VERSION_JSON_CDN_URL}${bust}`]) {
+    try {
+      const res = await fetch(url, {
+        headers: { "User-Agent": "pompay-server", Accept: "application/json" },
+      });
+      if (!res.ok) continue;
+      const parsed = await res.json();
+      if (!parsed || !parsed.latestVersion || !parsed.apkUrl) continue;
+      const body = JSON.stringify(parsed);
+      versionCache = { at: Date.now(), body };
+      return body;
+    } catch {
+      // try the next mirror
+    }
   }
-  const body = JSON.stringify(await res.json());
-  versionCache = { at: Date.now(), body };
-  return body;
+  if (versionCache) return versionCache.body;
+  throw new Error("version.json unreachable (raw + cdn)");
 }
 
 // --- Hourly scheduler (replaces Durable Object alarms) -----------------------

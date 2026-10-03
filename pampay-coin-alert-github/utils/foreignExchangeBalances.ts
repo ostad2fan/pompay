@@ -18,6 +18,7 @@
 
 import CryptoJS from 'crypto-js';
 import { ExchangeId } from '@/types/crypto';
+import { exchangeNow, markClockStale } from './exchangeClock';
 
 export interface ForeignWallet {
   apiKey: string;
@@ -177,15 +178,33 @@ function pushBalance(
 
 // ---------------------------------------------------------------------------
 // MEXC — Binance-style query signature + X-MEXC-APIKEY header (validated)
+// v1.4.10: 700003 = «Timestamp outside recvWindow» (clock drift!) — the stamp
+// now comes from MEXC's own /api/v3/time (see exchangeClock.ts), recvWindow
+// is widened to 30s, and a 700003 answer re-syncs the clock + retries once.
 // ---------------------------------------------------------------------------
 
-async function fetchMexc(w: ForeignWallet): Promise<ForeignBalance[]> {
-  const qs = `timestamp=${Date.now()}&recvWindow=10000`;
+async function mexcAccountAttempt(w: ForeignWallet): Promise<RawResponse> {
+  const ts = await exchangeNow('mexc');
+  const qs = `timestamp=${ts}&recvWindow=30000`;
   const signature = hmacSha256Hex(w.apiSecret, qs);
-  const res = await rawFetch(
+  return rawFetch(
     `https://api.mexc.com/api/v3/account?${qs}&signature=${signature}`,
     { headers: { 'X-MEXC-APIKEY': w.apiKey } }
   );
+}
+
+function mexcCodeOf(text: string): string {
+  const body = parseJson(text);
+  return String(body?.code ?? '');
+}
+
+async function fetchMexc(w: ForeignWallet): Promise<ForeignBalance[]> {
+  let res = await mexcAccountAttempt(w);
+  // 700003 = timestamp outside recvWindow → clock stale → re-sync + retry.
+  if (mexcCodeOf(res.text) === '700003') {
+    markClockStale('mexc');
+    res = await mexcAccountAttempt(w);
+  }
   const body = parseJson(res.text);
   if (!body) throw new Error(`پاسخ نامعتبر از MEXC (HTTP ${res.status})`);
   if (body.balances) {
@@ -200,9 +219,19 @@ async function fetchMexc(w: ForeignWallet): Promise<ForeignBalance[]> {
     return out;
   }
   const code = String(body.code ?? '');
+  if (code === '700003') {
+    throw new Error(
+      `ساعت گوشی با سرور MEXC اختلاف دارد (کد 700003) — ساعت و تاریخ گوشی را «خودکار» تنظیم کنید و دوباره تلاش کنید`
+    );
+  }
   if (code === '-2014' || code === '-2015' || res.status === 401 || res.status === 403) {
     throw new Error(
       `کلید API مکسی معتبر نیست (${code}: ${String(body.msg ?? '')}) — کلید و Secret را در MEXC بسازید و دسترسی «خواندن» بدهید`
+    );
+  }
+  if (code === '700006') {
+    throw new Error(
+      `کلید MEXC فقط از IPهای لیست سفید قبول می‌کند (کد 700006) — در تنظیمات کلید، محدودیت IP را بردارید یا IP فعلی را اضافه کنید`
     );
   }
   throw new Error(`خطای MEXC (کد ${code}): ${String(body.msg ?? res.status)}`);
@@ -255,14 +284,24 @@ async function fetchKucoin(w: ForeignWallet): Promise<ForeignBalance[]> {
 }
 
 // ---------------------------------------------------------------------------
-// Bitget v2 — OKX-style ACCESS-* headers (validated)
+// Bitget v2/v3 — OKX-style ACCESS-* headers (validated)
+// v1.4.10: 40085 = «حساب Unified Account است و API کلاسیک پشتیبانی نمی‌شود» —
+// این خطا ربطی به IP/منطقه ندارد؛ کلید کاربر سالم است ولی حسابش از نوع
+// «حساب معاملاتی یکپارچه (UTA)» است که endpointهای v2 را قبول نمی‌کند.
+// حالا: v2 (کلاسیک) امتحان می‌شود؛ اگر 40085 آمد، همان درخواست با
+// endpointهای UTA (v3) تکرار می‌شود:
+//   • /api/v3/account/assets         → دارایی‌های یکپارچه (اسپات+فیوچرز)
+//     rows: {coin, equity, usdValue, balance, available, locked, debt, bonus}
+//   • /api/v3/account/funding-assets → کیف فاندینگ
+//     rows: {coin, available, frozen, balance}
+// تایم‌استمپ هم با /api/v2/public/time سرورِ بیتگت هماهنگ می‌شود.
 // ---------------------------------------------------------------------------
 
 async function bitgetSigned(
   w: ForeignWallet,
   pathWithQuery: string
-): Promise<Record<string, unknown> | null> {
-  const ts = Date.now().toString();
+): Promise<{ body: Record<string, unknown> | null; status: number }> {
+  const ts = (await exchangeNow('bitget')).toString();
   const headers: Record<string, string> = {
     'ACCESS-KEY': w.apiKey,
     'ACCESS-SIGN': hmacSha256B64(w.apiSecret, `${ts}GET${pathWithQuery}`),
@@ -272,26 +311,48 @@ async function bitgetSigned(
     locale: 'en-US',
   };
   const res = await rawFetch(`https://api.bitget.com${pathWithQuery}`, { headers });
-  return parseJson(res.text);
+  return { body: parseJson(res.text), status: res.status };
 }
 
-/**
- * v1.4.9 — Bitget reads BOTH accounts now:
- *   • SPOT    /api/v2/spot/account/assets           → {coin, available, frozen}
- *   • FUTURES /api/v2/mix/account/accounts?productType=USDT-FUTURES
- *             → {marginCoin, available, locked, accountEquity, usdtEquity}
- * Previously only the SPOT endpoint was queried — a user holding only
- * futures margin saw an empty wallet («بیتگت اطلاعات را نمی‌خواند»).
- * Spot is primary: if spot answers OK, futures errors are swallowed.
- */
+/** UTA (Unified Trading Account) rows → ForeignBalance[] */
+function pushUtaRows(
+  out: ForeignBalance[],
+  rows: unknown[],
+  section: ForeignSection
+): void {
+  for (const item of rows) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    const asset = String(rec.coin ?? rec.marginCoin ?? '');
+    if (!asset) continue;
+    const free = toNum(rec.available);
+    // «locked» on UTA assets; «frozen» on funding assets
+    const frozen = toNum(rec.locked ?? rec.frozen);
+    const equity = toNum(rec.equity ?? rec.balance);
+    const usd = toNum(rec.usdValue);
+    if (free + frozen <= 0 && equity <= 0) continue;
+    const useEquity = free + frozen <= 0 && equity > 0;
+    const row: ForeignBalance = {
+      asset: asset.toUpperCase(),
+      free: useEquity ? equity : free,
+      locked: useEquity ? 0 : frozen,
+      total: useEquity ? equity : free + frozen,
+      valueUsd: usd > 0 ? usd : 0,
+      section,
+    };
+    out.push(row);
+  }
+}
+
 async function fetchBitget(w: ForeignWallet): Promise<ForeignBalance[]> {
   const out: ForeignBalance[] = [];
   let spotAuthError: Error | undefined;
   let spotOtherError: Error | undefined;
+  let accountIsUta = false;
 
-  // ---- spot ----
+  // ---- classic spot (v2) ----
   try {
-    const body = await bitgetSigned(w, '/api/v2/spot/account/assets');
+    const { body } = await bitgetSigned(w, '/api/v2/spot/account/assets');
     if (!body) throw new Error('پاسخ نامعتبر از Bitget (اسپات)');
     const code = String(body.code ?? '');
     if (code === '00000' && Array.isArray(body.data)) {
@@ -299,10 +360,12 @@ async function fetchBitget(w: ForeignWallet): Promise<ForeignBalance[]> {
         coin?: string;
         available?: string;
         frozen?: string;
-        uavailable?: string;
       }>) {
         pushBalance(out, String(d.coin ?? ''), toNum(d.available), toNum(d.frozen));
       }
+    } else if (code === '40085') {
+      // Unified Trading Account → classic v2 endpoints rejected; use v3 (UTA).
+      accountIsUta = true;
     } else if (code === '40037' || code === '40036' || code === '40038') {
       spotAuthError = new Error(
         `کلید Bitget معتبر نیست (${code}: ${String(body.msg ?? '')}) — کلید/Secret/Passphrase را چک کنید`
@@ -314,9 +377,43 @@ async function fetchBitget(w: ForeignWallet): Promise<ForeignBalance[]> {
     spotOtherError = e instanceof Error ? e : new Error(String(e));
   }
 
-  // ---- futures (USDT-M perpetual margin) ----
+  if (accountIsUta) {
+    // ---- UTA: unified assets + funding assets (v3) ----
+    let utaError: Error | undefined;
+    try {
+      const { body } = await bitgetSigned(w, '/api/v3/account/assets');
+      if (!body) throw new Error('پاسخ نامعتبر از Bitget (UTA)');
+      const code = String(body.code ?? '');
+      if (code === '00000') {
+        const data = (body.data ?? {}) as Record<string, unknown>;
+        pushUtaRows(out, asArray(data.assets), 'spot');
+      } else if (code === '40037' || code === '40036' || code === '40038') {
+        throw new Error(
+          `کلید Bitget معتبر نیست (${code}: ${String(body.msg ?? '')}) — کلید/Secret/Passphrase را چک کنید`
+        );
+      } else {
+        throw new Error(`خطای Bitget UTA (کد ${code}): ${String(body.msg ?? '')}`);
+      }
+    } catch (e) {
+      utaError = e instanceof Error ? e : new Error(String(e));
+    }
+    // funding wallet (best-effort)
+    try {
+      const { body } = await bitgetSigned(w, '/api/v3/account/funding-assets');
+      if (body && String(body.code ?? '') === '00000') {
+        pushUtaRows(out, asArray(body.data), 'funding');
+      }
+    } catch {}
+    if (out.length > 0) return out;
+    throw utaError ?? spotOtherError ?? new Error('حساب Bitget (UTA) خالی است یا قابل خواندن نیست');
+  }
+
+  // ---- classic futures (USDT-M perpetual margin, v2) ----
   try {
-    const body = await bitgetSigned(w, '/api/v2/mix/account/accounts?productType=USDT-FUTURES');
+    const { body } = await bitgetSigned(
+      w,
+      '/api/v2/mix/account/accounts?productType=USDT-FUTURES'
+    );
     if (body && String(body.code ?? '') === '00000' && Array.isArray(body.data)) {
       for (const d of body.data as Array<{
         marginCoin?: string;
@@ -929,22 +1026,56 @@ async function fetchLbank(w: ForeignWallet): Promise<ForeignBalance[]> {
 // ---------------------------------------------------------------------------
 // XT.com — v4 «xt-validate-*» header signing (matches ccxt + live probes).
 //   • SPOT    : GET https://sapi.xt.com/v4/balance
-//               (route probed live: fake key -> {"rc":1,"mc":"AUTH_101"})
 //               sign payload = xt-validate-algorithms=HmacSHA256&xt-validate-appkey=KEY
 //                               &xt-validate-recvwindow=RW&xt-validate-timestamp=TS#GET#/v4/balance
 //   • FUTURES : GET https://fapi.xt.com/future/user/v1/balance/list
-//               (route probed live: fake key -> returnCode 1 / 400)
 //               sign payload = xt-validate-appkey=KEY&xt-validate-timestamp=TS#GET#<path>
-// v1.4.9: the previous v1 endpoints (/api/v1/private/account/balance) only
-// answered {returnCode:0, result:{openapiDocs:...}} — an empty docs stub —
-// so the wallet could never read XT balances. Both v4 routes are used now and
-// spot + futures are merged; a precise Persian error is thrown when the key is
-// rejected.
+// v1.4.10:
+//   1) تایم‌استمپ از /v4/public/time خود XT خوانده می‌شود (ساعت گوشی دیگر
+//      خطای «outdated message» / خطای امضا نمی‌سازد).
+//   2) پیام خطا دقیق شد — XT برای هر مشکل کد جدا می‌دهد:
+//      AUTH_101 کلید پیدا نشد / AUTH_103 خطای امضا (Secret اشتباه) /
+//      AUTH_104 کلید فقط با IP مجاز / AUTH_105 تایم‌استمپ کهنه /
+//      AUTH_106 کلید دسترسی این کار را ندارد.
 // ---------------------------------------------------------------------------
+
+/** Persian, actionable message per XT auth code. */
+function xtAuthErrorMessage(mc: string, isFutures: boolean): Error | null {
+  const where = isFutures ? ' (فیوچرز)' : '';
+  switch (mc) {
+    case 'AUTH_101':
+      return new Error(
+        `XT این کلید را پیدا نکرد (AUTH_101)${where} — مطمئن شوید «AccessKey» را کپی کرده‌اید (نه SecretKey یا User ID). اگر تازه کلید ساختید چند دقیقه صبر کنید یا یک کلید جدید در XT.com → API Management بسازید و دوباره وارد کنید`
+      );
+    case 'AUTH_102':
+      return new Error(`کلید XT فعال نشده است (AUTH_102)${where} — در XT.com کلید را تأیید/فعال کنید`);
+    case 'AUTH_103':
+      return new Error(
+        `امضای XT نامعتبر است (AUTH_103)${where} — «SecretKey» را دقیقاً همان‌طور که موقع ساخت کلید نمایش داده شد کپی کنید (بدون فاصله اضافه)`
+      );
+    case 'AUTH_104':
+      return new Error(
+        `کلید XT فقط از IPهای مجاز قبول می‌کند (AUTH_104)${where} — در تنظیمات کلید در XT.com محدودیت IP را بردارید یا IP فعلی (IP فیلترشکن) را به لیست اضافه کنید`
+      );
+    case 'AUTH_105':
+      return new Error(
+        `ساعت درخواست با سرور XT نخوانده شد (AUTH_105)${where} — ساعت و تاریخ گوشی را روی «خودکار» بگذارید و دوباره تلاش کنید`
+      );
+    case 'AUTH_106':
+      return new Error(
+        `کلید XT مجوز این کار را ندارد (AUTH_106)${where} — در XT.com کلید را با مجوز خواندن موجودی بسازید`
+      );
+    default:
+      if (/AUTH/i.test(mc)) {
+        return new Error(`کلید API XT معتبر نیست (${mc})${where}`);
+      }
+      return null;
+  }
+}
 
 async function xtSpotBalance(w: ForeignWallet): Promise<ForeignBalance[]> {
   const path = '/v4/balance';
-  const ts = String(Date.now());
+  const ts = String(await exchangeNow('xt'));
   const recvWindow = '5000';
   const payload =
     `xt-validate-algorithms=HmacSHA256&xt-validate-appkey=${w.apiKey}` +
@@ -986,17 +1117,58 @@ async function xtSpotBalance(w: ForeignWallet): Promise<ForeignBalance[]> {
     return out;
   }
   const mc = String(body.mc ?? '');
-  if (/AUTH/i.test(mc)) {
-    throw new Error(
-      `کلید API XT معتبر نیست (${mc}) — در XT.com → API Management کلید را با مجوز خواندن بسازید و AccessKey/Secret را دقیق وارد کنید`
-    );
+  // timestamp rejected → force clock re-sync, then one retry.
+  if (mc === 'AUTH_105' || mc === 'AUTH_103') {
+    markClockStale('xt');
+    const ts2 = String(await exchangeNow('xt'));
+    const payload2 =
+      `xt-validate-algorithms=HmacSHA256&xt-validate-appkey=${w.apiKey}` +
+      `&xt-validate-recvwindow=${recvWindow}&xt-validate-timestamp=${ts2}#GET#${path}`;
+    const sig2 = hmacSha256Hex(w.apiSecret, payload2);
+    const res2 = await rawFetch(`https://sapi.xt.com${path}`, {
+      headers: {
+        'xt-validate-algorithms': 'HmacSHA256',
+        'xt-validate-appkey': w.apiKey,
+        'xt-validate-recvwindow': recvWindow,
+        'xt-validate-timestamp': ts2,
+        'xt-validate-signature': sig2,
+      },
+    });
+    const body2 = parseJson(res2.text);
+    if (body2 && Number(body2.rc ?? -1) === 0) {
+      const out: ForeignBalance[] = [];
+      let rows: unknown[] = asArray(body2.result);
+      if (rows.length === 0 && body2.result && typeof body2.result === 'object') {
+        const rec = body2.result as Record<string, unknown>;
+        rows = asArray(rec.list ?? rec.balances ?? rec.data);
+      }
+      for (const item of rows) {
+        if (!item || typeof item !== 'object') continue;
+        const rec = item as Record<string, unknown>;
+        pushBalance(
+          out,
+          String(rec.currency ?? rec.coin ?? rec.asset ?? ''),
+          toNum(rec.available ?? rec.free ?? rec.amount),
+          toNum(rec.frozen ?? rec.freeze ?? rec.locked ?? 0)
+        );
+      }
+      return out;
+    }
+    if (body2) {
+      const mc2 = String(body2.mc ?? '');
+      const err2 = xtAuthErrorMessage(mc2, false);
+      if (err2) throw err2;
+      throw new Error(`خطای XT (${mc2 || body2.rc})`);
+    }
   }
+  const err = xtAuthErrorMessage(mc, false);
+  if (err) throw err;
   throw new Error(`خطای XT (${mc || rc})`);
 }
 
 async function xtFuturesBalance(w: ForeignWallet): Promise<ForeignBalance[]> {
   const path = '/future/user/v1/balance/list';
-  const ts = String(Date.now());
+  const ts = String(await exchangeNow('xt'));
   const payload = `xt-validate-appkey=${w.apiKey}&xt-validate-timestamp=${ts}#GET#${path}`;
   const signature = hmacSha256Hex(w.apiSecret, payload);
   const res = await rawFetch(`https://fapi.xt.com${path}`, {
@@ -1033,6 +1205,8 @@ async function xtFuturesBalance(w: ForeignWallet): Promise<ForeignBalance[]> {
   }
   const msg = String(body.msgInfo ?? '');
   const errCode = String((body.error as Record<string, unknown> | undefined)?.code ?? '');
+  const authErr = xtAuthErrorMessage(errCode, true);
+  if (authErr) throw authErr;
   if (/sign|auth|token|key/i.test(msg + ' ' + errCode)) {
     throw new Error(
       `کلید API XT (فیوچرز) معتبر نیست (${errCode || msg}) — دسترسی خواندن را در XT.com چک کنید`
