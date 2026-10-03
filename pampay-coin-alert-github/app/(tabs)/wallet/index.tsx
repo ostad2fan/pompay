@@ -766,39 +766,52 @@ async function fetchBinancePeriodPnl(wallet: ExchangeWallet, days: PnlPeriodDays
       .filter((a) => !['USDT', 'USDC', 'BUSD', 'FDUSD', 'TUSD', 'DAI', 'BNB'].includes(a))
       .slice(0, 15);
 
-    for (const asset of held) {
-      for (const quote of ['USDT', 'FDUSD']) {
-        const trades = await binanceSigned<MyTrade[]>(
-          'https://api.binance.com/api/v3/myTrades',
-          wallet,
-          { symbol: `${asset}${quote}`, startTime: String(startTime), limit: '1000' }
-        );
-        if (!trades || trades.length === 0) continue;
+    // v1.4.9 — the myTrades calls for every held asset were SEQUENTIAL (up to
+    // 30 requests back-to-back through the VPN) — one slow asset stalled the
+    // whole PnL card. Now they run in batches of 5 in parallel with a 25s
+    // overall budget (futures numbers are already in by then; spot PnL is
+    // best-effort and must never hold the card hostage).
+    const spotDeadline = Date.now() + 25_000;
+    const BATCH = 5;
+    for (let i = 0; i < held.length; i += BATCH) {
+      if (Date.now() > spotDeadline) break;
+      const batch = held.slice(i, i + BATCH);
+      await Promise.all(
+        batch.map(async (asset) => {
+          for (const quote of ['USDT', 'FDUSD']) {
+            const trades = await binanceSigned<MyTrade[]>(
+              'https://api.binance.com/api/v3/myTrades',
+              wallet,
+              { symbol: `${asset}${quote}`, startTime: String(startTime), limit: '1000' }
+            );
+            if (!trades || trades.length === 0) continue;
 
-        let qty = 0;
-        let cost = 0;
-        for (const t of trades) {
-          const q = parseFloat(t.qty);
-          const p = parseFloat(t.price);
-          // commission (USDT-quoted trades charge commission in the quote or
-          // BNB; only the quote part is USD-exact — BNB fees are ignored).
-          const comm = parseFloat(t.commission ?? '0');
-          if (t.commissionAsset === quote) spotCommissions -= comm;
+            let qty = 0;
+            let cost = 0;
+            for (const t of trades) {
+              const q = parseFloat(t.qty);
+              const p = parseFloat(t.price);
+              // commission (USDT-quoted trades charge commission in the quote or
+              // BNB; only the quote part is USD-exact — BNB fees are ignored).
+              const comm = parseFloat(t.commission ?? '0');
+              if (t.commissionAsset === quote) spotCommissions -= comm;
 
-          if (t.isBuyer) {
-            qty += q;
-            cost += q * p;
-          } else {
-            const avg = qty > 0 ? cost / qty : 0;
-            const sellQty = Math.min(q, qty);
-            qty -= sellQty;
-            cost -= sellQty * avg;
-            spotRealized += (p - avg) * sellQty;
-            spotSells++;
+              if (t.isBuyer) {
+                qty += q;
+                cost += q * p;
+              } else {
+                const avg = qty > 0 ? cost / qty : 0;
+                const sellQty = Math.min(q, qty);
+                qty -= sellQty;
+                cost -= sellQty * avg;
+                spotRealized += (p - avg) * sellQty;
+                spotSells++;
+              }
+            }
+            break; // first quote with trades is enough
           }
-        }
-        break; // first quote with trades is enough
-      }
+        })
+      );
     }
   } catch (e) {
     console.log('[Wallet] Spot period PnL (best-effort) failed:', e);
@@ -1545,7 +1558,9 @@ async function fetchBitperpBalance(wallet: ExchangeWallet): Promise<WalletBalanc
   const balances: WalletBalance[] = [];
 
   // Funding (main) wallet — always USDT-denominated on BitPerp.
-  if (account.fundingUsdt > 0.0001) {
+  // v1.4.9 — threshold lowered to > 0: even a 5-cent row must appear
+  // («۵ سنت موجودی دارم اما نشون داده نمیشه»).
+  if (account.fundingUsdt > 0) {
     balances.push({
       asset: 'USDT',
       section: 'funding',
@@ -1566,6 +1581,29 @@ async function fetchBitperpBalance(wallet: ExchangeWallet): Promise<WalletBalanc
       total: b.amount,
       valueUsd: 0,
     });
+  }
+
+  // v1.4.9 — /api/fund-balance's own perpetual_balance: when the perp wallet
+  // list gave no USDT row (or rounded it away), this fallback still shows the
+  // perp margin — another path the «۵ سنت» could hide in.
+  if ((account.fundPerpUsdt ?? 0) > 0) {
+    const perpUsdt = balances.find((b) => b.section === 'futures' && b.asset === 'USDT');
+    if (!perpUsdt || perpUsdt.total <= 0) {
+      if (!perpUsdt) {
+        balances.push({
+          asset: 'USDT',
+          section: 'futures',
+          free: account.fundPerpUsdt!,
+          locked: 0,
+          total: account.fundPerpUsdt!,
+          valueUsd: account.fundPerpUsdt!,
+        });
+      } else {
+        perpUsdt.total = account.fundPerpUsdt!;
+        perpUsdt.free = account.fundPerpUsdt!;
+        perpUsdt.valueUsd = account.fundPerpUsdt!;
+      }
+    }
   }
 
   // USD valuation for perp assets without a value.
@@ -1945,9 +1983,18 @@ export default function WalletScreen() {
   // portfolio appear instantly on screen entry.
   const balanceQueries = useQueries({
     queries: cachesLoaded
-      ? wallets.map((w) => ({
+      ? wallets.map((w, idx) => ({
           queryKey: ['exchange-balance', w.id],
           queryFn: async (): Promise<ExchangeBalanceData> => {
+            // v1.4.9 — STAGGER: entering the wallet screen used to fire every
+            // exchange's balance fetch (plus the PnL section) at the SAME
+            // instant — dozens of requests through one VPN tunnel, the #1
+            // cause of «بایننس یکی در میان» cold-start failures. A 300ms
+            // offset per wallet smooths the burst; old data stays visible
+            // while refetching, so the delay is invisible to the user.
+            if (idx > 0) {
+              await new Promise((r) => setTimeout(r, Math.min(idx, 8) * 300));
+            }
             const fresh = await fetchExchangeBalance(w);
             await writeBalanceCache(w.id, fresh);
             return fresh;
@@ -1957,7 +2004,11 @@ export default function WalletScreen() {
           refetchInterval: foreignBlocked && isForeignExchange(w.exchangeId) ? false : refreshMs,
           refetchOnMount: foreignBlocked && isForeignExchange(w.exchangeId) ? false : 'always',
           staleTime: 30_000,
-          retry: 1,
+          // v1.4.9 — two DELAYED retries (react-query's retry has no built-in
+          // backoff): an immediate retry re-fires into the same congestion
+          // burst and fails again; 1.2s/2.4s later the network has calmed.
+          retry: 2,
+          retryDelay: (attempt: number) => 1200 * (attempt + 1),
         }))
       : [],
   });
@@ -2987,12 +3038,20 @@ function PnlPeriodSection({ wallet, iranGated }: { wallet: ExchangeWallet; iranG
     queryKey: ['exchange-pnl', wallet.id, period],
     queryFn: () => fetchPeriodPnl(wallet, period),
     staleTime: 5 * 60_000,
-    retry: 0,
+    // v1.4.9 — retry: 0 meant ONE transient failure at screen-open (network
+    // burst when all queries fire at once) permanently showed the error card
+    // until the period chip was toggled. Two delayed retries fix it.
+    retry: 2,
+    retryDelay: (attempt) => 1200 * (attempt + 1),
     // v1.4.7 — the PnL endpoints hit the exchange API too: they are fully
     // disabled while the exit IP is Iranian (same hard gate as balances).
     enabled: !iranGated,
   });
   const pnl = pnlQuery.data;
+  // v1.4.9 — manual refetch button on the error card.
+  const refetchPnl = useCallback(() => {
+    void pnlQuery.refetch();
+  }, [pnlQuery]);
 
   return (
     <View style={styles.pnlSection}>
@@ -3028,9 +3087,16 @@ function PnlPeriodSection({ wallet, iranGated }: { wallet: ExchangeWallet; iranG
       </View>
 
       {pnlQuery.error && !pnl && (
-        <Text style={styles.pnlNote}>
-          خطا در دریافت اطلاعات این بازه — کلید API و اتصال اینترنت را بررسی کنید.
-        </Text>
+        <View>
+          <Text style={styles.pnlNote}>
+            خطا در دریافت اطلاعات این بازه — کلید API و اتصال اینترنت را بررسی کنید.
+          </Text>
+          <Pressable style={styles.pnlRetryBtn} onPress={refetchPnl} disabled={pnlQuery.isFetching}>
+            <Text style={styles.pnlRetryBtnText}>
+              {pnlQuery.isFetching ? 'در حال تلاش مجدد…' : 'تلاش مجدد'}
+            </Text>
+          </Pressable>
+        </View>
       )}
 
       {pnl && !pnl.supported && (
@@ -3149,7 +3215,12 @@ function TotalPnlPeriodSection({
       queryKey: ['exchange-pnl', w.id, period] as const,
       queryFn: () => fetchPeriodPnl(w, period),
       staleTime: 5 * 60_000,
-      retry: 0,
+      // v1.4.9 — same delayed-retry policy as the per-exchange section: a
+      // single network hiccup must NOT permanently exclude an exchange from
+      // the TOTAL (that was the «مجموع کامل نشان نمی‌دهد مخصوصاً بایننس» bug:
+      // a failed Binance query was silently skipped in the aggregate).
+      retry: 2,
+      retryDelay: (attempt: number) => 1200 * (attempt + 1),
       // Same Iran hard gate: foreign exchange PnL endpoints stay untouched.
       enabled: !(foreignBlocked && isForeignExchange(w.exchangeId)),
     })),
@@ -3163,11 +3234,15 @@ function TotalPnlPeriodSection({
     let closed = 0;
     let supportedCount = 0;
     let loading = false;
+    // v1.4.9 — exchanges whose PnL fetch FAILED (query error, no data) —
+    // shown as an explicit warning instead of silently vanishing from the sum.
+    const failedNames: string[] = [];
     supportedWallets.forEach((w, i) => {
       const q = pnlQueries[i];
       const pnl = q?.data;
       if (!pnl) {
         if (q?.isFetching) loading = true;
+        else if (q?.isError) failedNames.push(w.exchangeName);
         return;
       }
       if (pnl.supported) {
@@ -3179,8 +3254,15 @@ function TotalPnlPeriodSection({
         closed += pnl.closedCount;
       }
     });
-    return { realized, funding, commissions, unrealized, closed, supportedCount, loading };
+    return { realized, funding, commissions, unrealized, closed, supportedCount, loading, failedNames };
   }, [supportedWallets, pnlQueries]);
+
+  // v1.4.9 — one-button retry: refetches every failed/loaded query.
+  const refetchAllPnl = useCallback(() => {
+    pnlQueries.forEach((q) => {
+      if (q && (q.isError || !q.data)) void q.refetch();
+    });
+  }, [pnlQueries]);
 
   if (supportedWallets.length === 0) return null;
 
@@ -3292,6 +3374,23 @@ function TotalPnlPeriodSection({
               {formatSignedUsd(total)}
             </Text>
           </View>
+          {aggregate.failedNames.length > 0 && (
+            <View style={styles.pnlFailedBox}>
+              <Text style={styles.pnlFailedText}>
+                ⚠️ داده‌ی این صرافی‌ها در این مجموع دریافت نشد: {aggregate.failedNames.join('، ')} — ممکن است
+                مجموع کمی ناقص باشد.
+              </Text>
+              <Pressable
+                style={styles.pnlRetryBtn}
+                onPress={refetchAllPnl}
+                disabled={aggregate.loading}
+              >
+                <Text style={styles.pnlRetryBtnText}>
+                  {aggregate.loading ? 'در حال تلاش مجدد…' : 'تلاش مجدد برای همه'}
+                </Text>
+              </Pressable>
+            </View>
+          )}
           <Text style={styles.pnlNote}>
             مجموع سود/زیان بایننس، بای‌بیت، OKX، مکسی، بیتگت و بیت‌پرپ در {PNL_PERIOD_LABEL[period]} انتخابی — دقیقاً از
             API خود صرافی‌ها (صرافی‌های بدون این قابلیت در مجموع لحاظ نمی‌شوند)
@@ -4007,5 +4106,32 @@ const styles = createThemedStyles(() => StyleSheet.create({
   pnlTotalValue: {
     fontSize: 14,
     fontWeight: '800' as const,
+  },
+  // v1.4.9 — retry button + failed-exchange warning box in the PnL sections.
+  pnlRetryBtn: {
+    alignSelf: 'flex-start',
+    marginTop: 6,
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    backgroundColor: colors.dark.accent,
+  },
+  pnlRetryBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700' as const,
+  },
+  pnlFailedBox: {
+    marginTop: 8,
+    padding: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#B8860B',
+    backgroundColor: 'rgba(184,134,11,0.12)',
+  },
+  pnlFailedText: {
+    fontSize: 11,
+    lineHeight: 17,
+    color: colors.dark.text,
   },
 }));
