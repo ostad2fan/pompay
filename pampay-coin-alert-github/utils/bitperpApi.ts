@@ -342,6 +342,9 @@ export interface BitperpPosition {
 export interface BitperpAccount {
   /** Funding (main) wallet USDT balance. */
   fundingUsdt: number;
+  /** v1.4.9 — perpetual USDT from /api/fund-balance (perpetual_balance),
+   *  used as a fallback when /api/balance gave no USDT row. */
+  fundPerpUsdt?: number;
   /** Perpetual wallet balances: [{asset, amount}]. */
   perpBalances: Array<{ asset: string; amount: number }>;
   /** Perp account equity / available margin (when returned). */
@@ -363,6 +366,12 @@ function businessError(data: unknown): string | undefined {
   if (!data || typeof data !== 'object') return undefined;
   const rec = data as { code?: unknown; msg?: unknown; message?: unknown; status?: unknown };
   const code = rec.code ?? rec.status;
+  // v1.4.9 — code:-1 is the server's CACHED-TIMEOUT answer and STILL CARRIES
+  // the last valid balance (bitperp's own web app relies on this: «سرور موقع
+  // timeout آخرین مقدار معتبر را cache می‌کند و code:-1 می‌دهد»). Throwing on
+  // it blanked the whole wallet — e.g. the «۵ سنت» row — for a full refresh
+  // cycle. Treat it as data, not as an error.
+  if (code === -1) return undefined;
   if (typeof code === 'number' && code !== 0) {
     const msg = typeof rec.msg === 'string' ? rec.msg : typeof rec.message === 'string' ? rec.message : '';
     return msg ? `${msg} (کد ${code})` : `کد خطای ${code}`;
@@ -377,7 +386,7 @@ function toNum(v: unknown): number {
 
 export async function fetchBitperpAccount(accessToken: string): Promise<BitperpAccount> {
   const [fundRes, balanceRes, perpRes, positionsRes] = await Promise.all([
-    getJson<{ code?: number; data?: { balance?: unknown; perpetual_balance?: unknown } | number }>(
+    getJson<{ code?: number; data?: { balance?: unknown; perpetual_balance?: unknown } | number | string }>(
       '/api/fund-balance',
       accessToken
     ),
@@ -399,14 +408,21 @@ export async function fetchBitperpAccount(accessToken: string): Promise<BitperpA
   const errorMsg = authFailed ? undefined : businessMsgs[0];
 
   // ---- funding wallet ----
+  // v1.4.9 — CONFIRMED shape (from bitperp's own web app):
+  //   { code: 0, data: { balance: "12.3", perpetual_balance: "45.6" } }
+  // balance/perpetual_balance may be strings, numbers, or the whole data may
+  // be a bare string/number — all are accepted now. Even when code:-1
+  // (cached timeout), the numbers are still the last VALID values → use them.
   let fundingUsdt = 0;
+  let fundPerpUsdt = 0;
   try {
     const d = fundRes.data?.data;
     if (typeof d === 'number') fundingUsdt = d;
+    else if (typeof d === 'string') fundingUsdt = toNum(d);
     else if (d && typeof d === 'object') {
       const rec = d as Record<string, unknown>;
-      // data.balance is the funding wallet; fall back to any numeric field.
       fundingUsdt = toNum(rec.balance ?? rec.funding ?? rec.amount ?? rec.usdt ?? 0);
+      fundPerpUsdt = toNum(rec.perpetual_balance ?? rec.perp ?? rec.perpetual ?? 0);
     }
   } catch {}
 
@@ -427,7 +443,7 @@ export async function fetchBitperpAccount(accessToken: string): Promise<BitperpA
       // A plain map { USDT: 12.3, ... } is also accepted.
       for (const [asset, amount] of Object.entries(root as Record<string, unknown>)) {
         const n = toNum(amount);
-        if (n > 0.0001) perpBalances.push({ asset: asset.toUpperCase(), amount: n });
+        if (n > 0.000001) perpBalances.push({ asset: asset.toUpperCase(), amount: n });
       }
     } else if (Array.isArray(root)) {
       for (const item of root) {
@@ -439,7 +455,7 @@ export async function fetchBitperpAccount(accessToken: string): Promise<BitperpA
         const amount = toNum(
           rec.balance ?? rec.total ?? rec.amount ?? rec.equity ?? rec.walletBalance ?? 0
         );
-        if (asset && amount > 0.0001) perpBalances.push({ asset, amount });
+        if (asset && amount > 0.000001) perpBalances.push({ asset, amount });
       }
     }
   } catch {}
@@ -502,6 +518,7 @@ export async function fetchBitperpAccount(accessToken: string): Promise<BitperpA
 
   return {
     fundingUsdt,
+    fundPerpUsdt,
     perpBalances,
     equity,
     availableMargin,

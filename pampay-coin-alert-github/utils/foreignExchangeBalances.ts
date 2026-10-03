@@ -258,41 +258,93 @@ async function fetchKucoin(w: ForeignWallet): Promise<ForeignBalance[]> {
 // Bitget v2 — OKX-style ACCESS-* headers (validated)
 // ---------------------------------------------------------------------------
 
-async function fetchBitget(w: ForeignWallet): Promise<ForeignBalance[]> {
-  const path = '/api/v2/spot/account/assets';
+async function bitgetSigned(
+  w: ForeignWallet,
+  pathWithQuery: string
+): Promise<Record<string, unknown> | null> {
   const ts = Date.now().toString();
   const headers: Record<string, string> = {
     'ACCESS-KEY': w.apiKey,
-    'ACCESS-SIGN': hmacSha256B64(w.apiSecret, `${ts}GET${path}`),
+    'ACCESS-SIGN': hmacSha256B64(w.apiSecret, `${ts}GET${pathWithQuery}`),
     'ACCESS-TIMESTAMP': ts,
     'ACCESS-PASSPHRASE': w.passphrase ?? '',
     'Content-Type': 'application/json',
     locale: 'en-US',
   };
-  const res = await rawFetch(`https://api.bitget.com${path}`, { headers });
-  const body = parseJson(res.text);
-  if (!body) throw new Error(`پاسخ نامعتبر از Bitget (HTTP ${res.status})`);
-  if (String(body.code) === '00000' && Array.isArray(body.data)) {
-    const out: ForeignBalance[] = [];
-    for (const d of body.data as Array<{
-      coin?: string;
-      available?: string;
-      frozen?: string;
-      uavailable?: string;
-    }>) {
-      const free = toNum(d.available);
-      const frozen = toNum(d.frozen);
-      pushBalance(out, String(d.coin ?? ''), free, frozen);
+  const res = await rawFetch(`https://api.bitget.com${pathWithQuery}`, { headers });
+  return parseJson(res.text);
+}
+
+/**
+ * v1.4.9 — Bitget reads BOTH accounts now:
+ *   • SPOT    /api/v2/spot/account/assets           → {coin, available, frozen}
+ *   • FUTURES /api/v2/mix/account/accounts?productType=USDT-FUTURES
+ *             → {marginCoin, available, locked, accountEquity, usdtEquity}
+ * Previously only the SPOT endpoint was queried — a user holding only
+ * futures margin saw an empty wallet («بیتگت اطلاعات را نمی‌خواند»).
+ * Spot is primary: if spot answers OK, futures errors are swallowed.
+ */
+async function fetchBitget(w: ForeignWallet): Promise<ForeignBalance[]> {
+  const out: ForeignBalance[] = [];
+  let spotAuthError: Error | undefined;
+  let spotOtherError: Error | undefined;
+
+  // ---- spot ----
+  try {
+    const body = await bitgetSigned(w, '/api/v2/spot/account/assets');
+    if (!body) throw new Error('پاسخ نامعتبر از Bitget (اسپات)');
+    const code = String(body.code ?? '');
+    if (code === '00000' && Array.isArray(body.data)) {
+      for (const d of body.data as Array<{
+        coin?: string;
+        available?: string;
+        frozen?: string;
+        uavailable?: string;
+      }>) {
+        pushBalance(out, String(d.coin ?? ''), toNum(d.available), toNum(d.frozen));
+      }
+    } else if (code === '40037' || code === '40036' || code === '40038') {
+      spotAuthError = new Error(
+        `کلید Bitget معتبر نیست (${code}: ${String(body.msg ?? '')}) — کلید/Secret/Passphrase را چک کنید`
+      );
+    } else {
+      spotOtherError = new Error(`خطای Bitget (کد ${code}): ${String(body.msg ?? '')}`);
     }
-    return out;
+  } catch (e) {
+    spotOtherError = e instanceof Error ? e : new Error(String(e));
   }
-  const code = String(body.code ?? '');
-  if (code === '40037' || code === '40036' || res.status === 400) {
-    throw new Error(
-      `کلید Bitget معتبر نیست (${code}: ${String(body.msg ?? '')}) — کلید/Secret/Passphrase را چک کنید`
-    );
+
+  // ---- futures (USDT-M perpetual margin) ----
+  try {
+    const body = await bitgetSigned(w, '/api/v2/mix/account/accounts?productType=USDT-FUTURES');
+    if (body && String(body.code ?? '') === '00000' && Array.isArray(body.data)) {
+      for (const d of body.data as Array<{
+        marginCoin?: string;
+        available?: string;
+        locked?: string;
+        accountEquity?: string;
+        usdtEquity?: string;
+      }>) {
+        const free = toNum(d.available);
+        const frozen = toNum(d.locked);
+        // available/locked can be 0 while accountEquity > 0 (all in positions)
+        // — fall back to equity so the margin still shows.
+        const equity = toNum(d.accountEquity ?? d.usdtEquity);
+        if (free + frozen <= 0 && equity > 0) {
+          pushBalance(out, String(d.marginCoin ?? ''), equity, 0, 'futures');
+        } else {
+          pushBalance(out, String(d.marginCoin ?? ''), free, frozen, 'futures');
+        }
+      }
+    }
+  } catch {
+    // futures is best-effort — spot errors are the ones to surface
   }
-  throw new Error(`خطای Bitget (کد ${code}): ${String(body.msg ?? '')}`);
+
+  if (out.length > 0) return out;
+  if (spotAuthError) throw spotAuthError;
+  if (spotOtherError) throw spotOtherError;
+  throw new Error('حساب Bitget خالی است یا قابل خواندن نیست');
 }
 
 // ---------------------------------------------------------------------------
@@ -875,92 +927,137 @@ async function fetchLbank(w: ForeignWallet): Promise<ForeignBalance[]> {
 }
 
 // ---------------------------------------------------------------------------
-// XT — futures private v1 (fapi.xt.com); accesskey+secret+timestamp+signature
+// XT.com — v4 «xt-validate-*» header signing (matches ccxt + live probes).
+//   • SPOT    : GET https://sapi.xt.com/v4/balance
+//               (route probed live: fake key -> {"rc":1,"mc":"AUTH_101"})
+//               sign payload = xt-validate-algorithms=HmacSHA256&xt-validate-appkey=KEY
+//                               &xt-validate-recvwindow=RW&xt-validate-timestamp=TS#GET#/v4/balance
+//   • FUTURES : GET https://fapi.xt.com/future/user/v1/balance/list
+//               (route probed live: fake key -> returnCode 1 / 400)
+//               sign payload = xt-validate-appkey=KEY&xt-validate-timestamp=TS#GET#<path>
+// v1.4.9: the previous v1 endpoints (/api/v1/private/account/balance) only
+// answered {returnCode:0, result:{openapiDocs:...}} — an empty docs stub —
+// so the wallet could never read XT balances. Both v4 routes are used now and
+// spot + futures are merged; a precise Persian error is thrown when the key is
+// rejected.
 // ---------------------------------------------------------------------------
 
-async function xtAttempt(
-  w: ForeignWallet,
-  variant: 'query-sig' | 'token-auth'
-): Promise<{ signRejected: boolean; error?: Error; balances?: ForeignBalance[] }> {
-  const path = '/api/v1/private/account/balance';
-  const ts = Date.now().toString();
-  let res: RawResponse;
-  if (variant === 'query-sig') {
-    const qs = `accesskey=${encodeURIComponent(w.apiKey)}&timestamp=${ts}&signature=${hmacSha256Hex(
-      w.apiSecret,
-      ts + w.apiKey
-    )}`;
-    res = await rawFetch(`https://fapi.xt.com${path}?${qs}`);
-  } else {
-    // token-style: Authorization = md5(accesskey+secret+timestamp)? XT v1 legacy
-    const token = md5Hex(`${w.apiKey}${w.apiSecret}${ts}`);
-    res = await rawFetch(`https://fapi.xt.com${path}?timestamp=${ts}&nonce=${ts}`, {
-      headers: { Authorization: token, accesskey: w.apiKey },
-    });
-  }
+async function xtSpotBalance(w: ForeignWallet): Promise<ForeignBalance[]> {
+  const path = '/v4/balance';
+  const ts = String(Date.now());
+  const recvWindow = '5000';
+  const payload =
+    `xt-validate-algorithms=HmacSHA256&xt-validate-appkey=${w.apiKey}` +
+    `&xt-validate-recvwindow=${recvWindow}&xt-validate-timestamp=${ts}#GET#${path}`;
+  const signature = hmacSha256Hex(w.apiSecret, payload);
+  const res = await rawFetch(`https://sapi.xt.com${path}`, {
+    headers: {
+      'xt-validate-algorithms': 'HmacSHA256',
+      'xt-validate-appkey': w.apiKey,
+      'xt-validate-recvwindow': recvWindow,
+      'xt-validate-timestamp': ts,
+      'xt-validate-signature': signature,
+    },
+  });
   const body = parseJson(res.text);
-  if (!body) {
-    return {
-      signRejected: false,
-      error: new Error(`پاسخ نامعتبر از XT (HTTP ${res.status})`),
-    };
-  }
-  const rc = Number(body.returnCode ?? -1);
-  const result = (body.result ?? {}) as Record<string, unknown>;
-  if (rc === 0 && result && !result.openapiDocs) {
+  if (!body) throw new Error(`پاسخ نامعتبر از XT (HTTP ${res.status})`);
+  const rc = Number(body.rc ?? -1);
+  if (rc === 0) {
     const out: ForeignBalance[] = [];
-    // XT balance result: {userId, list: [{currency, amount? frozen?...}]} or map
-    const list = asArray(result.list).length
-      ? asArray(result.list)
-      : asArray(result.balance);
-    if (list.length > 0) {
-      for (const r of list as Array<{
-        currency?: string;
-        coin?: string;
-        amount?: string;
-        available?: string;
-        frozen?: string;
-        free?: string;
-      }>) {
-        pushBalance(
-          out,
-          String(r.currency ?? r.coin ?? ''),
-          toNum(r.available ?? r.free ?? r.amount),
-          toNum(r.frozen ?? 0)
-        );
-      }
-    } else {
-      for (const [coin, v] of Object.entries(result)) {
-        if (v && typeof v === 'object') {
-          const row = v as Record<string, unknown>;
-          pushBalance(
-            out,
-            coin,
-            toNum(row.available ?? row.amount),
-            toNum(row.frozen ?? row.freeze ?? 0)
-          );
-        }
-      }
+    const result: unknown = body.result;
+    // v4: result is an array of {currency, available, frozen, ...} — tolerate
+    // map/list wrappers too.
+    let rows: unknown[] = asArray(result);
+    if (rows.length === 0 && result && typeof result === 'object') {
+      const rec = result as Record<string, unknown>;
+      rows = asArray(rec.list ?? rec.balances ?? rec.data);
     }
-    return { signRejected: false, balances: out };
+    for (const item of rows) {
+      if (!item || typeof item !== 'object') continue;
+      const rec = item as Record<string, unknown>;
+      const asset = String(rec.currency ?? rec.coin ?? rec.asset ?? '');
+      pushBalance(
+        out,
+        asset,
+        toNum(rec.available ?? rec.free ?? rec.amount),
+        toNum(rec.frozen ?? rec.freeze ?? rec.locked ?? 0)
+      );
+    }
+    return out;
   }
-  const msg = String(body.msgInfo ?? body.error ?? '');
-  const signRejected = /sign|auth|token/i.test(msg);
-  return {
-    signRejected,
-    error: new Error(`خطای XT (کد ${rc}): ${msg}`),
-  };
+  const mc = String(body.mc ?? '');
+  if (/AUTH/i.test(mc)) {
+    throw new Error(
+      `کلید API XT معتبر نیست (${mc}) — در XT.com → API Management کلید را با مجوز خواندن بسازید و AccessKey/Secret را دقیق وارد کنید`
+    );
+  }
+  throw new Error(`خطای XT (${mc || rc})`);
+}
+
+async function xtFuturesBalance(w: ForeignWallet): Promise<ForeignBalance[]> {
+  const path = '/future/user/v1/balance/list';
+  const ts = String(Date.now());
+  const payload = `xt-validate-appkey=${w.apiKey}&xt-validate-timestamp=${ts}#GET#${path}`;
+  const signature = hmacSha256Hex(w.apiSecret, payload);
+  const res = await rawFetch(`https://fapi.xt.com${path}`, {
+    headers: {
+      'xt-validate-appkey': w.apiKey,
+      'xt-validate-timestamp': ts,
+      'xt-validate-signature': signature,
+    },
+  });
+  const body = parseJson(res.text);
+  if (!body) throw new Error(`پاسخ نامعتبر از XT فیوچرز (HTTP ${res.status})`);
+  const rc = Number(body.returnCode ?? -1);
+  if (rc === 0) {
+    const out: ForeignBalance[] = [];
+    const result: unknown = body.result;
+    let rows: unknown[] = asArray(result);
+    if (rows.length === 0 && result && typeof result === 'object') {
+      const rec = result as Record<string, unknown>;
+      rows = asArray(rec.list ?? rec.balances ?? rec.data);
+    }
+    for (const item of rows) {
+      if (!item || typeof item !== 'object') continue;
+      const rec = item as Record<string, unknown>;
+      const asset = String(rec.marginCoin ?? rec.currency ?? rec.coin ?? rec.asset ?? '');
+      pushBalance(
+        out,
+        asset,
+        toNum(rec.available ?? rec.free ?? rec.amount),
+        toNum(rec.frozen ?? rec.freeze ?? rec.locked ?? 0),
+        'futures'
+      );
+    }
+    return out;
+  }
+  const msg = String(body.msgInfo ?? '');
+  const errCode = String((body.error as Record<string, unknown> | undefined)?.code ?? '');
+  if (/sign|auth|token|key/i.test(msg + ' ' + errCode)) {
+    throw new Error(
+      `کلید API XT (فیوچرز) معتبر نیست (${errCode || msg}) — دسترسی خواندن را در XT.com چک کنید`
+    );
+  }
+  throw new Error(`خطای XT فیوچرز (${errCode || msg || rc})`);
 }
 
 async function fetchXt(w: ForeignWallet): Promise<ForeignBalance[]> {
-  let last = await xtAttempt(w, 'query-sig');
-  if (last.balances) return last.balances;
-  if (last.signRejected) {
-    const alt = await xtAttempt(w, 'token-auth');
-    if (alt.balances) return alt.balances;
-    last = alt;
+  const out: ForeignBalance[] = [];
+  let spotError: Error | undefined;
+  let futuresError: Error | undefined;
+  try {
+    out.push(...(await xtSpotBalance(w)));
+  } catch (e) {
+    spotError = e instanceof Error ? e : new Error(String(e));
   }
-  throw last.error ?? new Error('خطای ناشناخته XT');
+  try {
+    out.push(...(await xtFuturesBalance(w)));
+  } catch (e) {
+    futuresError = e instanceof Error ? e : new Error(String(e));
+  }
+  if (out.length > 0) return out;
+  // Nothing readable anywhere — surface the SPOT error (primary account).
+  throw spotError ?? futuresError ?? new Error('خطای ناشناخته XT');
 }
 
 // ---------------------------------------------------------------------------
