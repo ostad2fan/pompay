@@ -1,4 +1,4 @@
-import { Tabs, useRouter, usePathname } from 'expo-router';
+import { Tabs, useRouter } from 'expo-router';
 import { Radar, Settings, Fish, Wallet, Brain, Skull, Rocket, TrendingUp } from 'lucide-react-native';
 import { useEffect, useRef } from 'react';
 import { AppState } from 'react-native';
@@ -9,22 +9,19 @@ const RETURN_TO_SETTINGS_AFTER_MS = 15 * 60_000;
 
 export default function TabLayout() {
   const router = useRouter();
-  const pathname = usePathname();
-  const bootedOnce = useRef(false);
   const backgroundedAt = useRef<number | null>(null);
 
-  useEffect(() => {
-    // v1.4.10 — «وقتی برنامه را باز می‌کنم بخش تنظیمات همیشه نشان داده شود»:
-    // every fresh app launch lands on the settings tab (where the IP-status
-    // card also lives), instead of the last-opened / scanner screen.
-    if (!bootedOnce.current) {
-      bootedOnce.current = true;
-      if (!/settings/.test(pathname ?? '')) {
-        router.replace('/(tabs)/settings');
-      }
-    }
-  }, [pathname, router]);
-
+  // v1.4.11 — «باز شدن برنامه = صفحه تنظیمات».
+  // v1.4.10 این را با router.replace بعد از اولین mount می‌کرد؛ اما در همان
+  // لحظه Root Layout هنوز «ready» نیست (افکت فرزند‌ها قبل از والد اجرا می‌شود)
+  // و expo-router این استثنا را می‌انداخت:
+  //   «Attempted to navigate before mounting the Root Layout component»
+  // → کرش فوری هنگام باز شدن برنامه.
+  // حالا شروع روی تنظیمات بدون هیچ navigate برنامه‌ای انجام می‌شود:
+  //   • app/+native-intent.tsx مسیر «/» را به «/settings» هدایت می‌کند
+  //   • initialRouteName="settings" روی خود تب‌ها (فول‌بک)
+  // فقط «برگشتن به تنظیمات بعد از ۱۵ دقیقه در بک‌گراند» همچنان با
+  // router.replace انجام می‌شود — آن موقع برنامه کاملاً mount و stable است.
   useEffect(() => {
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'background' || state === 'inactive') {
@@ -34,7 +31,8 @@ export default function TabLayout() {
         backgroundedAt.current = null;
         if (awayMs >= RETURN_TO_SETTINGS_AFTER_MS) {
           // Opening the app again after a long absence → back to settings.
-          router.replace('/(tabs)/settings');
+          // v1.4.11 — مسیر بدون گروه؛ مسیر گروه‌دار کرش استارتاپ ۱.۴.۱۰ بود.
+          router.replace('/settings');
         }
       }
     });
@@ -43,6 +41,7 @@ export default function TabLayout() {
 
   return (
     <Tabs
+      initialRouteName="settings"
       screenOptions={{
         headerShown: false,
         tabBarStyle: {

@@ -219,7 +219,7 @@ export default function WhaleTrackerScreen() {
   const handleOpenWallet = useCallback(
     (wallet: WhaleWallet) => {
       router.push({
-        pathname: '/(tabs)/whales/wallet-detail' as any,
+        pathname: '/whales/wallet-detail' as any,
         params: { address: wallet.address, label: wallet.label, walletId: wallet.id },
       });
     },

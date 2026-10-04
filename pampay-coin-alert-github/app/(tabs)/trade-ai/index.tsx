@@ -1011,7 +1011,7 @@ export default function TradeAiScreen() {
           styles.realTradeBtn,
           pressed && { opacity: 0.85 },
         ]}
-        onPress={() => router.push('/(tabs)/trade-ai/real-trade' as never)}
+        onPress={() => router.push('/trade-ai/real-trade')}
         testID="go-real-trade"
       >
         <View style={styles.realTradeBtnLeft}>

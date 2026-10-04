@@ -267,7 +267,7 @@ export default function MemeScannerScreen() {
 
   const handleOpenToken = useCallback((token: MemeToken) => {
     router.push({
-      pathname: '/(tabs)/meme-scanner/token-detail' as any,
+      pathname: '/meme-scanner/token-detail' as any,
       params: {
         tokenId: token.id,
         tokenData: JSON.stringify(token),

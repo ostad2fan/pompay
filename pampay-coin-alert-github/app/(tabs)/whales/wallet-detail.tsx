@@ -308,7 +308,7 @@ export default function WalletDetailScreen() {
                 style={({ pressed }) => [styles.spotRow, pressed && { opacity: 0.7 }]}
                 onPress={() => {
                   router.push({
-                    pathname: '/(tabs)/whales/token-detail' as any,
+                    pathname: '/whales/token-detail' as any,
                     params: {
                       symbol: bal.coin,
                       name: bal.coin,
