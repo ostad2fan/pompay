@@ -36,6 +36,7 @@ import { ExchangeId } from '@/types/crypto';
 import DropdownPicker from '@/components/DropdownPicker';
 import VpnWarningBanner from '@/components/VpnWarningBanner';
 import { isForeignExchange, checkVpnStatus, VpnStatus } from '@/utils/vpnGuard';
+import { isSanctionedIpMessage, sanctionedIpText } from '@/utils/geoBlock';
 import { useApp } from '@/contexts/AppContext';
 import { fetchUsdtTomanPrice, formatToman } from '@/utils/nobitexApi';
 import { fetchArzinjaBalances } from '@/utils/arzinjaV2Api';
@@ -2548,6 +2549,25 @@ function WalletItem({
   onRefresh,
 }: WalletItemProps) {
   const [activeSection, setActiveSection] = useState<'all' | WalletSection>('all');
+  // v1.4.12 — sanctioned-IP (geo-blocked) state for THIS exchange: the VPN is
+  // on and the exit IP is NOT Iranian, but this one exchange answered with a
+  // geo-block status (451/403/418) → «این صرافی IP شما را تحریم کرده».
+  const balanceErrorMessage =
+    balanceQuery?.error instanceof Error ? balanceQuery.error.message : undefined;
+  const sanctionedIp = isSanctionedIpMessage(balanceErrorMessage);
+  const sanctionedDialogShown = useRef(false);
+  useEffect(() => {
+    if (!sanctionedIp || sanctionedDialogShown.current) return;
+    sanctionedDialogShown.current = true;
+    Alert.alert(
+      `صرافی ${wallet.exchangeName} تحریم است`,
+      `IP خروجی فیلترشکن شما توسط این صرافی بلاک جغرافیایی شده (کشور تحریمی/محدود).\n\nبقیه صرافی‌ها اوکی هستند و به کار خود ادامه می‌دهند — می‌توانید فقط همین صرافی را قطع کنید یا با یک IP غیرتحریمی (کشور دیگر) دوباره تلاش کنید.`,
+      [
+        { text: 'قطع این صرافی', style: 'destructive', onPress: onRemove },
+        { text: 'باشه، بعداً' },
+      ]
+    );
+  }, [sanctionedIp, wallet.exchangeName, onRemove]);
   // v1.4.5 CRASH FIX: `balanceQueries` (useQueries) is EMPTY while the cached
   // snapshots are still loading (cachesLoaded=false), yet `wallets` already
   // holds every saved exchange — `balanceQueries[idx]` is undefined for a
@@ -2566,6 +2586,8 @@ function WalletItem({
   const gateError =
     balanceQuery?.error instanceof Error && balanceQuery.error.message === IRAN_GATE_ERROR;
   const showBalanceError = hasError && !iranGated && !gateError;
+  // v1.4.12 — the sanctioned card replaces the generic error card.
+  const showGenericBalanceError = showBalanceError && !sanctionedIp;
 
   // v1.4.8 — per-exchange dust threshold. BitPerp's own wallet page shows
   // even a 5-cent balance («۵ سنت موجودی دارم اما صفر می‌زند»), and any
@@ -2712,12 +2734,38 @@ function WalletItem({
             </View>
           )}
 
-          {showBalanceError && (
+          {/* ── v1.4.12: تحریم IP توسط همین صرافی (۴۵۱/۴۰۳) — بقیه صرافی‌ها اوکی ── */}
+          {sanctionedIp && (
+            <View style={styles.sanctionCard}>
+              <ShieldAlert size={18} color={colors.dark.red} />
+              <View style={styles.iranGateTextCol}>
+                <Text style={styles.sanctionTitle}>
+                  صرافی {wallet.exchangeName} این IP را تحریم کرده
+                </Text>
+                <Text style={styles.iranGateBody}>
+                  {sanctionedIpText(balanceErrorMessage ?? '')}
+                </Text>
+                <View style={styles.sanctionBtnRow}>
+                  <Pressable style={styles.sanctionBtn} onPress={onRemove}>
+                    <Text style={styles.sanctionBtnText}>قطع این صرافی</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.sanctionBtn, styles.sanctionBtnGhost]}
+                    onPress={() => void onRecheckVpn()}
+                  >
+                    <Text style={styles.sanctionBtnGhostText}>بررسی مجدد IP</Text>
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+          )}
+
+          {showGenericBalanceError && (
             <View style={styles.balanceError}>
               <ShieldAlert size={14} color={colors.dark.red} />
               <Text style={styles.balanceErrorText}>
-                {balanceQuery?.error instanceof Error
-                  ? balanceQuery.error.message
+                {balanceErrorMessage
+                  ? sanctionedIpText(balanceErrorMessage)
                   : 'خطا در دریافت موجودی — مطمئن شوید API معتبر است'}
               </Text>
             </View>
@@ -3116,7 +3164,9 @@ function PnlPeriodSection({ wallet, iranGated }: { wallet: ExchangeWallet; iranG
       {pnlQuery.error && !pnl && (
         <View>
           <Text style={styles.pnlNote}>
-            خطا در دریافت اطلاعات این بازه — کلید API و اتصال اینترنت را بررسی کنید.
+            {pnlQuery.error instanceof Error
+              ? sanctionedIpText(pnlQuery.error.message)
+              : 'خطا در دریافت اطلاعات این بازه — کلید API و اتصال اینترنت را بررسی کنید.'}
           </Text>
           <Pressable style={styles.pnlRetryBtn} onPress={refetchPnl} disabled={pnlQuery.isFetching}>
             <Text style={styles.pnlRetryBtnText}>
@@ -3715,6 +3765,50 @@ const styles = createThemedStyles(() => StyleSheet.create({
     fontSize: 11,
     fontWeight: '700' as const,
     color: colors.dark.orange,
+  },
+  // ── v1.4.12 — sanctioned-IP (geo-block) card styles ──
+  sanctionCard: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    backgroundColor: colors.dark.red + '14',
+    borderWidth: 1,
+    borderColor: colors.dark.red + '66',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 10,
+  },
+  sanctionTitle: {
+    fontSize: 13,
+    fontWeight: '800' as const,
+    color: colors.dark.red,
+    textAlign: 'right',
+  },
+  sanctionBtnRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 4,
+  },
+  sanctionBtn: {
+    backgroundColor: colors.dark.red + '22',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  sanctionBtnText: {
+    fontSize: 11,
+    fontWeight: '700' as const,
+    color: colors.dark.red,
+  },
+  sanctionBtnGhost: {
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: colors.dark.red + '55',
+  },
+  sanctionBtnGhostText: {
+    fontSize: 11,
+    fontWeight: '700' as const,
+    color: colors.dark.red,
   },
   balanceList: {
     gap: 8,

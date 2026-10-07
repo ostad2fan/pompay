@@ -2,8 +2,8 @@
  * VpnGateContext.tsx — v1.4.8 single shared exit-IP poller for the WHOLE app.
  *
  * One provider (mounted above everything in _layout) force-rechecks the
- * public exit IP + country every 15 seconds (and instantly on every app
- * resume). Everything else consumes the state:
+ * public exit IP + country every 2 seconds (v1.4.12 — was 15s) and instantly
+ * on every app resume. Everything else consumes the state:
  *
  *   • StartupIpGate      — full-screen blocking overlay when status === 'iran'
  *                          (covers startup AND «فیلترشکن وسط کار خاموش شد»)
@@ -12,8 +12,8 @@
  *   • AppContext scan    — refuses to scan Binance while blocked
  *   • Wallet screen      — foreign-exchange queries fully gated (v1.4.7)
  *
- * The check bypasses vpnGuard's 2-minute cache (force) so a VPN toggle is
- * noticed within one poll cycle (≤15s).
+ * The check bypasses vpnGuard's cache (force) so a VPN toggle is noticed
+ * within one poll cycle (≤2s).
  */
 
 import React, {
@@ -27,8 +27,8 @@ import React, {
 import { AppState } from 'react-native';
 import { getIpInfo, IpInfo, VpnStatus } from '@/utils/vpnGuard';
 
-/** How often the exit IP is re-checked while the app is open. */
-const POLL_MS = 15_000;
+/** How often the exit IP is re-checked while the app is open (v1.4.12: 2s). */
+const POLL_MS = 2_000;
 
 interface VpnGateState {
   status: VpnStatus;

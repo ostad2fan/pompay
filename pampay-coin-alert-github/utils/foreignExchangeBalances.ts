@@ -19,6 +19,7 @@
 import CryptoJS from 'crypto-js';
 import { ExchangeId } from '@/types/crypto';
 import { exchangeNow, markClockStale } from './exchangeClock';
+import { geoBlockErrorFor, noteResponseStatus } from './geoBlock';
 
 export interface ForeignWallet {
   apiKey: string;
@@ -62,6 +63,9 @@ async function rawFetch(
       signal: controller.signal,
       headers: { Accept: 'application/json', ...(init.headers ?? {}) },
     });
+    // v1.4.12 — record geo-block statuses (451/403/418) for sanctioned-IP
+    // detection (utils/geoBlock.ts). Cheap no-op for every other status.
+    noteResponseStatus(res.status, url);
     return { ok: res.ok, status: res.status, text: await res.text() };
   } finally {
     clearTimeout(timer);
@@ -1460,6 +1464,12 @@ export async function fetchForeignExchangeBalance(
   try {
     balances = await fetcher(wallet);
   } catch (e) {
+    // v1.4.12 — sanctioned-IP detection: if this exchange just answered with
+    // a geo-block status (451/403/418), replace the (often vague) error with
+    // the dedicated SanctionedIpError → wallet shows the «تحریم» dialog and
+    // can disconnect THIS exchange only (the others stay connected).
+    const geo = geoBlockErrorFor(exchangeId, wallet.exchangeName);
+    if (geo) throw geo;
     if (e instanceof Error) throw e;
     throw networkError(wallet.exchangeName, e);
   }

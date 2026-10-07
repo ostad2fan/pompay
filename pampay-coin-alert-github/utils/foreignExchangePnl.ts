@@ -20,6 +20,7 @@
 
 import CryptoJS from 'crypto-js';
 import { exchangeNow, markClockStale } from './exchangeClock';
+import { noteResponseStatus, geoBlockErrorFor } from './geoBlock';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_PAGES = 10;
@@ -46,6 +47,8 @@ async function rawFetch(url: string, init: RequestInit = {}): Promise<RawResp> {
       signal: controller.signal,
       headers: { Accept: 'application/json', ...(init.headers ?? {}) },
     });
+    // v1.4.12 — geo-block (451/403/418) tracking for sanctioned-IP detection.
+    noteResponseStatus(res.status, url);
     return { ok: res.ok, status: res.status, text: await res.text() };
   } finally {
     clearTimeout(timer);
@@ -229,6 +232,19 @@ async function bitgetPeriodPnl(w: ForeignPnlCredentials, days: number): Promise<
     // ---- UTA (v3): cursor-paginated position history ----
     return bitgetUtaPnl(w, windowStart);
   }
+  // v1.4.12 — Unified accounts sometimes answer the v2 route with code 00000
+  // and an EMPTY list (instead of 40085), which made PnL read as 0/خالی on
+  // EVERY timeframe. Empty classic result → probe the v3 UTA route as well;
+  // if it returns rows, those numbers win.
+  if (classic.result && classic.result.closedCount === 0) {
+    try {
+      const uta = await bitgetUtaPnl(w, windowStart);
+      if (uta && uta.closedCount > 0) return uta;
+    } catch {
+      // keep the classic zeros — auth errors for the classic route already
+      // threw above, so any failure here leaves the old behavior intact.
+    }
+  }
   return classic.result;
 }
 
@@ -292,40 +308,62 @@ async function bitgetUtaPnl(
   let fundingFees = 0;
   let commissions = 0;
   let closedCount = 0;
-  let cursor: string | undefined;
+  let lastError: Error | null = null;
 
-  for (let round = 0; round < MAX_PAGES * 2; round++) {
-    const path = '/api/v3/position/history-position';
-    let qs = `category=USDT-FUTURES&limit=100`;
-    if (cursor) qs += `&idLessThan=${cursor}`;
-    const { body, status } = await bitgetSignedGet(w, `${path}?${qs}`);
-    if (!body) throw new Error(`پاسخ نامعتبر از Bitget UTA (HTTP ${status})`);
+  // v1.4.12 — try both category spellings; keep whichever answers with rows.
+  for (const category of ['USDT-FUTURES', 'linear'] as const) {
+    let cursor: string | undefined;
+    let categoryCount = 0;
+    try {
+      for (let round = 0; round < MAX_PAGES * 2; round++) {
+        const path = '/api/v3/position/history-position';
+        let qs = `category=${category}&limit=100`;
+        if (cursor) qs += `&idLessThan=${cursor}`;
+        const { body, status } = await bitgetSignedGet(w, `${path}?${qs}`);
+        if (!body) throw new Error(`پاسخ نامعتبر از Bitget UTA (HTTP ${status})`);
 
-    const code = String(body.code ?? '');
-    const authErr = bitgetAuthError(code, String(body.msg ?? ''));
-    if (authErr) throw authErr;
-    if (code !== '00000') {
-      throw new Error(`خطای Bitget UTA در دریافت سود/زیان (کد ${code}): ${String(body.msg ?? '')}`);
+        const code = String(body.code ?? '');
+        const authErr = bitgetAuthError(code, String(body.msg ?? ''));
+        if (authErr) throw authErr;
+        if (code !== '00000') {
+          throw new Error(`خطای Bitget UTA در دریافت سود/زیان (کد ${code}): ${String(body.msg ?? '')}`);
+        }
+
+        const data = (body.data ?? {}) as Record<string, unknown>;
+        // v1.4.12 — tolerate every observed row-shape for the v3 route.
+        const rows = Array.isArray(data.list)
+          ? (data.list as Array<Record<string, unknown>>)
+          : Array.isArray(data.rows)
+            ? (data.rows as Array<Record<string, unknown>>)
+            : Array.isArray(data.positionList)
+              ? (data.positionList as Array<Record<string, unknown>>)
+              : [];
+        if (rows.length === 0) break;
+
+        for (const r of rows) {
+          const closeMs = toMs(r.updatedTime ?? r.uTime ?? r.closeTime ?? r.createdTime);
+          if (closeMs > 0 && closeMs < windowStart) continue;
+          realizedPnl += toNum(r.cumRealisedPnl ?? r.netProfit ?? r.pnl ?? r.realisedPnl);
+          fundingFees += toNum(r.totalFunding ?? r.fundingFee ?? 0);
+          commissions += toNum(r.openFeeTotal ?? 0) + toNum(r.closeFeeTotal ?? 0);
+          closedCount++;
+          categoryCount++;
+        }
+
+        const next = String(data.cursor ?? data.endId ?? '');
+        if (!next || rows.length < 100) break;
+        cursor = next;
+      }
+    } catch (e) {
+      // Remember the first failure; if the other category also fails, throw.
+      if (lastError === null) lastError = e instanceof Error ? e : new Error(String(e));
     }
-
-    const data = (body.data ?? {}) as Record<string, unknown>;
-    const rows = Array.isArray(data.list) ? (data.list as Array<Record<string, unknown>>) : [];
-    if (rows.length === 0) break;
-
-    for (const r of rows) {
-      const closeMs = toMs(r.updatedTime ?? r.createdTime);
-      if (closeMs > 0 && closeMs < windowStart) continue;
-      realizedPnl += toNum(r.cumRealisedPnl ?? r.netProfit ?? r.pnl);
-      fundingFees += toNum(r.totalFunding ?? r.fundingFee ?? 0);
-      commissions += toNum(r.openFeeTotal ?? 0) + toNum(r.closeFeeTotal ?? 0);
-      closedCount++;
+    if (categoryCount > 0) {
+      // This category returned data — use it.
+      return { realizedPnl, fundingFees, commissions, closedCount };
     }
-
-    const next = String(data.cursor ?? '');
-    if (!next || rows.length < 100) break;
-    cursor = next;
   }
-
+  if (closedCount === 0 && lastError) throw lastError;
   return { realizedPnl, fundingFees, commissions, closedCount };
 }
 
@@ -337,18 +375,27 @@ async function bitgetUtaPnl(
  * Period PnL for the supported foreign exchanges. Returns null when this
  * exchange has no period-PnL API (the caller shows its own note then).
  * Network/auth problems THROW precise Persian errors.
+ *
+ * v1.4.12 — a recent geo-block (451/403/418) from THIS exchange is converted
+ * into SanctionedIpError so the PnL card shows the «تحریم» explanation too.
  */
 export async function fetchForeignPeriodPnl(
   exchangeId: string,
   w: ForeignPnlCredentials,
   days: number
 ): Promise<ForeignPeriodPnl | null> {
-  switch (exchangeId) {
-    case 'mexc':
-      return mexcPeriodPnl(w, days);
-    case 'bitget':
-      return bitgetPeriodPnl(w, days);
-    default:
-      return null;
+  try {
+    switch (exchangeId) {
+      case 'mexc':
+        return await mexcPeriodPnl(w, days);
+      case 'bitget':
+        return await bitgetPeriodPnl(w, days);
+      default:
+        return null;
+    }
+  } catch (e) {
+    const geo = geoBlockErrorFor(exchangeId, exchangeId);
+    if (geo) throw geo;
+    throw e;
   }
 }

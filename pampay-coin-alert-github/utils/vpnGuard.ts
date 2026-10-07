@@ -12,9 +12,16 @@
  * All endpoints are HTTPS, free, no API key, and reachable from Iran without
  * a VPN (they only ANSWER the question — they don't need to be unblocked).
  *
- * Result is cached for 2 minutes; every check has a 5s timeout and we try
- * the next provider on failure. 'unknown' never blocks anything — the banner
- * is only shown on a POSITIVE Iran match.
+ * Result is cached briefly; every check has a short timeout and we try the
+ * next provider on failure. 'unknown' never blocks anything — the banner is
+ * only shown on a POSITIVE Iran match.
+ *
+ * v1.4.12 — the gate polls every 2 seconds (was 15). To survive that rate:
+ *   • providers rotate round-robin (spread the load across all three)
+ *   • forced checks share ONE in-flight promise (no request stacking)
+ *   • per-provider timeout dropped 5s → 2.5s so a check fits one poll cycle
+ *   • the non-forced cache is 3s (was 2min) so banners/other consumers
+ *     follow a VPN toggle almost instantly without extra traffic.
  */
 
 export type VpnStatus = 'vpn' | 'iran' | 'unknown';
@@ -48,10 +55,23 @@ const PROVIDERS: GeoProvider[] = [
 ];
 
 let cache: { at: number; status: VpnStatus } | null = null;
-const CACHE_MS = 2 * 60_000;
+const CACHE_MS = 3_000;
 
 /** In-flight promise so parallel components share one check. */
 let inflight: Promise<VpnStatus> | null = null;
+
+/** v1.4.12 — round-robin index: each new check starts with the next provider. */
+let providerCursor = 0;
+
+/** v1.4.12 — short timeout so a check completes within one 2s poll cycle. */
+const PROVIDER_TIMEOUT_MS = 2_500;
+
+function providersInRotation(): GeoProvider[] {
+  const n = PROVIDERS.length;
+  const start = providerCursor % n;
+  providerCursor = (providerCursor + 1) % n;
+  return [...PROVIDERS.slice(start), ...PROVIDERS.slice(0, start)];
+}
 
 async function fetchWithTimeout(url: string, ms: number): Promise<unknown | null> {
   try {
@@ -67,8 +87,8 @@ async function fetchWithTimeout(url: string, ms: number): Promise<unknown | null
 }
 
 async function checkOnce(): Promise<VpnStatus> {
-  for (const p of PROVIDERS) {
-    const data = await fetchWithTimeout(p.url, 5_000);
+  for (const p of providersInRotation()) {
+    const data = await fetchWithTimeout(p.url, PROVIDER_TIMEOUT_MS);
     const country = data ? p.extract(data) : null;
     if (country) {
       return country.toUpperCase() === 'IR' ? 'iran' : 'vpn';
@@ -136,6 +156,9 @@ const COUNTRY_FA: Record<string, string> = {
   KZ: 'قزاقستان',
 };
 
+/** v1.4.12 — in-flight promise for the FULL info check (forced path). */
+let infoInflight: Promise<IpInfo> | null = null;
+
 /** Reads the ip+country from the SAME providers used by checkVpnStatus. */
 export async function getIpInfo(force = false): Promise<IpInfo> {
   if (!force) {
@@ -144,8 +167,19 @@ export async function getIpInfo(force = false): Promise<IpInfo> {
       return ipInfoCache.info;
     }
   }
-  for (const p of PROVIDERS) {
-    const data = (await fetchWithTimeout(p.url, 5_000)) as Record<string, unknown> | null;
+  // Forced (2s gate poll): share one network round between overlapping ticks.
+  if (infoInflight) return infoInflight;
+  infoInflight = getIpInfoUncached()
+    .catch(() => ({ status: 'unknown' }) as IpInfo)
+    .finally(() => {
+      infoInflight = null;
+    });
+  return infoInflight;
+}
+
+async function getIpInfoUncached(): Promise<IpInfo> {
+  for (const p of providersInRotation()) {
+    const data = (await fetchWithTimeout(p.url, PROVIDER_TIMEOUT_MS)) as Record<string, unknown> | null;
     if (!data) continue;
     const ip =
       typeof data.ip === 'string'

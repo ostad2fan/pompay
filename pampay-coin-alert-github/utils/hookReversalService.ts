@@ -2,6 +2,20 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { fetchFuturesTickers, fetchKlines } from '@/utils/binanceApi';
 import { sendTelegramMessage } from '@/utils/telegramService';
 
+/** v1.4.12 - read the user's saved settings (same key AppContext uses). */
+const APP_SETTINGS_KEY = '@crypto_scanner_settings';
+async function isHookNotificationsOn(): Promise<boolean> {
+  try {
+    const stored = await AsyncStorage.getItem(APP_SETTINGS_KEY);
+    if (!stored) return true;
+    const settings = JSON.parse(stored);
+    // OFF only on an explicit false - missing/undefined means ON (default).
+    return settings.hookReversalNotifications !== false;
+  } catch {
+    return true;
+  }
+}
+
 /**
  * Hook Reversal indicator.
  * Detects the classic hook reversal price-action pattern on 4h/1d candles:
@@ -247,8 +261,13 @@ export async function runHookScanCycle(
     for (const sig of freshSignals) notifyKeys[sig.id] = true;
 
     if (!isFirstRun && newToAnnounce.length > 0) {
-      const sent = await sendTelegramMessage(buildTelegramText(newToAnnounce));
-      if (sent) console.log(`[HookReversal] Announced ${newToAnnounce.length} new signals`);
+      // v1.4.12 - Telegram announcements respect the hook notifications toggle:
+      // when the user turned the hook alerts OFF, signals are still detected and
+      // stored (the tab stays useful) but NOTHING is sent to Telegram.
+      if (await isHookNotificationsOn()) {
+        const sent = await sendTelegramMessage(buildTelegramText(newToAnnounce));
+        if (sent) console.log(`[HookReversal] Announced ${newToAnnounce.length} new signals`);
+      }
     }
 
     await saveNotifyKeys(notifyKeys);
