@@ -1,11 +1,21 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 /**
- * iranMarketApi.ts — v1.4.13
+ * iranMarketApi.ts — v1.4.14
  *
  * Live Iranian market prices (gold / silver / coins / mesghal / USD) in TOMAN,
- * from TGJU's public widget API (call1/call2 mirrors — the same feed that
+ * from TGJU's public widget API (call1/call2/call mirrors — the same feed that
  * powers tgju.org). No auth, no geo-block for Iranian users.
+ *
+ * v1.4.14 — «قیمت فلزات با فیلترشکن روشن نمی‌آید» fix:
+ *   TGJU sits behind Cloudflare and answers fine from MOST foreign exit IPs
+ *   (verified live), but some VPN exits are bot-flagged by Cloudflare and get
+ *   an HTML challenge instead of the JSON — both mirrors then fail and the
+ *   whole price grid goes blank. Fix = a 3-layer chain:
+ *     1. direct mirrors (call1 / call2 / call.tgju) — Iranian IP & clean exits
+ *     2. CORS-proxy mirror (api.allorigins.win) — ITS server fetches TGJU, so
+ *        the phone's (possibly challenged) exit IP never touches tgju.org
+ *     3. stale cache (≤ 24h) with the old timestamp — never a blank grid
  *
  * TGJU returns Iranian prices in RIAL → converted to Toman (/10).
  * Values are cached in memory (60s) + AsyncStorage (10 min) so the wallet's
@@ -16,6 +26,17 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 const TGJU_MIRRORS = [
   'https://call1.tgju.org/ajax.json',
   'https://call2.tgju.org/ajax.json',
+  'https://call.tgju.org/ajax.json',
+];
+
+/**
+ * v1.4.14 — proxy mirror for VPN exits that Cloudflare challenges. The proxy
+ * service fetches the TGJU file with ITS OWN (clean) IP and streams it back —
+ * the response is identical JSON. Only used after every direct mirror fails.
+ */
+const TGJU_PROXY_MIRRORS = [
+  'https://api.allorigins.win/raw?url=' + encodeURIComponent('https://call1.tgju.org/ajax.json'),
+  'https://api.allorigins.win/raw?url=' + encodeURIComponent('https://call2.tgju.org/ajax.json'),
 ];
 
 const CACHE_KEY = '@iran_market_prices_v1';
@@ -72,8 +93,13 @@ function toToman(raw: string | number | undefined | null): number {
   const clean = typeof raw === 'number' ? String(raw) : persianToEnglishDigits(raw).replace(/[,،\s]/g, '');
   const n = parseFloat(clean);
   if (!Number.isFinite(n) || n <= 0) return 0;
-  const toman = n > 10_000_000_000 ? n / 10 : n;
-  return toman;
+  // v1.4.14 — UNIT FIX: TGJU quotes this market in RIAL (verified against the
+  // cross-symbol ratios: gold24/USD ≈ world gold per oz, gold/silver ratio ≈ 69,
+  // coin ≈ 10.8 g of 18k). The old `> 10B` heuristic never divided at today's
+  // price levels → gold18 (264.9M RIAL) failed the 100M sanity bound → the
+  // whole price grid showed «قیمت‌ها در دسترس نیست» and, when it did render,
+  // values were 10× too high. RIAL → TOMAN is a plain ÷10.
+  return n / 10;
 }
 
 interface TgjuEntry {
@@ -149,42 +175,71 @@ async function readCached(): Promise<IranMarketPrices | null> {
   }
 }
 
+/** v1.4.14 — the VPN-on fallback may serve a stale-but-valid copy (≤24h). */
+async function readStaleCached(maxAgeMs: number): Promise<IranMarketPrices | null> {
+  try {
+    const stored = await AsyncStorage.getItem(CACHE_KEY);
+    if (!stored) return null;
+    const parsed = JSON.parse(stored) as IranMarketPrices;
+    if (!parsed?.gold18 || Date.now() - parsed.updatedAt > maxAgeMs) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 async function writeCache(prices: IranMarketPrices): Promise<void> {
   try {
     await AsyncStorage.setItem(CACHE_KEY, JSON.stringify(prices));
   } catch {}
 }
 
+/** Parse one TGJU response body → prices, or null when unusable (HTML challenge). */
+function parseTgjuBody(text: string): Partial<IranMarketPrices> | null {
+  try {
+    const data = JSON.parse(text) as { current?: Record<string, TgjuEntry> };
+    const partial = extractPrices(data);
+    if (partial.gold18) return partial;
+    return null;
+  } catch {
+    // v1.4.14 — Cloudflare challenge / HTML error page → treat as failure
+    // so the NEXT mirror (or the proxy layer) gets a chance.
+    return null;
+  }
+}
+
 /**
- * Fetches live Iranian metal/coin prices (Toman). Falls back to the cached
- * copy (≤10 min old) when both mirrors fail, then returns null.
+ * Fetches live Iranian metal/coin prices (Toman). Chain (v1.4.14):
+ *   direct mirrors → proxy mirrors → fresh cache → stale cache (≤24h) → null.
  */
 export async function fetchIranMarketPrices(): Promise<IranMarketPrices | null> {
   if (memoryCache && Date.now() - memoryCache.at < MEMORY_TTL) {
     return memoryCache.prices;
   }
 
+  const buildPrices = (partial: Partial<IranMarketPrices>, source: string): IranMarketPrices => ({
+    gold18: partial.gold18!,
+    gold24: partial.gold24!,
+    silver999: partial.silver999 ?? 0,
+    silver925: partial.silver925 ?? 0,
+    coinEmami: partial.coinEmami ?? 0,
+    coinBahar: partial.coinBahar ?? 0,
+    coinNim: partial.coinNim ?? 0,
+    coinRob: partial.coinRob ?? 0,
+    mesghal: partial.mesghal ?? 0,
+    dollar: partial.dollar ?? 0,
+    updatedAt: Date.now(),
+    source,
+  });
+
+  // ── layer 1: direct TGJU mirrors (Iranian IP & clean VPN exits) ──
   for (const url of TGJU_MIRRORS) {
     try {
-      const res = await fetchWithTimeout(url);
+      const res = await fetchWithTimeout(url, 12000);
       if (!res.ok) continue;
-      const data = (await res.json()) as { current?: Record<string, TgjuEntry> };
-      const partial = extractPrices(data);
-      if (partial.gold18) {
-        const prices: IranMarketPrices = {
-          gold18: partial.gold18!,
-          gold24: partial.gold24!,
-          silver999: partial.silver999 ?? 0,
-          silver925: partial.silver925 ?? 0,
-          coinEmami: partial.coinEmami ?? 0,
-          coinBahar: partial.coinBahar ?? 0,
-          coinNim: partial.coinNim ?? 0,
-          coinRob: partial.coinRob ?? 0,
-          mesghal: partial.mesghal ?? 0,
-          dollar: partial.dollar ?? 0,
-          updatedAt: Date.now(),
-          source: 'TGJU',
-        };
+      const partial = parseTgjuBody(await res.text());
+      if (partial) {
+        const prices = buildPrices(partial, 'TGJU');
         memoryCache = { at: Date.now(), prices };
         await writeCache(prices);
         console.log('[IranMarket] TGJU prices fetched — gold18:', prices.gold18);
@@ -195,11 +250,37 @@ export async function fetchIranMarketPrices(): Promise<IranMarketPrices | null> 
     }
   }
 
-  // Mirrors failed → serve the stale cache (if any) with the old timestamp.
+  // ── layer 2: proxy mirrors — the proxy's own IP fetches TGJU, so a
+  // Cloudflare-challenged VPN exit can no longer blank the price grid ──
+  for (const url of TGJU_PROXY_MIRRORS) {
+    try {
+      const res = await fetchWithTimeout(url, 20000);
+      if (!res.ok) continue;
+      const partial = parseTgjuBody(await res.text());
+      if (partial) {
+        const prices = buildPrices(partial, 'TGJU (پروکسی)');
+        memoryCache = { at: Date.now(), prices };
+        await writeCache(prices);
+        console.log('[IranMarket] proxied TGJU prices fetched — gold18:', prices.gold18);
+        return prices;
+      }
+    } catch (e) {
+      console.log(`[IranMarket] proxy failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+
+  // Mirrors failed → serve the fresh cache (if any) with the old timestamp.
   const cached = await readCached();
   if (cached) {
     console.log('[IranMarket] serving cached prices from', new Date(cached.updatedAt).toISOString());
     return cached;
+  }
+
+  // v1.4.14 — last resort: a stale-but-valid copy (≤24h) beats a blank grid.
+  const stale = await readStaleCached(24 * 60 * 60 * 1000);
+  if (stale) {
+    console.log('[IranMarket] serving STALE prices from', new Date(stale.updatedAt).toISOString());
+    return stale;
   }
   return null;
 }

@@ -25,6 +25,9 @@ import {
   DollarSign,
   TrendingUp,
   Mail,
+  Bitcoin,
+  Landmark,
+  Sparkles,
 } from 'lucide-react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -51,6 +54,7 @@ import { fetchForeignExchangeBalance } from '@/utils/foreignExchangeBalances';
 import { fetchForeignPeriodPnl } from '@/utils/foreignExchangePnl';
 import { exchangeNow, markClockStale } from '@/utils/exchangeClock';
 import LocalAssetsSection from '@/components/LocalAssetsSection';
+import GoldPredictionSection from '@/components/GoldPredictionSection';
 
 interface ExchangeWallet {
   id: string;
@@ -62,7 +66,7 @@ interface ExchangeWallet {
   addedAt: number;
 }
 
-type WalletSection = 'spot' | 'earn' | 'funding' | 'futures' | 'alpha';
+type WalletSection = 'spot' | 'earn' | 'funding' | 'futures' | 'alpha' | 'copy';
 
 interface WalletBalance {
   asset: string;
@@ -142,6 +146,7 @@ const SECTION_LABEL: Record<WalletSection, string> = {
   funding: 'فاندینگ',
   futures: 'فیوچرز',
   alpha: 'آلفا (Alpha)',
+  copy: 'کپی‌تریدینگ',
 };
 
 function formatSignedUsd(value: number): string {
@@ -1584,6 +1589,84 @@ async function fetchBitperpBalance(wallet: ExchangeWallet): Promise<WalletBalanc
     throw new Error(`بیت‌پرپ خطا برگرداند: ${account.errorMsg}`);
   }
 
+  // ── v1.4.14 — NEW wallet structure (Funding / Spot / Perp / Copy) ──
+  // BitPerp rebuilt its account model (live web app now reads
+  // /api/spot/fund-balance, /api/spot/balance, /api/v2/perp-balances and
+  // /api/wallet/overview). The legacy /api/balance now serves STALE data —
+  // the root cause of «دارایی‌های جدید نشان داده نمی‌شوند». When the new
+  // endpoints hold ANY data, they are the source of truth.
+  if (
+    account.newWallet &&
+    (account.fundingBalances.length > 0 ||
+      account.spotBalances.length > 0 ||
+      account.perpBalancesV2.length > 0)
+  ) {
+    const balances: WalletBalance[] = [];
+
+    for (const item of account.fundingBalances) {
+      balances.push({
+        asset: item.asset,
+        section: 'funding',
+        free: item.free,
+        locked: item.locked,
+        total: item.total,
+        valueUsd: item.valueUsd,
+      });
+    }
+
+    for (const item of account.spotBalances) {
+      balances.push({
+        asset: item.asset,
+        section: 'spot',
+        free: item.free,
+        locked: item.locked,
+        total: item.total,
+        valueUsd: item.valueUsd,
+      });
+    }
+
+    for (const item of account.perpBalancesV2) {
+      balances.push({
+        asset: item.asset,
+        section: 'futures',
+        free: item.available,
+        locked: 0,
+        total: item.equity > 0 ? item.equity : item.available,
+        valueUsd: 0,
+      });
+    }
+
+    // Copy-trading sub-account (USDT-denominated).
+    if ((account.copyEquity ?? 0) > 0) {
+      balances.push({
+        asset: 'USDT',
+        section: 'copy',
+        free: account.copyEquity ?? 0,
+        locked: 0,
+        total: account.copyEquity ?? 0,
+        valueUsd: account.copyEquity ?? 0,
+      });
+    }
+
+    // USD valuation for items without an API-provided value.
+    try {
+      const priceMap = await getUsdPriceMap();
+      for (const bal of balances) {
+        if (bal.valueUsd > 0) continue;
+        const stable = stableCoinValueUsd(bal.asset, bal.total);
+        if (stable !== null) {
+          bal.valueUsd = stable;
+        } else if (priceMap[`${bal.asset}USDT`]) {
+          bal.valueUsd = bal.total * priceMap[`${bal.asset}USDT`];
+        }
+      }
+    } catch {}
+
+    // Sum spot/perp rows with identical asset+section after valuation.
+    return balances.filter((b) => b.valueUsd !== 0 || b.total > 0.000001);
+  }
+
+  // ── LEGACY path (older server / new endpoints dead) — v1.4.9 logic ──
   const balances: WalletBalance[] = [];
 
   // Funding (main) wallet — always USDT-denominated on BitPerp.
@@ -1869,7 +1952,7 @@ async function fetchExchangeBalance(wallet: ExchangeWallet): Promise<ExchangeBal
     bal.section = bal.section ?? 'spot';
   }
 
-  const sectionOrder: Record<WalletSection, number> = { spot: 0, earn: 1, funding: 2, futures: 3, alpha: 4 };
+  const sectionOrder: Record<WalletSection, number> = { spot: 0, copy: 1, earn: 2, funding: 3, futures: 4, alpha: 5 };
   balances.sort(
     (a, b) =>
       (sectionOrder[a.section!] - sectionOrder[b.section!]) || b.valueUsd - a.valueUsd
@@ -1904,6 +1987,20 @@ export default function WalletScreen() {
   const { settings } = useApp();
   const [expandedWallet, setExpandedWallet] = useState<string | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
+
+  // v1.4.14 — three top-level tabs of the asset-management screen:
+  //   ۱. ارز دیجیتال (exchanges)   ۲. دارایی ریالی و فلزات   ۳. پیش‌بینی قیمت طلا
+  // Persisted so the user returns to the tab they last used.
+  const [activeMainTab, setActiveMainTab] = useState<'crypto' | 'rial' | 'gold'>('crypto');
+  useEffect(() => {
+    AsyncStorage.getItem('@wallet_main_tab_v1').then((t) => {
+      if (t === 'rial' || t === 'gold' || t === 'crypto') setActiveMainTab(t);
+    }).catch(() => {});
+  }, []);
+  const switchMainTab = useCallback((t: 'crypto' | 'rial' | 'gold') => {
+    setActiveMainTab(t);
+    AsyncStorage.setItem('@wallet_main_tab_v1', t).catch(() => {});
+  }, []);
   const [selectedExchange, setSelectedExchange] = useState<ExchangeId>('binance');
   const [newApiKey, setNewApiKey] = useState('');
   const [newApiSecret, setNewApiSecret] = useState('');
@@ -2234,6 +2331,42 @@ export default function WalletScreen() {
         show={hasForeignWallet || (showAddForm && isForeignExchange(selectedExchange))}
       />
 
+      {/* ── v1.4.14: سه تب بالای صفحه مدیریت دارایی ── */}
+      <View style={styles.mainTabBar}>
+        <Pressable
+          style={[styles.mainTab, activeMainTab === 'crypto' && styles.mainTabActive]}
+          onPress={() => switchMainTab('crypto')}
+          testID="main-tab-crypto"
+        >
+          <Bitcoin size={13} color={activeMainTab === 'crypto' ? colors.dark.accent : colors.dark.textSecondary} />
+          <Text style={[styles.mainTabText, activeMainTab === 'crypto' && styles.mainTabTextActive]}>
+            ارز دیجیتال
+          </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.mainTab, activeMainTab === 'rial' && styles.mainTabActive]}
+          onPress={() => switchMainTab('rial')}
+          testID="main-tab-rial"
+        >
+          <Landmark size={13} color={activeMainTab === 'rial' ? colors.dark.accent : colors.dark.textSecondary} />
+          <Text style={[styles.mainTabText, activeMainTab === 'rial' && styles.mainTabTextActive]}>
+            دارایی ریالی و فلزات
+          </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.mainTab, activeMainTab === 'gold' && styles.mainTabActive]}
+          onPress={() => switchMainTab('gold')}
+          testID="main-tab-gold"
+        >
+          <Sparkles size={13} color={activeMainTab === 'gold' ? colors.dark.accent : colors.dark.textSecondary} />
+          <Text style={[styles.mainTabText, activeMainTab === 'gold' && styles.mainTabTextActive]}>
+            پیش‌بینی قیمت طلا
+          </Text>
+        </Pressable>
+      </View>
+
+      {activeMainTab === 'crypto' && (
+      <>
       {/* ── کارت مجموع دارایی‌ها ── */}
           <View style={styles.portfolioCard}>
             <View style={styles.portfolioHeader}>
@@ -2320,9 +2453,6 @@ export default function WalletScreen() {
               />
             )}
           </View>
-
-      {/* ── v1.4.13: دارایی ریالی و فلزات (ریال + طلا + نقره + سکه + ارز) ── */}
-      <LocalAssetsSection usdtToToman={usdtToToman} totalPortfolioUsd={totalPortfolioUsd} />
 
       {/* ── کارت هر صرافی — با فلش باز/بسته می‌شود؛ سربرگ‌های داخلی ── */}
       {wallets.map((wallet, idx) => (
@@ -2496,6 +2626,22 @@ export default function WalletScreen() {
           <Text style={styles.addButtonText}>افزودن صرافی جدید</Text>
         </Pressable>
       )}
+      </>
+      )}
+
+      {/* ── تب ۲: دارایی ریالی و فلزات (ریال + طلا + نقره + سکه + ارز) ── */}
+      {activeMainTab === 'rial' && (
+        <>
+          <LocalAssetsSection usdtToToman={usdtToToman} totalPortfolioUsd={totalPortfolioUsd} />
+        </>
+      )}
+
+      {/* ── تب ۳: پیش‌بینی قیمت طلا (IME آتی شمش خام ۹۹۵) ── */}
+      {activeMainTab === 'gold' && (
+        <>
+          <GoldPredictionSection />
+        </>
+      )}
 
       <View style={styles.disclaimer}>
         <Text style={styles.disclaimerText}>
@@ -2518,10 +2664,11 @@ const SECTION_TAB_LABEL: Record<WalletSection, string> = {
   funding: 'فاندینگ',
   futures: 'فیوچرز',
   alpha: 'آلفا',
+  copy: 'کپی‌ترید',
 };
 
 /** Tab order — matches the user-requested اسپات/ارن/آلفا/فیوچرز/فاندینگ. */
-const SECTION_ORDER: WalletSection[] = ['spot', 'earn', 'alpha', 'futures', 'funding'];
+const SECTION_ORDER: WalletSection[] = ['spot', 'copy', 'earn', 'alpha', 'futures', 'funding'];
 
 interface AggregatedBalance extends WalletBalance {
   sections: WalletSection[];
@@ -3491,6 +3638,38 @@ const styles = createThemedStyles(() => StyleSheet.create({
     paddingHorizontal: 16,
     paddingTop: 12,
     paddingBottom: 40,
+  },
+  // v1.4.14 — three top-level tabs (ارز دیجیتال | ریالی و فلزات | پیش‌بینی طلا)
+  mainTabBar: {
+    flexDirection: 'row',
+    gap: 6,
+    marginBottom: 14,
+  },
+  mainTab: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+    paddingVertical: 9,
+    borderRadius: 12,
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+  },
+  mainTabActive: {
+    backgroundColor: colors.dark.accent + '18',
+    borderColor: colors.dark.accent + '55',
+  },
+  mainTabText: {
+    fontSize: 10,
+    fontWeight: '700' as const,
+    color: colors.dark.textSecondary,
+    textAlign: 'center',
+  },
+  mainTabTextActive: {
+    color: colors.dark.accent,
+    fontWeight: '800' as const,
   },
   sectionTabBar: {
     flexDirection: 'row',

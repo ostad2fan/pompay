@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { View, Text, StyleSheet, TextInput, Pressable, ActivityIndicator } from 'react-native';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -9,6 +9,7 @@ import {
   Coins,
   Wallet,
   TrendingUp,
+  TrendingDown,
   RefreshCw,
   ChevronDown,
   ChevronUp,
@@ -20,13 +21,21 @@ import {
   fetchIranMarketPrices,
   parseTomanInput,
   formatFullToman,
+  IranMarketPrices,
 } from '@/utils/iranMarketApi';
 import { formatToman } from '@/utils/nobitexApi';
+import {
+  fetchTgjuCloses,
+  closeAtOrBefore,
+  latestClose,
+  TgjuHistorySymbol,
+  TgjuClosePoint,
+} from '@/utils/tgjuHistoryApi';
 
 /**
- * LocalAssetsSection — v1.4.13
+ * LocalAssetsSection — v1.4.14
  *
- * «دارایی ریالی و فلزات» inside the wallet tab:
+ * «دارایی ریالی و فلزات» tab of the wallet:
  *  - Live Iranian prices (Toman): gold 18/24 per gram, silver 999/925 per
  *    gram, Emami/Bahar/half/quarter coins, and the tether price (passed in
  *    from the portfolio card — same source).
@@ -35,6 +44,10 @@ import { formatToman } from '@/utils/nobitexApi';
  *  - EVERY asset row shows its own Toman value next to it.
  *  - Grand total = Rial + gold + silver + coins + crypto (crypto USD value
  *    comes from the wallet's first header, converted at the live tether rate).
+ *  - v1.4.14 — PnL card with ۷/۳۰/۹۰/۱۸۰-day timeframes: the daily-close
+ *    history of every HELD asset is fetched from TGJU's public history API
+ *    and compared against the live price (realized market PnL of the metal
+ *    holdings — independent of when the user actually bought them).
  */
 
 const ASSETS_KEY = '@local_assets_v1';
@@ -345,6 +358,200 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
               </Text>
             </View>
           </View>
+
+          {/* ── v1.4.14: PnL over 7/30/90/180 days (TGJU daily closes) ── */}
+          <LocalAssetsPnl assets={assets} prices={p ?? undefined} />
+        </>
+      )}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v1.4.14 — PnL card: market change of every HELD asset over the window
+// ---------------------------------------------------------------------------
+
+const PNL_PERIODS = [7, 30, 90, 180] as const;
+type LocalPnlPeriod = (typeof PNL_PERIODS)[number];
+const PNL_PERIOD_LABEL: Record<LocalPnlPeriod, string> = {
+  7: '۷ روز',
+  30: '۳۰ روز',
+  90: '۹۰ روز',
+  180: '۱۸۰ روز',
+};
+
+interface HeldAssetSpec {
+  key: string;
+  label: string;
+  qty: number;
+  symbol: string;
+  liveUnit: number;
+}
+
+function LocalAssetsPnl({ assets, prices }: { assets: LocalAssets; prices?: IranMarketPrices }) {
+  const [period, setPeriod] = useState<LocalPnlPeriod>(180);
+
+  const goldQty = parseTomanInput(assets.goldGrams) || 0;
+  const silverQty = parseTomanInput(assets.silverGrams) || 0;
+
+  const held: HeldAssetSpec[] = useMemo(() => {
+    const list: HeldAssetSpec[] = [];
+    if (goldQty > 0) {
+      const is24 = assets.goldKarat === '24';
+      list.push({
+        key: 'gold',
+        label: is24 ? 'طلای ۲۴ عیار' : 'طلای ۱۸ عیار',
+        qty: goldQty,
+        symbol: is24 ? TgjuHistorySymbol.gold24 : TgjuHistorySymbol.gold18,
+        liveUnit: (is24 ? prices?.gold24 : prices?.gold18) ?? 0,
+      });
+    }
+    if (silverQty > 0) {
+      const is925 = assets.silverType === '925';
+      list.push({
+        key: 'silver',
+        label: is925 ? 'نقره ۹۲۵' : 'نقره ۹۹۹',
+        qty: silverQty,
+        symbol: is925 ? TgjuHistorySymbol.silver925 : TgjuHistorySymbol.silver999,
+        liveUnit: (is925 ? prices?.silver925 : prices?.silver999) ?? 0,
+      });
+    }
+    const coins: Array<[string, string, string, number]> = [
+      ['emami', 'سکه امامی', 'sekee', parseTomanInput(assets.coinEmami) || 0],
+      ['bahar', 'سکه بهار آزادی', 'sekeb', parseTomanInput(assets.coinBahar) || 0],
+      ['nim', 'نیم سکه', 'nim', parseTomanInput(assets.coinNim) || 0],
+      ['rob', 'ربع سکه', 'rob', parseTomanInput(assets.coinRob) || 0],
+    ];
+    const coinLive: Record<string, number> = {
+      emami: prices?.coinEmami ?? 0,
+      bahar: prices?.coinBahar ?? 0,
+      nim: prices?.coinNim ?? 0,
+      rob: prices?.coinRob ?? 0,
+    };
+    for (const [key, label, symbol, qty] of coins) {
+      if (qty > 0) list.push({ key, label, qty, symbol, liveUnit: coinLive[key] ?? 0 });
+    }
+    return list;
+  }, [goldQty, silverQty, assets, prices]);
+
+  const symbols = useMemo(() => [...new Set(held.map((h) => h.symbol))], [held]);
+
+  // One query for every needed symbol's daily-close series (10-min cache).
+  const historyQuery = useQuery({
+    queryKey: ['tgju-history', symbols],
+    queryFn: async (): Promise<Record<string, TgjuClosePoint[]>> => {
+      const entries = await Promise.all(
+        symbols.map(async (s) => [s, await fetchTgjuCloses(s)] as const)
+      );
+      return Object.fromEntries(entries);
+    },
+    enabled: symbols.length > 0,
+    staleTime: 10 * 60 * 1000,
+    retry: 1,
+  });
+
+  const seriesMap = historyQuery.data;
+
+  const rows = useMemo(() => {
+    if (!seriesMap) return [] as Array<{ label: string; pnl: number; basis: number }>;
+    const target = Date.now() - period * 86_400_000;
+    const out: Array<{ label: string; pnl: number; basis: number }> = [];
+    for (const h of held) {
+      const series = seriesMap[h.symbol];
+      if (!series || series.length === 0) continue;
+      const nowUnit = h.liveUnit > 0 ? h.liveUnit : latestClose(series) ?? 0;
+      const thenUnit = closeAtOrBefore(series, target);
+      if (nowUnit <= 0 || thenUnit === null || thenUnit <= 0) continue;
+      out.push({
+        label: h.label,
+        pnl: h.qty * (nowUnit - thenUnit),
+        basis: h.qty * thenUnit,
+      });
+    }
+    return out;
+  }, [seriesMap, held, period]);
+
+  const totalPnl = rows.reduce((s, r) => s + r.pnl, 0);
+  const totalBasis = rows.reduce((s, r) => s + r.basis, 0);
+  const totalPct = totalBasis > 0 ? (totalPnl / totalBasis) * 100 : 0;
+
+  if (held.length === 0) return null;
+
+  const positive = totalPnl >= 0;
+
+  return (
+    <View style={styles.pnlBox}>
+      <View style={styles.pnlHeadRow}>
+        {positive ? (
+          <TrendingUp size={14} color={colors.dark.green} />
+        ) : (
+          <TrendingDown size={14} color={colors.dark.red} />
+        )}
+        <Text style={styles.pnlTitle}>سود / زیان دارایی‌ها (تغییر قیمت بازار)</Text>
+      </View>
+
+      {/* period selector */}
+      <View style={styles.pnlPeriodRow}>
+        {PNL_PERIODS.map((d) => (
+          <Pressable
+            key={d}
+            style={[styles.pnlPeriodChip, period === d && styles.pnlPeriodChipActive]}
+            onPress={() => setPeriod(d)}
+          >
+            <Text style={[styles.pnlPeriodText, period === d && styles.pnlPeriodTextActive]}>
+              {PNL_PERIOD_LABEL[d]}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+
+      {historyQuery.isLoading ? (
+        <View style={styles.pnlLoading}>
+          <ActivityIndicator size="small" color={colors.dark.accent} />
+          <Text style={styles.pnlLoadingText}>دریافت تاریخچه قیمت‌ها…</Text>
+        </View>
+      ) : historyQuery.isError || rows.length === 0 ? (
+        <Text style={styles.pnlEmpty}>
+          تاریخچه قیمت برای این بازه در دسترس نیست — بعداً دوباره تلاش کنید
+        </Text>
+      ) : (
+        <>
+          <Text style={[styles.pnlTotal, { color: positive ? colors.dark.green : colors.dark.red }]}>
+            {positive ? '+' : '−'} {formatFullToman(Math.abs(Math.round(totalPnl)))} تومان
+          </Text>
+          <View style={styles.pnlPctRow}>
+            <View
+              style={[
+                styles.pnlPctChip,
+                !positive && { backgroundColor: colors.dark.red + '1C' },
+              ]}
+            >
+              <Text style={[styles.pnlPctText, !positive && { color: colors.dark.red }]}>
+                {positive ? '▲' : '▼'} {Math.abs(totalPct).toLocaleString('fa-IR', {
+                  maximumFractionDigits: 1,
+                })}٪ در {PNL_PERIOD_LABEL[period]}
+              </Text>
+            </View>
+          </View>
+
+          {rows.map((r) => (
+            <View key={r.label} style={styles.pnlRow}>
+              <Text style={styles.pnlRowLabel}>{r.label}</Text>
+              <Text
+                style={[
+                  styles.pnlRowValue,
+                  { color: r.pnl >= 0 ? colors.dark.green : colors.dark.red },
+                ]}
+              >
+                {r.pnl >= 0 ? '+' : '−'} {formatFullToman(Math.abs(Math.round(r.pnl)))} ت
+              </Text>
+            </View>
+          ))}
+
+          <Text style={styles.pnlNote}>
+            مبنا: قیمت پایان روزِ {PNL_PERIOD_LABEL[period]} پیش تا امروز (منبع: TGJU).
+            تغییر ارزش بر اساس نوسان بازار است، نه زمان خرید واقعی شما.
+          </Text>
         </>
       )}
     </View>
@@ -676,6 +883,118 @@ const styles = createThemedStyles(() =>
       color: colors.dark.textSecondary,
       textAlign: 'right',
       lineHeight: 16,
+    },
+    // v1.4.14 — PnL card styles
+    pnlBox: {
+      marginTop: 10,
+      backgroundColor: colors.dark.card,
+      borderRadius: 12,
+      padding: 14,
+      borderWidth: 1,
+      borderColor: colors.dark.border,
+    },
+    pnlHeadRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      marginBottom: 8,
+    },
+    pnlTitle: {
+      fontSize: 12,
+      fontWeight: '700' as const,
+      color: colors.dark.text,
+      flex: 1,
+      textAlign: 'right',
+    },
+    pnlPeriodRow: {
+      flexDirection: 'row',
+      gap: 6,
+      marginBottom: 10,
+    },
+    pnlPeriodChip: {
+      flex: 1,
+      alignItems: 'center',
+      paddingVertical: 5,
+      borderRadius: 8,
+      backgroundColor: colors.dark.surface,
+      borderWidth: 1,
+      borderColor: colors.dark.border,
+    },
+    pnlPeriodChipActive: {
+      backgroundColor: colors.dark.accentDim,
+      borderColor: colors.dark.accent,
+    },
+    pnlPeriodText: {
+      fontSize: 10.5,
+      fontWeight: '600' as const,
+      color: colors.dark.textSecondary,
+    },
+    pnlPeriodTextActive: {
+      color: colors.dark.accent,
+      fontWeight: '700' as const,
+    },
+    pnlLoading: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      justifyContent: 'center',
+      paddingVertical: 10,
+    },
+    pnlLoadingText: {
+      fontSize: 11,
+      color: colors.dark.textSecondary,
+    },
+    pnlEmpty: {
+      fontSize: 10.5,
+      lineHeight: 17,
+      color: colors.dark.textSecondary,
+      textAlign: 'center',
+      paddingVertical: 8,
+    },
+    pnlTotal: {
+      fontSize: 20,
+      fontWeight: '800' as const,
+      textAlign: 'right',
+    },
+    pnlPctRow: {
+      flexDirection: 'row',
+      justifyContent: 'flex-start',
+      marginVertical: 6,
+    },
+    pnlPctChip: {
+      backgroundColor: colors.dark.green + '18',
+      borderRadius: 9,
+      paddingHorizontal: 10,
+      paddingVertical: 4,
+    },
+    pnlPctText: {
+      fontSize: 11,
+      fontWeight: '800' as const,
+      color: colors.dark.green,
+    },
+    pnlRow: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      paddingVertical: 5,
+      borderTopWidth: 1,
+      borderTopColor: colors.dark.border + '33',
+    },
+    pnlRowLabel: {
+      fontSize: 11,
+      fontWeight: '600' as const,
+      color: colors.dark.textSecondary,
+    },
+    pnlRowValue: {
+      fontSize: 12,
+      fontWeight: '700' as const,
+    },
+    pnlNote: {
+      fontSize: 9,
+      lineHeight: 15,
+      color: colors.dark.textMuted,
+      textAlign: 'right',
+      marginTop: 8,
     },
   })
 );

@@ -339,17 +339,41 @@ export interface BitperpPosition {
   roePercent: number;
 }
 
+export interface BitperpWalletItem {
+  asset: string;
+  free: number;
+  locked: number;
+  total: number;
+  /** USDT value when the API provides it (spot/fund items carry `value`). */
+  valueUsd: number;
+}
+
 export interface BitperpAccount {
-  /** Funding (main) wallet USDT balance. */
+  /** Funding (main) wallet USDT balance — LEGACY /api/fund-balance shape. */
   fundingUsdt: number;
   /** v1.4.9 — perpetual USDT from /api/fund-balance (perpetual_balance),
    *  used as a fallback when /api/balance gave no USDT row. */
   fundPerpUsdt?: number;
-  /** Perpetual wallet balances: [{asset, amount}]. */
+  /** Perpetual wallet balances: [{asset, amount}] — LEGACY /api/balance shape. */
   perpBalances: Array<{ asset: string; amount: number }>;
   /** Perp account equity / available margin (when returned). */
   equity?: number;
   availableMargin?: number;
+  /** v1.4.14 — NEW wallet structure (discovered from the live web-app bundle,
+   *  Oct 2026). BitPerp split the account into Funding / Spot / Perpetual /
+   *  Copy-Trading sub-accounts with new endpoints:
+   *    GET /api/spot/fund-balance → {code:0, data:[{asset,free,locked,total,value}]}
+   *    GET /api/spot/balance      → {code:0, data:[{asset,free,locked,total,value}]}
+   *    GET /api/v2/perp-balances  → {code:0, data:[{asset,available,equity,…}]}
+   *    GET /api/wallet/overview   → {balance:{equity,available,…}, running:[…], …}
+   *  The user's «new assets don't show» bug: the app kept reading the OLD
+   *  /api/balance + /api/fund-balance which now return stale/partial data. */
+  newWallet: boolean;
+  fundingBalances: BitperpWalletItem[];
+  spotBalances: BitperpWalletItem[];
+  perpBalancesV2: Array<{ asset: string; available: number; equity: number }>;
+  /** Copy-trading account equity (USDT) from /api/wallet/overview. */
+  copyEquity?: number;
   /** Open positions (best-effort parse). */
   positions: BitperpPosition[];
   /** True when the access token was rejected (401) → refresh needed. */
@@ -384,7 +408,94 @@ function toNum(v: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+// ---------------------------------------------------------------------------
+// v1.4.14 — NEW wallet endpoints (live web-app bundle, Oct 2026)
+// ---------------------------------------------------------------------------
+
+/** {code:0, data:[{asset, free, locked, total, value}]} — spot & fund items. */
+function parseWalletItemRows(data: unknown): BitperpWalletItem[] {
+  const root = extractDataArray(data);
+  const out: BitperpWalletItem[] = [];
+  if (!Array.isArray(root)) return out;
+  for (const item of root) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    const asset = String(rec.asset ?? rec.coin ?? rec.currency ?? rec.symbol ?? '').toUpperCase();
+    if (!asset) continue;
+    const free = toNum(rec.free ?? rec.available ?? rec.balance ?? 0);
+    const locked = toNum(rec.locked ?? rec.frozen ?? rec.in_orders ?? 0);
+    const total = toNum(rec.total ?? rec.equity ?? 0) || free + locked;
+    if (total <= 0.000001 && free <= 0.000001 && locked <= 0.000001) continue;
+    out.push({ asset, free, locked, total, valueUsd: toNum(rec.value ?? rec.usdValue ?? 0) });
+  }
+  return out;
+}
+
+/** {code:0, data:[{asset, available, equity}]} — v2 perp items. */
+function parsePerpV2Rows(data: unknown): Array<{ asset: string; available: number; equity: number }> {
+  const root = extractDataArray(data);
+  const out: Array<{ asset: string; available: number; equity: number }> = [];
+  if (!Array.isArray(root)) return out;
+  for (const item of root) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    const asset = String(rec.asset ?? rec.coin ?? rec.currency ?? rec.symbol ?? '').toUpperCase();
+    if (!asset) continue;
+    const available = toNum(rec.available ?? rec.free ?? rec.balance ?? 0);
+    const equity = toNum(rec.equity ?? rec.total ?? available);
+    if (available <= 0.000001 && equity <= 0.000001) continue;
+    out.push({ asset, available, equity });
+  }
+  return out;
+}
+
+/** FastAPI {code:0, data:[…]} → the array itself (tolerant). */
+function extractDataArray(data: unknown): unknown {
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === 'object') {
+    const rec = data as Record<string, unknown>;
+    if (rec.code !== undefined && Number(rec.code) !== 0) return null; // business error
+    if (Array.isArray(rec.data)) return rec.data;
+    for (const key of ['balances', 'coins', 'assets', 'list', 'rows']) {
+      if (Array.isArray(rec[key])) return rec[key];
+    }
+  }
+  return null;
+}
+
 export async function fetchBitperpAccount(accessToken: string): Promise<BitperpAccount> {
+  // v1.4.14 — probe the NEW endpoints first (in parallel, cheap): if ANY of
+  // them answers, the account uses the new Funding/Spot/Perp/Copy structure
+  // and the legacy /api/balance data is stale (the «new assets missing» bug).
+  const [spotFundRes, spotRes, perpV2Res, overviewRes] = await Promise.all([
+    getJson<unknown>('/api/spot/fund-balance', accessToken),
+    getJson<unknown>('/api/spot/balance', accessToken),
+    getJson<unknown>('/api/v2/perp-balances', accessToken),
+    getJson<unknown>('/api/wallet/overview', accessToken),
+  ]);
+
+  const newEndpointsAlive =
+    spotFundRes.ok || spotRes.ok || perpV2Res.ok || overviewRes.ok;
+  const newAuthRejected =
+    (spotFundRes.status === 401 && !spotFundRes.ok) ||
+    (spotRes.status === 401 && !spotRes.ok) ||
+    (perpV2Res.status === 401 && !perpV2Res.ok) ||
+    (overviewRes.status === 401 && !overviewRes.ok);
+
+  const fundingBalances = parseWalletItemRows(spotFundRes.data);
+  const spotBalances = parseWalletItemRows(spotRes.data);
+  const perpBalancesV2 = parsePerpV2Rows(perpV2Res.data);
+  let copyEquity: number | undefined;
+  try {
+    const ov = overviewRes.data as
+      | { balance?: { equity?: unknown; available?: unknown } }
+      | null
+      | undefined;
+    const eq = toNum(ov?.balance?.equity);
+    if (eq > 0) copyEquity = eq;
+  } catch {}
+
+  // Legacy endpoints — still fetched (fallback + funding/perp-equity data).
   const [fundRes, balanceRes, perpRes, positionsRes] = await Promise.all([
     getJson<{ code?: number; data?: { balance?: unknown; perpetual_balance?: unknown } | number | string }>(
       '/api/fund-balance',
@@ -399,13 +510,18 @@ export async function fetchBitperpAccount(accessToken: string): Promise<BitperpA
   ]);
 
   const authFailed =
+    newAuthRejected ||
     fundRes.status === 401 || balanceRes.status === 401 || perpRes.status === 401;
 
   // v1.4.7 — business errors inside HTTP-200 bodies (FastAPI {code, msg}).
+  // v1.4.14: only when the NEW endpoints gave nothing (otherwise the legacy
+  // stale answers must not raise a false error on a perfectly good account).
+  const newWalletDataReady =
+    fundingBalances.length > 0 || spotBalances.length > 0 || perpBalancesV2.length > 0 || copyEquity !== undefined;
   const businessMsgs = [fundRes.data, balanceRes.data, perpRes.data]
     .map((d) => businessError(d))
     .filter(Boolean) as string[];
-  const errorMsg = authFailed ? undefined : businessMsgs[0];
+  const errorMsg = authFailed || newWalletDataReady ? undefined : businessMsgs[0];
 
   // ---- funding wallet ----
   // v1.4.9 — CONFIRMED shape (from bitperp's own web app):
@@ -522,6 +638,11 @@ export async function fetchBitperpAccount(accessToken: string): Promise<BitperpA
     perpBalances,
     equity,
     availableMargin,
+    newWallet: newEndpointsAlive,
+    fundingBalances,
+    spotBalances,
+    perpBalancesV2,
+    copyEquity,
     positions,
     authFailed,
     errorMsg,
