@@ -18,7 +18,7 @@ export interface ServerIndicator {
   id: string;
   name: string;
   code: string;
-  timeframe: "15m" | "1h" | "4h" | "1d";
+  timeframe: "15m" | "30m" | "1h" | "4h" | "1d";
   receiveSignals: boolean;
 }
 
@@ -581,6 +581,26 @@ function boundKeys(map: Record<string, boolean>, cap: number): Record<string, bo
   return bounded;
 }
 
+const SIGNAL_TF_MS: Record<string, number> = {
+  "15m": 15 * 60_000,
+  "30m": 30 * 60_000,
+  "1h": 60 * 60_000,
+  "4h": 4 * 60 * 60_000,
+  "1d": 24 * 60 * 60_000,
+};
+
+/**
+ * v1.4.13 — restart-resilient announcing. Railway redeploys/restarts wipe the
+ * notify keys (ephemeral filesystem), which used to make the first post-boot
+ * scan swallow ALL announcements (the isFirstRun seed). A first run now
+ * announces only signals whose candle closed within 2× its timeframe — no
+ * stale flood, and a restart no longer eats the current cycle's signals.
+ */
+function freshSignal(s: { timeframe: string; candleOpenTime: number }): boolean {
+  const tfMs = SIGNAL_TF_MS[s.timeframe] ?? 24 * 60 * 60_000;
+  return Date.now() - s.candleOpenTime <= 2 * tfMs;
+}
+
 /** Short one-line summary used for push notification bodies. */
 function signalPushText(kind: "gainz" | "custom" | "hook", fresh: { action: string; displayName: string; price: number; timeframe: string }[]): string {
   const top = fresh[0];
@@ -600,15 +620,20 @@ class ScanEngine {
   }
 
   /**
-   * Quick tick (every ~10 min): scans 15-minute custom indicators so they
-   * fire close to the 15m candle closes instead of once per day.
+   * Quick tick (every ~10 min): scans the intraday custom indicators (15m
+   * and 30m) so they fire close to their candle closes instead of once per
+   * day. v1.4.13: 30m added — previously the app supported 30m but the
+   * server coerced it to 1d, so closed-app 30m signals almost never fired.
    */
   async quickTick(): Promise<void> {
     try {
       const cfg = await store.get<ScanConfig>("config");
       if (!cfg || !cfg.botToken || !cfg.chatId) return;
       const quick = (cfg.indicators ?? []).filter(
-        (i) => i.receiveSignals && i.timeframe === "15m" && i.code.trim().length > 0
+        (i) =>
+          i.receiveSignals &&
+          (i.timeframe === "15m" || i.timeframe === "30m") &&
+          i.code.trim().length > 0
       );
       if (quick.length === 0) return;
       const lastQuickAt = (await store.get<number>("lastQuickScanAt")) ?? 0;
@@ -625,13 +650,13 @@ class ScanEngine {
 
       const keys = (await store.get<Record<string, boolean>>("customNotifyKeys")) ?? {};
       const isFirstRun = Object.keys(keys).length === 0;
-      const announce = fresh.filter((s) => !keys[s.id]);
+      const announce = fresh.filter((s) => !keys[s.id] && (!isFirstRun || freshSignal(s)));
       for (const s of fresh) keys[s.id] = true;
 
       await store.put("customNotifyKeys", boundKeys(keys, 600));
       await store.put("customSignals", merged);
 
-      if (!isFirstRun && announce.length > 0) {
+      if (announce.length > 0) {
         await sendTelegram(cfg, buildCustomText(announce));
         await sendPushToAll(
           "🧩 سیگنال اندیکاتور دستی",
@@ -639,7 +664,7 @@ class ScanEngine {
           { kind: "custom", count: announce.length }
         );
       }
-      console.log(`[ScanServer] quickTick (15m indicators): ${fresh.length} current, ${announce.length} new`);
+      console.log(`[ScanServer] quickTick (15m/30m indicators): ${fresh.length} current, ${announce.length} new${isFirstRun ? " (first-run fresh-only)" : ""}`);
     } catch (e) {
       console.log("[ScanServer] quickTick failed:", e);
     }
@@ -678,7 +703,7 @@ class ScanEngine {
             id: i.id,
             name: String(i.name ?? "").slice(0, 60),
             code: i.code.slice(0, 8000),
-            timeframe: (["15m", "1h", "4h", "1d"] as const).includes(i.timeframe)
+            timeframe: (["15m", "30m", "1h", "4h", "1d"] as const).includes(i.timeframe)
               ? i.timeframe
               : "1d",
             receiveSignals: !!i.receiveSignals,
@@ -803,13 +828,13 @@ class ScanEngine {
 
           const keys = (await store.get<Record<string, boolean>>("gainzNotifyKeys")) ?? {};
           const isFirstRun = Object.keys(keys).length === 0;
-          const announce = fresh.filter((s) => !keys[s.id]);
+          const announce = fresh.filter((s) => !keys[s.id] && (!isFirstRun || freshSignal(s)));
           for (const s of fresh) keys[s.id] = true;
 
           await store.put("gainzNotifyKeys", boundKeys(keys, 1000));
           await store.put("gainzSignals", merged);
 
-          if (!isFirstRun && announce.length > 0) {
+          if (announce.length > 0) {
             gainzNew = announce.length;
             await sendTelegram(cfg, buildGainzText(announce));
             await sendPushToAll(
@@ -831,7 +856,7 @@ class ScanEngine {
         const active = cfg.indicators.filter((i) => i.receiveSignals && i.code.trim().length > 0);
         const due = active.filter((i) => {
           if (dailyDue) return true;
-          if (i.timeframe === "15m") return false; // quickTick's job
+          if (i.timeframe === "15m" || i.timeframe === "30m") return false; // quickTick's job
           if (i.timeframe === "1h") return true; // hourly tick
           if (i.timeframe === "4h") return hour % 4 === 0;
           return false; // 1d handled by dailyDue
@@ -849,13 +874,13 @@ class ScanEngine {
 
             const keys = (await store.get<Record<string, boolean>>("customNotifyKeys")) ?? {};
             const isFirstRun = Object.keys(keys).length === 0;
-            const announce = fresh.filter((s) => !keys[s.id]);
+            const announce = fresh.filter((s) => !keys[s.id] && (!isFirstRun || freshSignal(s)));
             for (const s of fresh) keys[s.id] = true;
 
             await store.put("customNotifyKeys", boundKeys(keys, 600));
             await store.put("customSignals", merged);
 
-            if (!isFirstRun && announce.length > 0) {
+            if (announce.length > 0) {
               customNew = announce.length;
               await sendTelegram(cfg, buildCustomText(announce));
               await sendPushToAll(
@@ -886,13 +911,13 @@ class ScanEngine {
 
             const keys = (await store.get<Record<string, boolean>>("hookNotifyKeys")) ?? {};
             const isFirstRun = Object.keys(keys).length === 0;
-            const announce = fresh.filter((s) => !keys[s.id]);
+            const announce = fresh.filter((s) => !keys[s.id] && (!isFirstRun || freshSignal(s)));
             for (const s of fresh) keys[s.id] = true;
 
             await store.put("hookNotifyKeys", boundKeys(keys, 700));
             await store.put("hookSignals", merged);
 
-            if (!isFirstRun && announce.length > 0) {
+            if (announce.length > 0) {
               hookNew = announce.length;
               await sendTelegram(cfg, buildHookText(announce));
               await sendPushToAll(

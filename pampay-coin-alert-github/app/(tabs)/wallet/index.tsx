@@ -50,6 +50,7 @@ import {
 import { fetchForeignExchangeBalance } from '@/utils/foreignExchangeBalances';
 import { fetchForeignPeriodPnl } from '@/utils/foreignExchangePnl';
 import { exchangeNow, markClockStale } from '@/utils/exchangeClock';
+import LocalAssetsSection from '@/components/LocalAssetsSection';
 
 interface ExchangeWallet {
   id: string;
@@ -2214,6 +2215,7 @@ export default function WalletScreen() {
       queryClient.invalidateQueries({ queryKey: ['exchange-balance', w.id] });
     });
     queryClient.invalidateQueries({ queryKey: ['usdt-toman-price'] });
+    queryClient.invalidateQueries({ queryKey: ['iran-market-prices'] });
   }, [wallets]);
 
   // هشدار فیلترشکن فقط وقتی معنی دارد که صرافی خارجی متصل است (یا در حال
@@ -2318,6 +2320,9 @@ export default function WalletScreen() {
               />
             )}
           </View>
+
+      {/* ── v1.4.13: دارایی ریالی و فلزات (ریال + طلا + نقره + سکه + ارز) ── */}
+      <LocalAssetsSection usdtToToman={usdtToToman} totalPortfolioUsd={totalPortfolioUsd} />
 
       {/* ── کارت هر صرافی — با فلش باز/بسته می‌شود؛ سربرگ‌های داخلی ── */}
       {wallets.map((wallet, idx) => (

@@ -631,6 +631,50 @@ export const [AppProvider, useApp] = createContextHook(() => {
     };
   }, [settings.telegramEnabled]);
 
+  // v1.4.13: push the latest config (incl. ALL custom indicators) to the scan
+  // server right when the app goes to the background — the server's 24/7
+  // quickTick (15m/30m) + hourly ticks then always scan the user's newest
+  // indicators even if the app never re-opens (root cause of «سیگنال‌ها فقط
+  // وقتی برنامه باز است می‌آیند» was a stale server-side indicator list).
+  const lastBgSyncRef = useRef(0);
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state: AppStateStatus) => {
+      if (state !== 'background') return;
+      if (!settings.telegramEnabled || !settings.telegramBotToken || !settings.telegramChatId) return;
+      if (Date.now() - lastBgSyncRef.current < 60_000) return;
+      lastBgSyncRef.current = Date.now();
+      syncScanConfig({
+        botToken: settings.telegramBotToken,
+        chatId: settings.telegramChatId,
+        gainzAlgoEnabled: settings.gainzAlgoNotifications,
+        gainzTimeframes: settings.gainzTimeframes ?? ['1d'],
+        hookEnabled: settings.hookReversalNotifications !== false,
+        hookTimeframes: settings.hookTimeframes ?? ['1d'],
+        scannerEnabled: settings.scannerNotifications !== false,
+        memeEnabled: settings.memeShortNotifications !== false,
+        preListingEnabled: settings.preListingNotifications !== false,
+        volumeThreshold: settings.volumeThreshold,
+      })
+        .then((r) => {
+          console.log('[AppContext] background config sync:', r.ok ? 'ok' : r.reason);
+        })
+        .catch(() => {});
+    });
+    return () => sub.remove();
+  }, [
+    settings.telegramEnabled,
+    settings.telegramBotToken,
+    settings.telegramChatId,
+    settings.gainzAlgoNotifications,
+    settings.gainzTimeframes,
+    settings.hookReversalNotifications,
+    settings.hookTimeframes,
+    settings.scannerNotifications,
+    settings.memeShortNotifications,
+    settings.preListingNotifications,
+    settings.volumeThreshold,
+  ]);
+
   useEffect(() => {
     return () => {
       if (scanIntervalRef.current) {

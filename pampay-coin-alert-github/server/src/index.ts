@@ -22,6 +22,7 @@ import { URL } from "url";
 import { getAlanchandUsdtToman } from "./alanchand";
 import { getNobitexUsdtToman } from "./nobitex";
 import { scanEngine } from "./scanEngine";
+import type { ScanConfig, CustomSignal, GainzSignal, HookSignal } from "./scanEngine";
 import { runFastScanCycle, pumpDumpResponse } from "./fastScan";
 import { registerPushToken, unregisterPushToken, pushStatus } from "./push";
 import { sendTelegram, getLastTelegramError } from "./telegram";
@@ -118,6 +119,53 @@ const server = http.createServer(async (req, res) => {
       const summary = await scanEngine.runScanCycle("manual");
       return json(res, 200, { ok: !summary.skipped, summary });
     }
+    // ---- v1.4.13: custom-indicator diagnostics (secret-protected) ----
+    // Shows exactly WHICH indicators the server has (name / timeframe /
+    // receiveSignals / code size), evaluation errors, the latest custom
+    // signals and the last quick-tick — so "چرا سیگنال نمی‌آید؟" is answerable
+    // in one browser tab.
+    if (req.method === "GET" && url.pathname === "/scan/indicator-debug") {
+      const secret = String(url.searchParams.get("secret") ?? "");
+      const cfg = await store.get<{ secret?: string }>("config");
+      if (!cfg || !secret || cfg.secret !== secret) {
+        return json(res, 403, { ok: false, error: "secret mismatch" });
+      }
+      const customErrors = (await store.get<Record<string, string>>("customErrors")) ?? {};
+      const customSignals = (await store.get<CustomSignal[]>("customSignals")) ?? [];
+      const gainzSignals = (await store.get<GainzSignal[]>("gainzSignals")) ?? [];
+      const hookSignals = (await store.get<HookSignal[]>("hookSignals")) ?? [];
+      const lastQuickScanAt = await store.get<number>("lastQuickScanAt");
+      const lastScanAt2 = await store.get<number>("lastScanAt");
+      const lastScanDate2 = await store.get<string>("lastScanDate");
+      const fullCfg = cfg as ScanConfig;
+      const indicators = (fullCfg.indicators ?? []).map((i) => ({
+        name: i.name,
+        timeframe: i.timeframe,
+        receiveSignals: i.receiveSignals,
+        codeLength: (i.code ?? "").length,
+        lastError: customErrors[i.id] ?? null,
+      }));
+      return json(res, 200, {
+        ok: true,
+        indicatorCount: indicators.length,
+        indicators,
+        customSignalCount: customSignals.length,
+        latestCustomSignals: customSignals.slice(0, 10).map((s) => ({
+          id: s.id,
+          indicatorName: s.indicatorName,
+          symbol: s.symbol,
+          timeframe: s.timeframe,
+          detectedAt: s.detectedAt,
+        })),
+        gainzSignalCount: gainzSignals.length,
+        hookSignalCount: hookSignals.length,
+        lastQuickScanAt: lastQuickScanAt ?? null,
+        lastScanAt: lastScanAt2 ?? null,
+        lastScanDate: lastScanDate2 ?? null,
+        serverNow: Date.now(),
+      });
+    }
+
     if (req.method === "GET" && url.pathname === "/scan/status") {
       const [config, lastScanDate, lastScanAt, lastFastScanAt, lastTelegramError, lastTelegramSuccessAt] = await Promise.all([
         store.get<{ secret: string; botToken: string; chatId: string }>("config"),
