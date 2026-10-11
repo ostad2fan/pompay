@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Landmark,
   Banknote,
+  DollarSign,
   Gem,
   Medal,
   Coins,
@@ -33,27 +34,33 @@ import {
 } from '@/utils/tgjuHistoryApi';
 
 /**
- * LocalAssetsSection — v1.4.14
+ * LocalAssetsSection — v1.4.15
  *
  * «دارایی ریالی و فلزات» tab of the wallet:
  *  - Live Iranian prices (Toman): gold 18/24 per gram, silver 999/925 per
- *    gram, Emami/Bahar/half/quarter coins, and the tether price (passed in
- *    from the portfolio card — same source).
- *  - User inputs: Rial cash, gold grams (+karat), silver grams (+type),
- *    coin counts — persisted in AsyncStorage.
+ *    gram, Emami/Bahar/half/quarter coins, the free-market USD rate and the
+ *    tether price (passed in from the portfolio card — same source).
+ *  - User inputs: Rial cash, paper-USD cash (v1.4.15), gold grams (+karat),
+ *    silver grams (+type), coin counts — persisted in AsyncStorage.
  *  - EVERY asset row shows its own Toman value next to it.
- *  - Grand total = Rial + gold + silver + coins + crypto (crypto USD value
- *    comes from the wallet's first header, converted at the live tether rate).
+ *  - Grand total = Rial + USD cash + gold + silver + coins + crypto (crypto
+ *    USD value comes from the wallet's first header, converted at the live
+ *    tether rate).
  *  - v1.4.14 — PnL card with ۷/۳۰/۹۰/۱۸۰-day timeframes: the daily-close
  *    history of every HELD asset is fetched from TGJU's public history API
  *    and compared against the live price (realized market PnL of the metal
  *    holdings — independent of when the user actually bought them).
+ *  - v1.4.15 — PnL card moved to the TOP (right under the live price grid,
+ *    always visible) + paper-USD row with the free-market dollar rate
+ *    (falls back to the tether rate when TGJU's dollar quote is missing).
  */
 
 const ASSETS_KEY = '@local_assets_v1';
 
 interface LocalAssets {
   rialCash: string;
+  /** v1.4.15 — paper (physical) USD the user holds, in dollars. */
+  usdCash: string;
   goldGrams: string;
   goldKarat: '18' | '24';
   silverGrams: string;
@@ -66,6 +73,7 @@ interface LocalAssets {
 
 const EMPTY_ASSETS: LocalAssets = {
   rialCash: '',
+  usdCash: '',
   goldGrams: '',
   goldKarat: '18',
   silverGrams: '',
@@ -134,6 +142,12 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
 
   // ── computed Toman values (each asset separately) ──
   const rialValue = parseTomanInput(assets.rialCash) || 0;
+  // v1.4.15 — paper-USD: value at the FREE-MARKET dollar rate (TGJU
+  // «price_dollar_rl»); falls back to the tether rate when that quote is
+  // missing (some VPN exits / stale caches only ship the metal symbols).
+  const usdRate = p && p.dollar > 0 ? p.dollar : usdtToToman;
+  const usdQty = parseTomanInput(assets.usdCash) || 0;
+  const usdValue = usdQty > 0 && usdRate > 0 ? usdQty * usdRate : 0;
   const goldUnit = assets.goldKarat === '24' ? p?.gold24 ?? 0 : p?.gold18 ?? 0;
   const goldValue = (parseTomanInput(assets.goldGrams) || 0) * goldUnit;
   const silverUnit = assets.silverType === '925' ? p?.silver925 ?? 0 : p?.silver999 ?? 0;
@@ -147,9 +161,9 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
   const coinsValue =
     coinValues.emami + coinValues.bahar + coinValues.nim + coinValues.rob;
   const cryptoToman = usdtToToman > 0 ? totalPortfolioUsd * usdtToToman : 0;
-  const grandTotal = rialValue + goldValue + silverValue + coinsValue + cryptoToman;
+  const grandTotal = rialValue + usdValue + goldValue + silverValue + coinsValue + cryptoToman;
   const hasAnyInput =
-    rialValue > 0 || goldValue > 0 || silverValue > 0 || coinsValue > 0 || totalPortfolioUsd > 0;
+    rialValue > 0 || usdValue > 0 || goldValue > 0 || silverValue > 0 || coinsValue > 0 || totalPortfolioUsd > 0;
 
   const minutesOld = p ? Math.max(1, Math.round((Date.now() - p.updatedAt) / 60000)) : 0;
 
@@ -187,6 +201,7 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
           <PriceChip label="سکه بهار آزادی" value={p?.coinBahar} />
           <PriceChip label="نیم سکه" value={p?.coinNim} />
           <PriceChip label="ربع سکه" value={p?.coinRob} />
+          <PriceChip label="دلار آزاد" value={p?.dollar} />
           <PriceChip
             label="تتر"
             value={usdtToToman > 0 ? usdtToToman : undefined}
@@ -199,6 +214,10 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
           <Text style={styles.priceNote}>قیمت‌ها در دسترس نیست — بعداً تازه‌سازی کنید</Text>
         )}
       </View>
+
+      {/* ── v1.4.15: PnL moved to the TOP — right under the live prices ── */}
+      <View style={{ height: 12 }} />
+      <LocalAssetsPnl assets={assets} prices={p ?? undefined} />
 
       {expanded && (
         <>
@@ -217,6 +236,25 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
             unitLabel="تومان"
             tomanValue={rialValue}
             valueHint="مقدار را به تومان وارد کنید"
+          />
+
+          {/* ── v1.4.15 — paper (physical) dollar row ── */}
+          <AssetRow
+            icon={<DollarSign size={14} color={'#4CAF50'} />}
+            label="دلار کاغذی (فیزیکی)"
+            value={assets.usdCash}
+            onChangeText={(t) => update({ usdCash: t })}
+            placeholder="مثلاً 500"
+            keyboardType="decimal-pad"
+            unitLabel="دلار"
+            tomanValue={usdValue}
+            valueHint={
+              usdRate > 0
+                ? `نرخ هر دلار: ${formatFullToman(usdRate)} تومان${
+                    p && p.dollar > 0 ? '' : ' (تتر)'
+                  }`
+                : 'نرخ دلار در حال دریافت'
+            }
           />
 
           <AssetRow
@@ -344,7 +382,7 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
           <View style={styles.totalBox}>
             <View style={styles.totalRow}>
               <TrendingUp size={16} color={colors.dark.green} />
-              <Text style={styles.totalLabel}>مجموع کل دارایی (ریال + طلا + نقره + سکه + ارز)</Text>
+              <Text style={styles.totalLabel}>مجموع کل دارایی (ریال + دلار + طلا + نقره + سکه + ارز)</Text>
             </View>
             <Text style={styles.totalAmount}>
               {hasAnyInput ? `${formatToman(grandTotal)} تومان` : '—'}
@@ -354,13 +392,10 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
             )}
             <View style={styles.totalBreakdown}>
               <Text style={styles.breakdownText}>
-                ریال {formatToman(rialValue)} • طلا {formatToman(goldValue)} • نقره {formatToman(silverValue)} • سکه {formatToman(coinsValue)} • ارز {formatToman(cryptoToman)}
+                ریال {formatToman(rialValue)} • دلار {formatToman(usdValue)} • طلا {formatToman(goldValue)} • نقره {formatToman(silverValue)} • سکه {formatToman(coinsValue)} • ارز {formatToman(cryptoToman)}
               </Text>
             </View>
           </View>
-
-          {/* ── v1.4.14: PnL over 7/30/90/180 days (TGJU daily closes) ── */}
-          <LocalAssetsPnl assets={assets} prices={p ?? undefined} />
         </>
       )}
     </View>
@@ -369,6 +404,7 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
 
 // ---------------------------------------------------------------------------
 // v1.4.14 — PnL card: market change of every HELD asset over the window
+// (v1.4.15 — moved to the top of the section + paper-USD row included)
 // ---------------------------------------------------------------------------
 
 const PNL_PERIODS = [7, 30, 90, 180] as const;
@@ -393,9 +429,21 @@ function LocalAssetsPnl({ assets, prices }: { assets: LocalAssets; prices?: Iran
 
   const goldQty = parseTomanInput(assets.goldGrams) || 0;
   const silverQty = parseTomanInput(assets.silverGrams) || 0;
+  const usdQty = parseTomanInput(assets.usdCash) || 0;
 
   const held: HeldAssetSpec[] = useMemo(() => {
     const list: HeldAssetSpec[] = [];
+    // v1.4.15 — paper dollars: their TOMAN value changes with the USD rate,
+    // so the free-market dollar series (price_dollar_rl) is a held asset too.
+    if (usdQty > 0) {
+      list.push({
+        key: 'usd',
+        label: 'دلار کاغذی',
+        qty: usdQty,
+        symbol: TgjuHistorySymbol.dollar,
+        liveUnit: prices?.dollar ?? 0,
+      });
+    }
     if (goldQty > 0) {
       const is24 = assets.goldKarat === '24';
       list.push({
@@ -432,7 +480,7 @@ function LocalAssetsPnl({ assets, prices }: { assets: LocalAssets; prices?: Iran
       if (qty > 0) list.push({ key, label, qty, symbol, liveUnit: coinLive[key] ?? 0 });
     }
     return list;
-  }, [goldQty, silverQty, assets, prices]);
+  }, [goldQty, silverQty, usdQty, assets, prices]);
 
   const symbols = useMemo(() => [...new Set(held.map((h) => h.symbol))], [held]);
 

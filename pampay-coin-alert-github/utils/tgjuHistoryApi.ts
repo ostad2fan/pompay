@@ -18,7 +18,7 @@
 const HISTORY_BASE = 'https://api.tgju.org/v1/market/indicator/summary-table-data';
 const REQUEST_TIMEOUT_MS = 20_000;
 
-/** TGJU symbols used by the rial/metals PnL. */
+/** TGJU symbols used by the rial/metals PnL (dollar added in v1.4.15). */
 export const TgjuHistorySymbol = {
   gold18: 'geram18',
   gold24: 'geram24',
@@ -28,6 +28,8 @@ export const TgjuHistorySymbol = {
   coinBahar: 'sekeb',
   coinNim: 'nim',
   coinRob: 'rob',
+  /** Free-market USD (paper dollars) — Toman per USD. */
+  dollar: 'price_dollar_rl',
 } as const;
 
 export type TgjuHistoryKey = keyof typeof TgjuHistorySymbol;
