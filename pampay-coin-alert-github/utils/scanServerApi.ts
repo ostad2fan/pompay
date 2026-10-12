@@ -205,9 +205,10 @@ export interface ScanConfigSyncResult {
 
 /**
  * Pushes the scan configuration to the server (bot token, chat id, GainzAlgo
- * flag, the user's custom indicators and the fast-cycle flags: pump/dump
- * scanner, meme short, pre-listing + volume threshold). The server then
- * announces ALL sections' signals on Telegram + push while the app is closed.
+ * flag, the user's custom indicators, the fast-cycle flags: pump/dump
+ * scanner, meme short, pre-listing + volume threshold AND v1.4.17 the
+ * tracked whale wallets). The server then announces ALL sections' signals on
+ * Telegram + push while the app is closed.
  */
 export async function syncScanConfig(params: {
   botToken: string;
@@ -220,6 +221,8 @@ export async function syncScanConfig(params: {
   memeEnabled?: boolean;
   preListingEnabled?: boolean;
   volumeThreshold?: number;
+  whaleWallets?: { id: string; address: string; label: string }[];
+  whaleNotifications?: boolean;
 }): Promise<ScanConfigSyncResult> {
   const serverUrl = await getServerUrl();
   if (!serverUrl || !params.botToken || !params.chatId) {
@@ -247,6 +250,8 @@ export async function syncScanConfig(params: {
           memeEnabled: params.memeEnabled,
           preListingEnabled: params.preListingEnabled,
           volumeThreshold: params.volumeThreshold,
+          whaleWallets: params.whaleWallets,
+          whaleNotifications: params.whaleNotifications,
           indicators,
         }),
         signal: controller.signal,

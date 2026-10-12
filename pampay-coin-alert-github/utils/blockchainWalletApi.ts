@@ -2,33 +2,39 @@
  * blockchainWalletApi.ts — v1.4.17
  *
  * Keyless read-only balance fetching for the «کیف پول بلاکچین» 4th tab.
- * EVERY source below was live-verified before implementation:
+ * ONE wallet = one address tracked on MANY networks (v1.4.17).
+ * EVERY source below was live-verified before implementation
+ * (scripts/live-test-v1417*.mjs — 5 rounds, ~90 endpoint checks).
  *
- *  EVM (ETH / BSC / Polygon / Arbitrum / Base / Filecoin-FEVM):
- *    - Primary: Blockscout API v2 — GET {root}/api/v2/addresses/{addr}
- *      + /token-balances → native coin + ALL ERC-20 tokens with decimals and
- *      a USD `exchange_rate` per token (full discovery, no key). NOTE: a
- *      browser-like User-Agent header is REQUIRED — bare clients get a
- *      Cloudflare HTML challenge (verified live).
- *    - Fallback (PRIMARY for BSC — no public Blockscout exists there):
- *      public RPC eth_getBalance + Multicall3 aggregate3 over a LARGE token
- *      set (curated hardcoded list + runtime token lists: PancakeSwap top-100
- *      for BSC, Uniswap default list for ETH) — ONE RPC call per ~120 tokens.
- *  Tron: api.trongrid.io (no key) — /wallet/getaccount for TRX +
- *    /wallet/triggerconstantcontract balanceOf probes for curated TRC-20
- *    (contracts verified on-chain).
- *  Bitcoin: mempool.space/api/address (UTXO sum) + blockstream.info fallback.
- *  Solana: public RPC getBalance + getTokenAccountsByOwner(jsonParsed);
- *    SPL prices via Jupiter lite-api (keyless, includes 24h change).
- *  Filecoin: glif public RPC — eth_getBalance for 0x (FEVM) addresses and
- *    Filecoin.WalletBalance for native f1/f3/f4 addresses (both live-verified).
+ *  EVM (29 chains — one 0x address):
+ *    - Primary: Blockscout API v2 where available (full ERC-20 discovery +
+ *      per-token USD exchange_rate; browser User-Agent REQUIRED).
+ *    - Universal fallback/extension: Multicall3 (0xcA11bde…, selector
+ *      0x82ad56cb — verified against ethers' ABI encoder) probing a token
+ *      REGISTRY built from CoinGecko's coins/list?include_platform=true
+ *      (~4.5k BSC / 6k ETH contracts) + Trust Wallet tokenlists + curated
+ *      extras — filtered to Binance-listed coins so every Binance currency
+ *      on that network is probed (root fix of «FLAN ارز نمایش داده
+ *      نمی‌شود»): SHIB / FLOKI / CTSI / FET / APE / TOSHI / SONIC / NIR …
+ *    - Prices: Binance spot → Binance FUTURES (POPCAT fix) → CoinGecko
+ *      simple/token_price (by contract) → stable=$1 → «قیمت نامشخص» (row
+ *      stays visible — never dropped for missing price).
  *
- * v1.4.17 — prices: Binance spot ticker batch FIRST, then Binance USDT-M
- * FUTURES ticker batch (fapi) for coins that have no spot pair (POPCAT and
- * friends) — the «فقط یه ارز / قیمت نامشخص» gap. Stables = $1.
+ *  Independent networks (each with its own keyless reader):
+ *    Tron (TronGrid), Solana (RPC + Jupiter + DexScreener), TON (tonapi.io
+ *    + toncenter — Tonkeeper addresses), Bitcoin (mempool.space), Filecoin
+ *    (glif StateGetActor/StateLookupID + FEVM), Litecoin, Dogecoin, BCH,
+ *    XRP (xrpl), Cardano (koios), Polkadot (state_getStorage + BLAKE2b key
+ *    derivation), Cosmos (publicnode REST), Near (view_account + FT),
+ *    Aptos (resources), Sui (GraphQL), Stellar (horizon), Algorand
+ *    (algonode), Tezos (tzkt), MultiversX, Hedera (mirror), Zilliqa (JSON
+ *    RPC), VeChain (veblocks), Kaspa.
+ *
+ * PnL v1.4.17: per-wallet AND per-token market-change PnL over
+ * ۷/۳۰/۹۰/۱۸۰ days — Binance klines for Binance coins, CoinGecko
+ * market_chart for the rest.
  */
 
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   BlockchainNetwork,
   BlockchainTokenBalance,
@@ -36,8 +42,12 @@ import {
   BlockchainWalletData,
   CURATED_TRC20,
   NETWORKS,
-  tronHexAddress,
   Trc20Token,
+  isEvmNetwork,
+  polkadotStorageKey,
+  ss58Decode,
+  tronHexAddress,
+  zilliqaBase16,
   writeBlockchainBalanceCache,
 } from './blockchainWallets';
 
@@ -62,216 +72,358 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   }
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
-  return fetchJson<T>(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-}
-
-/** "0x…" hex → number via BigInt (exact for balances up to 2^53 units). */
-function numFromBigIntHex(hex: string): number {
-  if (!hex || hex === '0x') return 0;
+async function postJson<T>(url: string, body: unknown, timeoutMs = TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return Number(BigInt(hex));
-  } catch {
-    const n = parseInt(hex, 16);
-    return Number.isFinite(n) ? n : 0;
+    const res = await fetch(url, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'User-Agent': UA, Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return (await res.json()) as T;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-/**
- * "0x…" hex, integer decimal string or float string → number.
- * Integer decimal strings go through BigInt first — 18-decimal raw balances
- * (BSC USDT etc.) exceed 2^53 and parseFloat loses digits silently.
- */
+function hexToNumber(hex: string): number {
+  if (!hex || hex === '0x') return 0;
+  const n = parseInt(hex, 16);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** "0x…" hex or decimal string → number (lossy ok for balances we display). */
 function bigStrToNumber(raw: string | number | null | undefined): number {
   if (raw === null || raw === undefined) return 0;
-  const s = String(raw).trim();
-  if (!s) return 0;
-  if (s.startsWith('0x') || s.startsWith('0X')) return numFromBigIntHex(s);
-  if (/^-?\d+$/.test(s)) {
-    try {
-      return Number(BigInt(s));
-    } catch {
-      return parseFloat(s) || 0;
-    }
-  }
+  const s = String(raw);
+  if (s.startsWith('0x') || s.startsWith('0X')) return hexToNumber(s);
   const n = parseFloat(s);
   return Number.isFinite(n) ? n : 0;
 }
 
 // ---------------------------------------------------------------------------
-// Binance prices — SPOT first, FUTURES (fapi) fills futures-only coins
+// v1.4.17 — Binance price system: SPOT + FUTURES tickers in one map.
+// POPCAT (futures-only) and every other futures-only coin now get prices.
+// The map also seeds the "Binance coin set" used to filter the probe
+// registry (user: «همه ارزهای بایننس روی همان شبکه‌ها»).
 // ---------------------------------------------------------------------------
 
-const BINANCE_HOSTS = ['https://data-api.binance.vision', 'https://api.binance.com'];
-const FAPI_HOST = 'https://fapi.binance.com';
+const BINANCE_SPOT_HOSTS = ['https://data-api.binance.vision', 'https://api.binance.com'];
+const BINANCE_FAPI_HOST = 'https://fapi.binance.com';
 
-interface BinanceTicker {
+export interface BinancePriceEntry {
+  price: number;
+  chg: number | null;
+  /** spot (preferred) or futures */
+  src: 'spot' | 'futures';
+}
+
+interface BinanceTicker24 {
   symbol: string;
   lastPrice: string;
   priceChangePercent: string;
 }
 
-const priceCache = new Map<string, { at: number; price: number; chg: number | null }>();
-const PRICE_TTL = 60_000;
+let allTickerCache: {
+  at: number;
+  bySymbol: Record<string, BinancePriceEntry>;
+  coins: Set<string>;
+} | null = null;
 
-/** Futures (USDT-M perpetual) map — ~800 symbols, cached 5 minutes. */
-let futuresMapCache: { at: number; map: Record<string, { price: number; chg: number | null }> } = {
-  at: 0,
-  map: {},
-};
+const ALL_TICKERS_TTL = 60_000;
 
-export async function fetchBinanceTickers(pairs: string[]): Promise<Record<string, { price: number; chg: number | null }>> {
-  const out: Record<string, { price: number; chg: number | null }> = {};
-  const now = Date.now();
-  const missing = pairs.filter((p) => {
-    const c = priceCache.get(p);
-    if (c && now - c.at < PRICE_TTL) {
-      out[p] = { price: c.price, chg: c.chg };
-      return false;
-    }
-    return true;
-  });
-  if (missing.length === 0) return out;
-  const symbolsParam = encodeURIComponent(JSON.stringify(missing));
-  let lastErr: unknown = null;
-  for (const host of BINANCE_HOSTS) {
-    try {
-      const data = await fetchJson<BinanceTicker[]>(
-        `${host}/api/v3/ticker/24hr?symbols=${symbolsParam}`
-      );
-      for (const t of data) {
-        const price = parseFloat(t.lastPrice);
-        const chg = parseFloat(t.priceChangePercent);
-        const entry = { at: now, price, chg: Number.isFinite(chg) ? chg : null };
-        priceCache.set(t.symbol, entry);
-        out[t.symbol] = { price, chg: entry.chg };
-      }
-      return out;
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  if (lastErr && Object.keys(out).length === 0) throw lastErr;
-  return out;
-}
-
-async function fetchBinanceFuturesMap(): Promise<Record<string, { price: number; chg: number | null }>> {
-  if (Date.now() - futuresMapCache.at < 5 * 60_000) return futuresMapCache.map;
-  let data: BinanceTicker[] | null = null;
-  try {
-    data = await fetchJson<BinanceTicker[]>(`${FAPI_HOST}/fapi/v1/ticker/24hr`);
-  } catch {
-    data = null;
-  }
-  if (!data || !Array.isArray(data)) {
-    // 24hr is weight-limited (HTTP 418/429 on busy IPs) — the plain price
-    // list is lighter and keyless (no 24h change in that case).
-    const plain = await fetchJson<{ symbol: string; price: string }[]>(
-      `${FAPI_HOST}/fapi/v1/ticker/price`
-    );
-    data = plain.map((p) => ({ symbol: p.symbol, lastPrice: p.price, priceChangePercent: '' }));
-  }
-  const map: Record<string, { price: number; chg: number | null }> = {};
-  if (Array.isArray(data)) {
-    for (const t of data) {
-      const price = parseFloat(t.lastPrice);
-      const chg = parseFloat(t.priceChangePercent);
-      if (Number.isFinite(price) && price > 0) {
-        map[t.symbol] = { price, chg: Number.isFinite(chg) && chg !== 0 ? chg : null };
-      }
-    }
-  }
-  futuresMapCache = { at: Date.now(), map };
-  return map;
+/** Coins to ignore (leveraged tokens). */
+function isLeveraged(symbol: string): boolean {
+  return /(UP|DOWN|BULL|BEAR)USDT$/.test(symbol);
 }
 
 /**
- * Spot + futures merged price map for a set of pairs — coins that only trade
- * as perpetuals (POPCAT…) get their live price from fapi.
+ * Fetches ALL spot + futures USDT tickers ONCE (60s cache) →
+ * { 'ETHUSDT': {price, chg}, … } + the Binance coin set.
  */
-export async function fetchBinanceSpotAndFutures(
-  pairs: string[]
-): Promise<Record<string, { price: number; chg: number | null }>> {
-  let out: Record<string, { price: number; chg: number | null }> = {};
-  try {
-    out = await fetchBinanceTickers(pairs);
-  } catch {
-    out = {};
+export async function getBinancePriceMap(): Promise<{
+  bySymbol: Record<string, BinancePriceEntry>;
+  coins: Set<string>;
+}> {
+  if (allTickerCache && Date.now() - allTickerCache.at < ALL_TICKERS_TTL) {
+    return { bySymbol: allTickerCache.bySymbol, coins: allTickerCache.coins };
   }
-  const missing = pairs.filter((p) => !out[p]);
-  if (missing.length > 0) {
+  const bySymbol: Record<string, BinancePriceEntry> = {};
+  const coins = new Set<string>();
+
+  // spot
+  let spotOk = false;
+  for (const host of BINANCE_SPOT_HOSTS) {
     try {
-      const f = await fetchBinanceFuturesMap();
-      for (const p of missing) {
-        if (f[p]) out[p] = f[p];
+      const data = await fetchJson<BinanceTicker24[]>(`${host}/api/v3/ticker/24hr`, undefined);
+      if (!Array.isArray(data)) continue;
+      for (const t of data) {
+        if (!t.symbol.endsWith('USDT') || isLeveraged(t.symbol)) continue;
+        const price = parseFloat(t.lastPrice);
+        const chg = parseFloat(t.priceChangePercent);
+        if (!Number.isFinite(price)) continue;
+        bySymbol[t.symbol] = {
+          price,
+          chg: Number.isFinite(chg) ? chg : null,
+          src: 'spot',
+        };
+        coins.add(t.symbol.slice(0, -4));
       }
+      spotOk = true;
+      break;
     } catch {}
   }
-  return out;
-}
 
-const STABLE_SYMBOLS = ['USDT', 'USDC', 'DAI', 'USDD', 'USDC.E', 'TUSD', 'FDUSD', 'USDJ', 'STUSDT', 'PYUSD'];
+  // futures (fills gaps like POPCAT + adds futures-only coins)
+  try {
+    const f = await fetchJson<BinanceTicker24[]>(`${BINANCE_FAPI_HOST}/fapi/v1/ticker/24hr`);
+    if (Array.isArray(f)) {
+      for (const t of f) {
+        if (!t.symbol.endsWith('USDT') || isLeveraged(t.symbol)) continue;
+        const price = parseFloat(t.lastPrice);
+        const chg = parseFloat(t.priceChangePercent);
+        if (!Number.isFinite(price)) continue;
+        const coin = t.symbol.slice(0, -4);
+        coins.add(coin);
+        if (!bySymbol[t.symbol]) {
+          bySymbol[t.symbol] = {
+            price,
+            chg: Number.isFinite(chg) ? chg : null,
+            src: 'futures',
+          };
+        }
+      }
+    }
+  } catch {}
+
+  const fresh = { at: Date.now(), bySymbol, coins };
+  allTickerCache = fresh;
+  return { bySymbol, coins };
+}
 
 /** Symbol → Binance pair guess (ETH → ETHUSDT). */
 function binancePairFor(symbol: string): string | undefined {
   const s = symbol.toUpperCase();
-  if (STABLE_SYMBOLS.includes(s)) {
+  if (['USDT', 'USDC', 'DAI', 'TUSD', 'FDUSD', 'BUSD', 'USDD', 'PYUSD', 'USDC.E'].includes(s)) {
     return undefined; // stables are $1
   }
-  if (['POL', 'MATIC', 'WPOL', 'WMATIC'].includes(s)) return 'POLUSDT';
-  if (s === 'WBTC' || s === 'BTCB') return 'BTCUSDT';
-  if (['WETH', 'WBETH', 'RETH', 'STETH', 'WSTETH'].includes(s)) return 'ETHUSDT';
+  if (['POL', 'MATIC'].includes(s)) return 'POLUSDT';
+  if (s === 'WBTC') return 'BTCUSDT';
+  if (s === 'WETH' || s === 'WBETH' || s === 'RETH' || s === 'STETH' || s === 'WSTETH') return 'ETHUSDT';
+  if (s === 'WSOL') return 'SOLUSDT';
+  if (s === 'MULTI') return 'MULTIUSDT';
   return `${s}USDT`;
 }
 
-/**
- * Fill every token's price/value — spot → futures → stables = $1.
- * v1.4.17: the $1 stable assumption is capped at 10^12 units — spam tokens
- * NAME themselves "USDT" on explorers and burn-junk quantities would
- * otherwise show as $10^24 fake positions.
- */
-async function fillPricesFromBinance(tokens: BlockchainTokenBalance[]): Promise<void> {
-  const pairs = tokens
-    .filter((t) => t.priceUsd <= 0 && t.binancePair)
-    .map((t) => t.binancePair as string);
-  const setStable = (t: BlockchainTokenBalance) => {
-    if (STABLE_SYMBOLS.includes(t.symbol.toUpperCase()) && t.qty <= 1e12) {
-      t.priceUsd = 1;
-      t.change24hPct = 0;
-      t.valueUsd = t.qty;
-    }
-  };
-  if (pairs.length === 0) {
-    tokens.forEach(setStable);
-    return;
-  }
-  try {
-    const map = await fetchBinanceSpotAndFutures([...new Set(pairs)]);
-    for (const t of tokens) {
-      if (t.priceUsd > 0) continue;
-      const hit = t.binancePair ? map[t.binancePair] : undefined;
-      if (hit) {
-        t.priceUsd = hit.price;
-        t.change24hPct = hit.chg;
-        t.valueUsd = t.qty * hit.price;
-      } else {
-        setStable(t);
-      }
-    }
-  } catch {
-    tokens.forEach(setStable);
-  }
+const STABLE_SYMBOLS = [
+  'USDT', 'USDC', 'DAI', 'USDD', 'USDC.E', 'TUSD', 'FDUSD', 'BUSD',
+  'PYUSD', 'USDT.E', 'USDCB', 'FDUSD',
+];
+
+function isStableSymbol(symbol: string): boolean {
+  return STABLE_SYMBOLS.includes(symbol.toUpperCase());
 }
 
 // ---------------------------------------------------------------------------
-// RPC helpers + Multicall3 (fallback path — PRIMARY for BSC)
+// v1.4.17 — Token REGISTRY: CoinGecko coins/list?include_platform=true
+// (~3.8MB, 24h in-memory cache) + Trust Wallet tokenlists + curated extras.
+// Only contracts whose symbol is Binance-listed (or in TW/curated) are
+// probed — full coverage of real coins without thousands of spam probes.
 // ---------------------------------------------------------------------------
 
-async function rpcCall<T>(urls: string[], method: string, params: unknown[]): Promise<T> {
+export interface RegistryToken {
+  symbol: string;
+  name: string;
+  contract: string;
+  decimals: number;
+  cgId?: string;
+}
+
+interface CgCoin {
+  id: string;
+  symbol: string;
+  name: string;
+  platforms: Record<string, string>;
+}
+
+let registryCache: {
+  at: number;
+  byChain: Partial<Record<BlockchainNetwork, RegistryToken[]>>;
+} = { at: 0, byChain: {} };
+
+const REGISTRY_TTL = 24 * 3600_000;
+/** Max tokens probed per chain per refresh (cap API cost). */
+const REGISTRY_PROBE_CAP = 900;
+
+let cgCoinsCache: { at: number; coins: CgCoin[] | null } | null = null;
+
+async function fetchCgCoins(): Promise<CgCoin[] | null> {
+  // the coins/list download is ~3.8MB — at most once per 24h
+  if (cgCoinsCache && Date.now() - cgCoinsCache.at < REGISTRY_TTL) return cgCoinsCache.coins;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    try {
+      const res = await fetch('https://api.coingecko.com/api/v3/coins/list?include_platform=true', {
+        headers: { 'User-Agent': UA, Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const coins = (await res.json()) as CgCoin[];
+      cgCoinsCache = { at: Date.now(), coins };
+      return coins;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    if (cgCoinsCache) return cgCoinsCache.coins;
+    return null;
+  }
+}
+
+interface TwToken {
+  symbol: string;
+  name: string;
+  address: string;
+  decimals: number;
+  extensions?: { coingeckoId?: string };
+}
+
+async function fetchTwTokenlist(dir: string): Promise<TwToken[] | null> {
+  try {
+    const d = await fetchJson<{ tokens: TwToken[] }>(
+      `https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/${dir}/tokenlist.json`
+    );
+    return Array.isArray(d?.tokens) ? d.tokens : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Build (and cache for 24h) the per-chain probe registry. */
+async function getTokenRegistry(network: BlockchainNetwork): Promise<RegistryToken[]> {
+  const cached = registryCache.byChain[network];
+  if (cached && Date.now() - registryCache.at < REGISTRY_TTL) return cached;
+
+  const meta = NETWORKS[network];
+  const [cg, tw, { coins }] = await Promise.all([
+    fetchCgCoins(),
+    meta.twList ? fetchTwTokenlist(meta.twList) : Promise.resolve(null),
+    getBinancePriceMap(),
+  ]);
+
+  const byContract = new Map<string, RegistryToken>();
+  const add = (t: RegistryToken) => {
+    const key = t.contract.toLowerCase();
+    if (!byContract.has(key)) byContract.set(key, t);
+  };
+
+  // 1) Trust Wallet list first (trusted contracts, always probed)
+  if (tw) {
+    for (const t of tw) {
+      if (!t.address || !/^0x[0-9a-fA-F]{40}$/.test(t.address)) continue;
+      add({
+        symbol: t.symbol.toUpperCase(),
+        name: t.name,
+        contract: t.address,
+        decimals: Number.isFinite(t.decimals) ? t.decimals : 18,
+        cgId: t.extensions?.coingeckoId,
+      });
+    }
+  }
+
+  // 2) CoinGecko contracts — filtered to Binance coins + already-known symbols
+  if (cg && meta.cgPlatform) {
+    let added = 0;
+    for (const coin of cg) {
+      if (added >= REGISTRY_PROBE_CAP) break;
+      const contract = coin.platforms?.[meta.cgPlatform];
+      if (!contract || !/^0x[0-9a-fA-F]{40}$/.test(contract)) continue;
+      const sym = (coin.symbol ?? '').toUpperCase();
+      if (!sym || sym.length > 16) continue;
+      // probe only real coins: Binance-listed OR already in the trusted list
+      if (!coins.has(sym) && !byContract.has(contract.toLowerCase())) continue;
+      add({ symbol: sym, name: coin.name, contract, decimals: 18, cgId: coin.id });
+      added++;
+    }
+  }
+
+  const list = [...byContract.values()];
+  registryCache.byChain[network] = list;
+  if (!registryCache.at) registryCache.at = Date.now();
+  return list;
+}
+
+// ---------------------------------------------------------------------------
+// v1.4.17 — Multicall3 aggregate3 (VERIFIED against ethers' encoder live on
+// BSC/Polygon/Base/etc. — selector 0x82ad56cb, two-level offset tables).
+// ---------------------------------------------------------------------------
+
+const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
+const BALANCE_OF_SELECTOR = '0x70a08231';
+
+const WORD = (hexOrNum: string | number, len = 64): string => {
+  const s = typeof hexOrNum === 'string' ? hexOrNum.replace(/^0x/i, '').toLowerCase() : hexOrNum.toString(16);
+  return s.padStart(len, '0');
+};
+
+interface Mc3Call {
+  target: string;
+  data: string;
+}
+
+function encodeAggregate3(calls: Mc3Call[]): string {
+  const n = calls.length;
+  const headLen = 96;
+  const elems = calls.map((c) => {
+    const dataNo0x = c.data.replace(/^0x/i, '').toLowerCase();
+    const dataLen = dataNo0x.length / 2;
+    const paddedWords = Math.ceil(dataLen / 32);
+    return { dataNo0x, dataLen, size: headLen + 32 + paddedWords * 32 };
+  });
+  let out = '0x82ad56cb';
+  out += WORD('20'); // offset to array
+  out += WORD(n);
+  let cur = n * 32;
+  for (const e of elems) {
+    out += WORD(cur);
+    cur += e.size;
+  }
+  calls.forEach((c, i) => {
+    const e = elems[i];
+    out += WORD(c.target.replace(/^0x/i, ''));
+    out += '0'.repeat(64); // allowFailure = false
+    out += WORD('60'); // offset to callData relative to element start
+    out += WORD(e.dataLen);
+    out += e.dataNo0x.padEnd(Math.ceil(e.dataLen / 32) * 64, '0');
+  });
+  return out;
+}
+
+function decodeAggregate3Result(hex: string): { success: boolean; data: string }[] {
+  const h = hex.replace(/^0x/i, '').toLowerCase();
+  const word = (i: number) => h.slice(i * 64, i * 64 + 64);
+  const arrLenWordIdx = parseInt(word(0), 16) / 32;
+  const n = parseInt(word(arrLenWordIdx), 16);
+  const out: { success: boolean; data: string }[] = [];
+  for (let k = 0; k < n; k++) {
+    const elemOffBytes = parseInt(word(arrLenWordIdx + 1 + k), 16);
+    if (!Number.isFinite(elemOffBytes)) continue;
+    const elemWord = arrLenWordIdx + 1 + elemOffBytes / 32;
+    const success = word(elemWord) === '0'.repeat(63) + '1';
+    const dataOffBytes = parseInt(word(elemWord + 1), 16);
+    const lenWord = elemWord + dataOffBytes / 32;
+    const len = parseInt(word(lenWord), 16);
+    const data = h.slice((lenWord + 1) * 64, (lenWord + 1) * 64 + len * 2);
+    out.push({ success, data: '0x' + data });
+  }
+  return out;
+}
+
+async function rpcCall<T>(urls: string[], method: string, params: unknown[], timeoutMs = TIMEOUT_MS): Promise<T> {
   let lastErr: unknown = null;
   for (const url of urls) {
     try {
@@ -280,7 +432,7 @@ async function rpcCall<T>(urls: string[], method: string, params: unknown[]): Pr
         id: 1,
         method,
         params,
-      });
+      }, timeoutMs);
       if (d.error) throw new Error(d.error.message);
       return d.result as T;
     } catch (e) {
@@ -290,279 +442,92 @@ async function rpcCall<T>(urls: string[], method: string, params: unknown[]): Pr
   throw lastErr ?? new Error('RPC ناموفق');
 }
 
-const BALANCE_OF_SELECTOR = '0x70a08231';
-
 /**
- * v1.4.17 — the canonical multicall address hosts MULTICALL v1 on BSC /
- * Arbitrum / Base (on-chain-verified: aggregate3 selector absent, legacy
- * aggregate present), so we use the LEGACY `aggregate((address,bytes)[])`
- * which exists in Multicall v1/v2/v3 on every chain. Downside: it reverts
- * when ANY inner call fails → batches bisect on failure to isolate bad
- * tokens (see multicallBatch).
+ * balanceOf for many ERC-20s in a handful of eth_calls (batches of 120).
+ * Returns contract(lowercase) → raw bigint (only > 0 entries included).
  */
-const MULTICALL = '0xcA11bde05977b3631167028862bE2a173976CA11';
-const AGG_SELECTOR = '0x252dba42';
-
-interface McCall {
-  target: string;
-  callData: string;
-}
-
-/** ABI-encode aggregate((address,bytes)[]) — all callDatas are 36 bytes. */
-function encodeAggregate(calls: McCall[]): string {
-  const tails: string[] = [];
-  for (const c of calls) {
-    const h = c.callData.slice(2);
-    const lenWord = (h.length / 2).toString(16).padStart(64, '0');
-    const paddedLen = Math.ceil(h.length / 64) * 64;
-    tails.push(lenWord + h.padEnd(paddedLen, '0'));
-  }
-  let out = AGG_SELECTOR;
-  out += '20'.padStart(64, '0'); // offset to the array
-  out += calls.length.toString(16).padStart(64, '0'); // array length
-  // element offsets (bytes from the start of the array data, right after the
-  // N offset words) — element i starts at N*32 + Σ previous element sizes.
-  let acc = 0;
-  for (let i = 0; i < calls.length; i++) {
-    const elemBytes = 64 + tails[i].length / 2; // head 2 words + tail
-    out += (calls.length * 32 + acc).toString(16).padStart(64, '0');
-    acc += elemBytes;
-  }
-  // elements — head: [target][offset-to-bytes = 64], tail: [len][data]
-  for (let i = 0; i < calls.length; i++) {
-    out += calls[i].target.slice(2).toLowerCase().padStart(64, '0'); // target
-    out += (64).toString(16).padStart(64, '0'); // offset to bytes (head = 2 words)
-    out += tails[i];
-  }
-  return out;
-}
-
-/**
- * Decode aggregate's return (uint256 blockNumber, bytes[] returnData) into
- * the raw hex payloads (no 0x). Array length sits at word 2, element offsets
- * start at word 3 (each relative to the array data region).
- */
-function decodeAggregateReturn(result: string): string[] {
-  const h = result.startsWith('0x') ? result.slice(2) : result;
-  if (h.length < 192) return [];
-  const rd = (i: number) => h.slice(i * 64, (i + 1) * 64);
-  const wv = (i: number) => {
-    try {
-      return Number(BigInt('0x' + rd(i)));
-    } catch {
-      return 0;
-    }
-  };
-  const arrLen = wv(2);
-  if (arrLen <= 0 || arrLen > 2000) return [];
-  const out: string[] = [];
-  for (let i = 0; i < arrLen; i++) {
-    try {
-      const offBytes = wv(3 + i);
-      const elemWord = 3 + Math.floor(offBytes / 32);
-      const lenBytes = wv(elemWord);
-      out.push(h.slice((elemWord + 1) * 64, (elemWord + 1) * 64 + lenBytes * 2));
-    } catch {
-      out.push('');
-    }
-  }
-  return out;
-}
-
-interface Erc20Meta {
-  symbol: string;
-  name: string;
-  contract: string;
-  decimals: number;
-}
-
-/** One multicall batch (~120 tokens) → balanceOf for every token at once. */
 async function multicallBalances(
-  network: BlockchainNetwork,
-  address: string,
-  tokens: Erc20Meta[]
-): Promise<BlockchainTokenBalance[]> {
+  rpcs: string[],
+  wallet: string,
+  contracts: { contract: string; decimals: number }[]
+): Promise<Map<string, bigint>> {
+  const out = new Map<string, bigint>();
   const BATCH = 120;
-  const out: BlockchainTokenBalance[] = [];
-  for (let start = 0; start < tokens.length; start += BATCH) {
-    const batch = tokens.slice(start, start + BATCH);
-    out.push(...(await multicallBatch(network, address, batch)));
+  const ownerPadded = WORD(wallet.slice(2));
+  for (let i = 0; i < contracts.length; i += BATCH) {
+    const batch = contracts.slice(i, i + BATCH);
+    try {
+      const raw = await rpcCall<string>(rpcs, 'eth_call', [
+        { to: MULTICALL3, data: encodeAggregate3(batch.map((b) => ({ target: b.contract, data: BALANCE_OF_SELECTOR + ownerPadded }))) },
+        'latest',
+      ]);
+      if (!raw || raw === '0x') continue;
+      const decoded = decodeAggregate3Result(raw);
+      decoded.forEach((r, k) => {
+        if (!r.success || !r.data || r.data === '0x') return;
+        try {
+          const v = BigInt(r.data);
+          if (v > 0n) out.set(batch[k].contract.toLowerCase(), v);
+        } catch {}
+      });
+    } catch {
+      // one failed batch must not kill the whole discovery
+    }
   }
   return out;
 }
 
-/** One aggregate() eth_call — bisects on revert (legacy aggregate reverts when any inner call fails). */
-async function multicallBatch(
-  network: BlockchainNetwork,
-  address: string,
-  batch: Erc20Meta[]
-): Promise<BlockchainTokenBalance[]> {
-  const ownerArg = address.slice(2).toLowerCase().padStart(64, '0');
-  const calls: McCall[] = batch.map((t) => ({
-    target: t.contract,
-    callData: `${BALANCE_OF_SELECTOR}${ownerArg}`,
-  }));
-  try {
-    const result = await rpcCall<string>(NETWORKS[network].rpcs, 'eth_call', [
-      { to: MULTICALL, data: encodeAggregate(calls) },
-      'latest',
-    ]);
-    const raw = decodeAggregateReturn(result);
-    if (raw.length !== batch.length) return []; // corrupted decode — skip batch
-    const out: BlockchainTokenBalance[] = [];
-    raw.forEach((dataHex, i) => {
-      if (!dataHex || dataHex.length < 64) return;
-      const qty = Number(BigInt('0x' + dataHex.slice(0, 64))) / Math.pow(10, batch[i].decimals);
-      if (!(qty > 0)) return;
-      out.push({
-        symbol: batch[i].symbol,
-        name: batch[i].name,
-        kind: 'token',
-        qty,
-        priceUsd: 0,
-        change24hPct: null,
-        valueUsd: 0,
-        binancePair: binancePairFor(batch[i].symbol),
-        network,
-      });
-    });
-    return out;
-  } catch {
-    // aggregate reverts when ANY inner call fails — split the batch to
-    // isolate the failing token (a few bad contracts never kill the rest).
-    if (batch.length > 1) {
-      const mid = Math.floor(batch.length / 2);
-      const [a, b] = await Promise.all([
-        multicallBatch(network, address, batch.slice(0, mid)),
-        multicallBatch(network, address, batch.slice(mid)),
-      ]);
-      return [...a, ...b];
+// ---------------------------------------------------------------------------
+// CoinGecko price by contract (batch) — for tokens with no Binance listing
+// ---------------------------------------------------------------------------
+
+const cgPriceCache = new Map<string, { at: number; price: number; chg: number | null; id?: string }>();
+const CG_PRICE_TTL = 120_000;
+
+async function cgTokenPrices(
+  platform: string,
+  contracts: string[]
+): Promise<Map<string, { price: number; chg: number | null; id: string }>> {
+  const out = new Map<string, { price: number; chg: number | null; id: string }>();
+  if (contracts.length === 0) return out;
+  const now = Date.now();
+  const missing: string[] = [];
+  for (const c of contracts) {
+    const hit = cgPriceCache.get(`${platform}:${c.toLowerCase()}`);
+    if (hit && now - hit.at < CG_PRICE_TTL) {
+      if (hit.price > 0) out.set(c.toLowerCase(), { price: hit.price, chg: hit.chg, id: hit.id ?? '' });
+    } else {
+      missing.push(c);
     }
-    return []; // a single failing token — drop it
   }
-}
-
-// ---------------------------------------------------------------------------
-// Runtime token lists (keyless, cached 7 days) + curated fallback sets
-// ---------------------------------------------------------------------------
-
-interface TokenListEntry {
-  chainId: number;
-  address: string;
-  symbol: string;
-  name: string;
-  decimals: number;
-}
-
-/** Standard "token list" JSON sources — no API key, public CDNs. */
-const TOKEN_LIST_SOURCES: Partial<Record<BlockchainNetwork, { url: string; chainId: number }>> = {
-  bsc: { url: 'https://tokens.pancakeswap.finance/pancakeswap-top-100.json', chainId: 56 },
-  ethereum: { url: 'https://tokens.uniswap.org', chainId: 1 },
-};
-
-const TOKEN_LIST_TTL = 7 * 24 * 3600 * 1000;
-const tokenListMem = new Map<BlockchainNetwork, { at: number; tokens: Erc20Meta[] }>();
-
-async function fetchTokenList(network: BlockchainNetwork): Promise<Erc20Meta[]> {
-  const src = TOKEN_LIST_SOURCES[network];
-  if (!src) return [];
-  const mem = tokenListMem.get(network);
-  if (mem && Date.now() - mem.at < TOKEN_LIST_TTL) return mem.tokens;
-  const storeKey = `@bc_token_list_${network}`;
-  try {
-    const raw = await AsyncStorage.getItem(storeKey);
-    if (raw) {
-      const cached = JSON.parse(raw) as { at: number; tokens: Erc20Meta[] };
-      if (cached?.tokens && Date.now() - cached.at < TOKEN_LIST_TTL) {
-        tokenListMem.set(network, cached);
-        return cached.tokens;
-      }
-    }
-  } catch {}
-  try {
-    const data = await fetchJson<{ tokens?: TokenListEntry[] }>(src.url);
-    const list = (data.tokens ?? [])
-      .filter((t) => t.chainId === src.chainId && /^0x[0-9a-fA-F]{40}$/.test(t.address ?? ''))
-      .map((t) => ({
-        symbol: String(t.symbol ?? '').slice(0, 16).toUpperCase(),
-        name: String(t.name ?? t.symbol ?? '').slice(0, 40),
-        contract: t.address,
-        decimals: Number.isFinite(t.decimals) && (t.decimals as number) >= 0 ? (t.decimals as number) : 18,
-      }))
-      .filter((t) => t.symbol.length > 0)
-      .slice(0, 300);
-    const payload = { at: Date.now(), tokens: list };
-    tokenListMem.set(network, payload);
+  if (missing.length === 0) return out;
+  // batches of 60 contracts
+  for (let i = 0; i < missing.length; i += 60) {
+    const part = missing.slice(i, i + 60);
     try {
-      await AsyncStorage.setItem(storeKey, JSON.stringify(payload));
+      const url =
+        `https://api.coingecko.com/api/v3/simple/token_price/${platform}` +
+        `?contract_addresses=${part.join(',')}&vs_currencies=usd&include_24hr_change=true`;
+      const d = await fetchJson<Record<string, { usd?: number; usd_24h_change?: number }>>(url);
+      for (const [contract, v] of Object.entries(d ?? {})) {
+        const price = Number(v?.usd);
+        if (!Number.isFinite(price) || price <= 0) continue;
+        const chg = Number(v?.usd_24h_change);
+        const entry = {
+          at: now,
+          price,
+          chg: Number.isFinite(chg) ? chg : null,
+        };
+        cgPriceCache.set(`${platform}:${contract.toLowerCase()}`, entry);
+        out.set(contract.toLowerCase(), { price, chg: entry.chg, id: '' });
+      }
     } catch {}
-    return list;
-  } catch {
-    return [];
   }
-}
-
-/** Verified-on-chain fallback ERC-20 sets per EVM chain (famous ones only). */
-const FALLBACK_EVM_TOKENS: Partial<Record<BlockchainNetwork, Erc20Meta[]>> = {
-  ethereum: [
-    { symbol: 'USDT', name: 'Tether USD', contract: '0xdAC17F958D2ee523a2206206994597C13D831ec7', decimals: 6 },
-    { symbol: 'USDC', name: 'USD Coin', contract: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', decimals: 6 },
-    { symbol: 'DAI', name: 'Dai Stablecoin', contract: '0x6B175474E89094C44Da98b954EedeAC495271d0F', decimals: 18 },
-    { symbol: 'LINK', name: 'Chainlink', contract: '0x514910771AF9Ca656af840dff83E8264EcF986CA', decimals: 18 },
-    { symbol: 'SHIB', name: 'Shiba Inu', contract: '0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE', decimals: 18 },
-    { symbol: 'PEPE', name: 'Pepe', contract: '0x6982508145454Ce325dDbE47a25d4ec3d2311933', decimals: 18 },
-    { symbol: 'UNI', name: 'Uniswap', contract: '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984', decimals: 18 },
-    { symbol: 'WBTC', name: 'Wrapped BTC', contract: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', decimals: 8 },
-    { symbol: 'WETH', name: 'Wrapped Ether', contract: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', decimals: 18 },
-    { symbol: 'STETH', name: 'Lido Staked ETH', contract: '0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84', decimals: 18 },
-    { symbol: 'LDO', name: 'Lido DAO', contract: '0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32', decimals: 18 },
-    { symbol: 'AAVE', name: 'Aave', contract: '0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9', decimals: 18 },
-    { symbol: 'MATIC', name: 'Polygon (ERC-20)', contract: '0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0', decimals: 18 },
-  ],
-  bsc: [
-    { symbol: 'USDT', name: 'Tether USD (BSC)', contract: '0x55d398326f99059fF775485246999027B3197955', decimals: 18 },
-    { symbol: 'USDC', name: 'USD Coin (BSC)', contract: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', decimals: 18 },
-    { symbol: 'CAKE', name: 'PancakeSwap (BSC)', contract: '0x0E09FaBB73BD3aDE0a17ECC321fD13a19e81cE82', decimals: 18 },
-    { symbol: 'ETH', name: 'Ethereum (Pegged)', contract: '0x2170Ed0880ac9A755fd29B2688956BD959F933F8', decimals: 18 },
-    { symbol: 'BTCB', name: 'Bitcoin (Pegged)', contract: '0x7130d2A12B9BCBFAe4f2634d864A1Ee1Ce3Ead9c', decimals: 18 },
-    { symbol: 'BUSD', name: 'Binance USD (BSC)', contract: '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56', decimals: 18 },
-    { symbol: 'DAI', name: 'Dai Stablecoin (BSC)', contract: '0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3', decimals: 18 },
-    { symbol: 'WBNB', name: 'Wrapped BNB', contract: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', decimals: 18 },
-    { symbol: 'LINK', name: 'Chainlink (BSC)', contract: '0xF8A0BF9cF54Bb92F17374d9e9A321E6a035E1cE1', decimals: 18 },
-  ],
-  polygon: [
-    { symbol: 'USDC', name: 'USD Coin', contract: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', decimals: 6 },
-    { symbol: 'USDC.E', name: 'USD Coin (bridged)', contract: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', decimals: 6 },
-    { symbol: 'USDT', name: 'Tether USD (Polygon)', contract: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F', decimals: 6 },
-    { symbol: 'WETH', name: 'Wrapped Ether (bridged)', contract: '0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619', decimals: 18 },
-    { symbol: 'WMATIC', name: 'Wrapped POL', contract: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270', decimals: 18 },
-  ],
-  arbitrum: [
-    { symbol: 'USDC', name: 'USD Coin', contract: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', decimals: 6 },
-    { symbol: 'USDT', name: 'Tether USD (Arbitrum)', contract: '0xFd086bC7CD5C481DCC9C85fEe2EdF96a049e4D0d', decimals: 6 },
-    { symbol: 'WBTC', name: 'Wrapped BTC (Arbitrum)', contract: '0x2f2a2543B76A4166549F7aaB2e75Bfb0B16D3202', decimals: 8 },
-    { symbol: 'ARB', name: 'Arbitrum', contract: '0x912CE59144191C1204E64559FE8253a0e49E6548', decimals: 18 },
-    { symbol: 'WETH', name: 'Wrapped Ether (Arbitrum)', contract: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', decimals: 18 },
-  ],
-  base: [
-    { symbol: 'USDC', name: 'USD Coin', contract: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', decimals: 6 },
-    { symbol: 'WETH', name: 'Wrapped Ether (Base)', contract: '0x4200000000000000000000000000000000000006', decimals: 18 },
-  ],
-  filecoin: [],
-};
-
-/** Hardcoded set + runtime token list merged by contract address. */
-async function resolveErc20Set(network: BlockchainNetwork): Promise<Erc20Meta[]> {
-  const hardcoded = FALLBACK_EVM_TOKENS[network] ?? [];
-  const runtime = await fetchTokenList(network).catch(() => [] as Erc20Meta[]);
-  const byAddr = new Map<string, Erc20Meta>();
-  for (const t of hardcoded) byAddr.set(t.contract.toLowerCase(), t);
-  for (const t of runtime) byAddr.set(t.contract.toLowerCase(), t);
-  return [...byAddr.values()].slice(0, 260);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
-// EVM balances — Blockscout primary (full discovery) + Multicall3 fallback
+// EVM balances — Blockscout primary + registry/Multicall3 universal path
 // ---------------------------------------------------------------------------
 
 interface BsToken {
@@ -582,17 +547,67 @@ interface BsAddress {
   exchange_rate: string | null;
 }
 
+/** v1.4.16 fallback set (kept — famous verified contracts per chain). */
+const FALLBACK_EVM_TOKENS: Partial<Record<BlockchainNetwork, { symbol: string; name: string; contract: string; decimals: number }[]>> = {
+  ethereum: [
+    { symbol: 'USDT', name: 'Tether USD', contract: '0xdAC17F958D2ee523a2206206994597C13D831ec7', decimals: 6 },
+    { symbol: 'USDC', name: 'USD Coin', contract: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', decimals: 6 },
+    { symbol: 'DAI', name: 'Dai Stablecoin', contract: '0x6B175474E89094C44Da98b954EedeAC495271d0F', decimals: 18 },
+    { symbol: 'LINK', name: 'Chainlink', contract: '0x514910771AF9Ca656af840dff83E8264EcF986CA', decimals: 18 },
+    { symbol: 'SHIB', name: 'Shiba Inu', contract: '0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE', decimals: 18 },
+    { symbol: 'PEPE', name: 'Pepe', contract: '0x6982508145454Ce325dDbE47a25d4ec3d2311933', decimals: 18 },
+    { symbol: 'UNI', name: 'Uniswap', contract: '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984', decimals: 18 },
+    { symbol: 'WBTC', name: 'Wrapped BTC', contract: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', decimals: 8 },
+  ],
+  bsc: [
+    { symbol: 'USDT', name: 'Tether USD (BSC)', contract: '0x55d398326f99059fF775485246999027B3197955', decimals: 18 },
+    { symbol: 'USDC', name: 'USD Coin (BSC)', contract: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', decimals: 18 },
+    { symbol: 'CAKE', name: 'PancakeSwap (BSC)', contract: '0x0E09FaBB73BD3aDE0a17ECC321fD13a19e81cE82', decimals: 18 },
+    { symbol: 'ETH', name: 'Ethereum (Pegged)', contract: '0x2170Ed0880ac9A755fd29B2688956BD959F933F8', decimals: 18 },
+    { symbol: 'BTCB', name: 'Bitcoin (Pegged)', contract: '0x7130d2A12B9BCBFAe4f2634d864A1Ee1Ce3Ead9c', decimals: 18 },
+    { symbol: 'SHIB', name: 'Shiba Inu (BSC)', contract: '0x2859E4544C4aBb03966803b044A93563Bd2D0DD4', decimals: 18 },
+    { symbol: 'FLOKI', name: 'Floki (BSC)', contract: '0xfb5B838b6cfEEdC787076ac3c5d0Ea1cB70a018c', decimals: 9 },
+  ],
+  polygon: [
+    { symbol: 'USDC', name: 'USD Coin', contract: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', decimals: 6 },
+    { symbol: 'USDC.e', name: 'USD Coin (bridged)', contract: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', decimals: 6 },
+    { symbol: 'USDT', name: 'Tether USD (Polygon)', contract: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F', decimals: 6 },
+  ],
+  arbitrum: [
+    { symbol: 'USDC', name: 'USD Coin', contract: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', decimals: 6 },
+    { symbol: 'USDT', name: 'Tether USD (Arbitrum)', contract: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', decimals: 6 },
+  ],
+  base: [
+    { symbol: 'USDC', name: 'USD Coin', contract: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', decimals: 6 },
+    { symbol: 'TOSHI', name: 'Toshi (Base)', contract: '0x2f5dbf70521b4bc5ec81be0aac36f1e7a0e7c1ac', decimals: 9 },
+  ],
+  avalanche: [
+    { symbol: 'USDT', name: 'Tether USD (Avalanche)', contract: '0x9702230A8Ea53601f5cD2dc00fDBc13d4d449Faf', decimals: 6 },
+    { symbol: 'USDC.e', name: 'USD Coin (bridged)', contract: '0xA7D7079b0FEaD0F8028A7f440910011d9cF1aF0e', decimals: 6 },
+    { symbol: 'JOE', name: 'Trader Joe', contract: '0x6e84a6216eA6dACC71eE8E6b0a5B7A47B5A6786E', decimals: 18 },
+  ],
+  sonic: [
+    { symbol: 'S', name: 'Sonic (native bridged)', contract: '0x039e2fB6610e3298d0c1c252705555530e46752c', decimals: 18 },
+    { symbol: 'wS', name: 'Wrapped Sonic', contract: '0x549A6e4821e5b0BbE3A8f7f26bF4467A86f61D9D', decimals: 18 },
+  ],
+};
+
+/** Internal row with the token contract attached (for CoinGecko price fills). */
+interface EvmTokenRow extends BlockchainTokenBalance {
+  contract?: string;
+}
+
 async function fetchEvmBalances(
   network: BlockchainNetwork,
   address: string
 ): Promise<BlockchainTokenBalance[]> {
   const meta = NETWORKS[network];
-  const tokens: BlockchainTokenBalance[] = [];
-  let usedFallback = !meta.blockscout; // BSC has no public Blockscout
-
-  // ── primary: Blockscout (full ERC-20 discovery + USD prices) ──
+  const tokens: EvmTokenRow[] = [];
   let nativeQty = 0;
   let nativePrice = 0;
+  let discoveredAny = false;
+
+  // ── primary: Blockscout (full ERC-20 discovery + USD rates) ──
   if (meta.blockscout) {
     try {
       const addr = await fetchJson<BsAddress>(
@@ -607,43 +622,99 @@ async function fetchEvmBalances(
         if (!t.token || t.token.type !== 'ERC-20' || !t.value) continue;
         const qty = bigStrToNumber(t.value) / Math.pow(10, bigStrToNumber(t.token.decimals));
         if (!(qty > 0)) continue;
-        const rawPrice = parseFloat(t.token.exchange_rate ?? '') || 0;
-        // v1.4.17 — scam tokens report FAKE exchange_rates on explorers →
-        // absurd "$10^24" rows. No real single-position plausibly exceeds
-        // $50B — treat bigger products as unpriced (qty still shows).
-        const price = qty * rawPrice <= 50e9 ? rawPrice : 0;
+        let price = parseFloat(t.token.exchange_rate ?? '') || 0;
+        // v1.4.17 — blockscout's rate is UNRELIABLE for illiquid/spam tokens
+        // (a fake trillion-dollar row was observed in testing). A personal
+        // wallet never holds > $1T of one token — treat as unknown price.
+        if (qty * price > 1e12) price = 0;
         const symbol = (t.token.symbol ?? '?').toUpperCase();
         tokens.push({
           symbol,
           name: t.token.name ?? symbol,
-          kind: 'token',
+          kind: 'token' as const,
           qty,
           priceUsd: price,
           change24hPct: null,
           valueUsd: qty * price,
           binancePair: binancePairFor(symbol),
           network,
+          contract: t.token.address_hash?.toLowerCase(),
         });
       }
+      discoveredAny = true;
     } catch {
-      usedFallback = true;
+      discoveredAny = false;
     }
   }
 
-  // ── fallback: public RPC native + Multicall3 over a large token set ──
-  if (usedFallback) {
-    const rawBalance = await rpcCall<string>(meta.rpcs, 'eth_getBalance', [address, 'latest']);
-    nativeQty = numFromBigIntHex(rawBalance) / 1e18;
-    nativePrice = 0;
-    const set = await resolveErc20Set(network);
-    tokens.push(...(await multicallBalances(network, address, set)));
+  // ── universal: registry + Multicall3 (ALSO runs when Blockscout gave
+  // nothing, or on chains without a Blockscout — BSC/AVAX/Fantom/…).
+  // This is the v1.4.17 root fix for «X ارز نمایش داده نمی‌شود».
+  {
+    let registry = await getTokenRegistry(network).catch(() => [] as RegistryToken[]);
+    if (registry.length === 0) {
+      // last-resort curated set (tiny but famous contracts)
+      registry = (FALLBACK_EVM_TOKENS[network] ?? []).map((t) => ({
+        symbol: t.symbol,
+        name: t.name,
+        contract: t.contract,
+        decimals: t.decimals,
+      }));
+    }
+    if (registry.length > 0) {
+      const foundRaw = await multicallBalances(meta.rpcs, address, registry).catch(
+        () => new Map<string, bigint>()
+      );
+      const foundContracts: { token: RegistryToken; raw: bigint }[] = [];
+      for (const t of registry) {
+        const raw = foundRaw.get(t.contract.toLowerCase());
+        if (raw) foundContracts.push({ token: t, raw });
+      }
+      // CG prices by contract for the found tokens (fills non-Binance coins)
+      let cgPrices = new Map<string, { price: number; chg: number | null; id: string }>();
+      if (foundContracts.length > 0 && meta.cgPlatform) {
+        cgPrices = await cgTokenPrices(
+          meta.cgPlatform,
+          foundContracts.map((f) => f.token.contract)
+        ).catch(() => new Map<string, { price: number; chg: number | null; id: string }>());
+      }
+      for (const f of foundContracts) {
+        const sym = f.token.symbol.toUpperCase();
+        const qty = Number(f.raw) / Math.pow(10, f.token.decimals ?? 18);
+        if (!(qty > 0)) continue;
+        const cg = cgPrices.get(f.token.contract.toLowerCase());
+        tokens.push({
+          symbol: sym,
+          name: f.token.name ?? sym,
+          kind: 'token' as const,
+          qty,
+          priceUsd: cg?.price ?? 0,
+          change24hPct: cg?.chg ?? null,
+          valueUsd: cg ? qty * cg.price : 0,
+          binancePair: binancePairFor(sym),
+          coingeckoId: f.token.cgId ?? (cg?.id || undefined),
+          network,
+          contract: f.token.contract.toLowerCase(),
+        });
+      }
+    }
+
+    // native balance via RPC (covers no-Blockscout chains + cross-check)
+    if (!discoveredAny || nativeQty <= 0) {
+      try {
+        nativeQty =
+          bigStrToNumber(
+            await rpcCall<string>(meta.rpcs, 'eth_getBalance', [address, 'latest'])
+          ) / 1e18;
+      } catch {}
+    }
   }
 
   if (nativeQty > 0) {
     tokens.unshift({
       symbol: meta.native,
       name: `${meta.label} — ${meta.native}`,
-      kind: 'native',
+      kind: 'native' as const,
       qty: nativeQty,
       priceUsd: nativePrice,
       change24hPct: null,
@@ -653,44 +724,56 @@ async function fetchEvmBalances(
     });
   }
 
-  // Fill missing prices via Binance spot + futures (RPC fallback + zero-price rows)
+  // Fill missing prices: Binance spot → Binance futures → CoinGecko by
+  // contract → stable=$1. Rows with no price STAY (shown as «قیمت نامشخص»).
   await fillPricesFromBinance(tokens);
+  if (meta.cgPlatform) {
+    const orphans = tokens.filter((t) => t.priceUsd <= 0 && t.contract);
+    if (orphans.length > 0) {
+      const cg = await cgTokenPrices(
+        meta.cgPlatform,
+        orphans.map((t) => t.contract as string)
+      ).catch(() => new Map<string, { price: number; chg: number | null; id: string }>());
+      for (const t of orphans) {
+        const hit = cg.get((t.contract as string).toLowerCase());
+        if (hit && hit.price > 0) {
+          t.priceUsd = hit.price;
+          t.change24hPct = hit.chg;
+          t.valueUsd = t.qty * hit.price;
+          if (!t.coingeckoId && hit.id) t.coingeckoId = hit.id;
+        }
+      }
+    }
+  }
   return tokens;
 }
 
-// ---------------------------------------------------------------------------
-// Filecoin — 0x (FEVM) via eth_getBalance, f1/f3/f4 via Filecoin.WalletBalance
-// ---------------------------------------------------------------------------
-
-async function fetchFilecoinBalances(address: string): Promise<BlockchainTokenBalance[]> {
-  const meta = NETWORKS.filecoin;
-  const a = address.trim();
-  let qty = 0;
-  if (/^0x[0-9a-fA-F]{40}$/.test(a)) {
-    // FEVM address — same 0x form as other EVM chains (glif live-verified).
-    const raw = await rpcCall<string>(meta.rpcs, 'eth_getBalance', [a, 'latest']);
-    qty = numFromBigIntHex(raw) / 1e18;
-  } else {
-    // Native f1/f3/f4 — result is attoFIL as a decimal string.
-    const r = await rpcCall<string | number>(meta.rpcs, 'Filecoin.WalletBalance', [a]);
-    qty = bigStrToNumber(r) / 1e18;
+async function fillPricesFromBinance(tokens: BlockchainTokenBalance[]): Promise<void> {
+  const needMap = tokens.some((t) => t.priceUsd <= 0 || t.binancePair);
+  if (!needMap) return;
+  const { bySymbol } = await getBinancePriceMap().catch(() => ({
+    bySymbol: {} as Record<string, BinancePriceEntry>,
+  }));
+  for (const t of tokens) {
+    if (isStableSymbol(t.symbol) && t.priceUsd <= 0) {
+      t.priceUsd = 1;
+      t.change24hPct = 0;
+      t.valueUsd = t.qty;
+      continue;
+    }
+    // v1.4.17 — Binance is the REFERENCE price: it overrides explorer rates
+    // (spot AND futures) whenever the coin trades there; the explorer rate
+    // only survives for coins with no Binance listing. Fixes the fake
+    // trillion-dollar rows produced by illiquid tokens' exchange rates.
+    const hit = t.binancePair ? bySymbol[t.binancePair] : undefined;
+    if (hit && hit.price > 0) {
+      t.priceUsd = hit.price;
+      t.change24hPct = hit.chg;
+      t.valueUsd = t.qty * hit.price;
+      continue;
+    }
+    // no Binance price → keep the explorer/registry price if present (0 = unknown)
   }
-  const tokens: BlockchainTokenBalance[] = [];
-  if (qty > 0) {
-    tokens.push({
-      symbol: 'FIL',
-      name: 'فایل‌کوین',
-      kind: 'native',
-      qty,
-      priceUsd: 0,
-      change24hPct: null,
-      valueUsd: 0,
-      binancePair: 'FILUSDT',
-      network: 'filecoin',
-    });
-  }
-  await fillPricesFromBinance(tokens);
-  return tokens;
 }
 
 // ---------------------------------------------------------------------------
@@ -712,14 +795,11 @@ async function trc20Balance(ownerHex: string, token: Trc20Token): Promise<number
   );
   const raw = d.constant_result?.[0];
   if (!raw) return 0;
-  try {
-    return Number(BigInt('0x' + raw)) / Math.pow(10, token.decimals);
-  } catch {
-    return 0;
-  }
+  const n = parseInt(raw, 16);
+  return Number.isFinite(n) ? n / Math.pow(10, token.decimals) : 0;
 }
 
-async function fetchTronBalances(address: string): Promise<BlockchainTokenBalance[]> {
+async function fetchTronBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
   const ownerHex = tronHexAddress(address);
   if (!ownerHex) throw new Error('آدرس ترون نامعتبر است');
   const acct = await postJson<{ balance?: number }>(
@@ -732,13 +812,13 @@ async function fetchTronBalances(address: string): Promise<BlockchainTokenBalanc
     tokens.push({
       symbol: 'TRX',
       name: 'ترون',
-      kind: 'native',
+      kind: 'native' as const,
       qty: trxQty,
       priceUsd: 0,
       change24hPct: null,
       valueUsd: 0,
       binancePair: 'TRXUSDT',
-      network: 'tron',
+      network,
     });
   }
   const probes = await Promise.allSettled(CURATED_TRC20.map((t) => trc20Balance(ownerHex, t)));
@@ -748,13 +828,13 @@ async function fetchTronBalances(address: string): Promise<BlockchainTokenBalanc
     tokens.push({
       symbol: t.symbol,
       name: t.name,
-      kind: 'token',
+      kind: 'token' as const,
       qty: r.value,
       priceUsd: t.stable ? 1 : 0,
       change24hPct: t.stable ? 0 : null,
       valueUsd: t.stable ? r.value : 0,
       binancePair: binancePairFor(t.symbol),
-      network: 'tron',
+      network,
     });
   });
   await fillPricesFromBinance(tokens);
@@ -762,52 +842,10 @@ async function fetchTronBalances(address: string): Promise<BlockchainTokenBalanc
 }
 
 // ---------------------------------------------------------------------------
-// Bitcoin — UTXO sum
+// Solana — SOL + SPL discovery (Jupiter → DexScreener prices)
 // ---------------------------------------------------------------------------
 
-async function fetchBitcoinBalances(address: string): Promise<BlockchainTokenBalance[]> {
-  const hosts = ['https://mempool.space/api', 'https://blockstream.info/api'];
-  let lastErr: unknown = null;
-  for (const host of hosts) {
-    try {
-      const d = await fetchJson<{
-        chain_stats: { funded_txo_sum: number; spent_txo_sum: number };
-        mempool_stats: { funded_txo_sum: number; spent_txo_sum: number };
-      }>(`${host}/address/${address}`);
-      const sats =
-        d.chain_stats.funded_txo_sum -
-        d.chain_stats.spent_txo_sum +
-        d.mempool_stats.funded_txo_sum -
-        d.mempool_stats.spent_txo_sum;
-      const qty = sats / 1e8;
-      if (qty <= 0) return [];
-      const tokens: BlockchainTokenBalance[] = [
-        {
-          symbol: 'BTC',
-          name: 'بیت‌کوین',
-          kind: 'native',
-          qty,
-          priceUsd: 0,
-          change24hPct: null,
-          valueUsd: 0,
-          binancePair: 'BTCUSDT',
-          network: 'bitcoin',
-        },
-      ];
-      await fillPricesFromBinance(tokens);
-      return tokens;
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr ?? new Error('دریافت موجودی بیت‌کوین ناموفق بود');
-}
-
-// ---------------------------------------------------------------------------
-// Solana — SOL + SPL token accounts + Jupiter prices
-// ---------------------------------------------------------------------------
-
-async function fetchSolanaBalances(address: string): Promise<BlockchainTokenBalance[]> {
+async function fetchSolanaBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
   const tokens: BlockchainTokenBalance[] = [];
   const rpcs = NETWORKS.solana.rpcs;
   const call = <T>(method: string, params: unknown[]): Promise<T> =>
@@ -836,17 +874,16 @@ async function fetchSolanaBalances(address: string): Promise<BlockchainTokenBala
     tokens.push({
       symbol: 'SOL',
       name: 'سولانا',
-      kind: 'native',
+      kind: 'native' as const,
       qty: solQty,
       priceUsd: 0,
       change24hPct: null,
       valueUsd: 0,
       binancePair: 'SOLUSDT',
-      network: 'solana',
+      network,
     });
   }
 
-  // SPL token accounts (full discovery)
   try {
     const accounts = await call<{
       value: {
@@ -857,45 +894,53 @@ async function fetchSolanaBalances(address: string): Promise<BlockchainTokenBala
       { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
       { encoding: 'jsonParsed' },
     ]);
-    const spl = accounts?.value ?? [];
-    const withBalance = spl
+    const spl = (accounts?.value ?? [])
       .map((a) => ({
         mint: a.account.data.parsed.info.mint,
         qty: a.account.data.parsed.info.tokenAmount.uiAmount ?? 0,
       }))
       .filter((x) => x.qty > 0);
-    if (withBalance.length > 0) {
-      // Jupiter price v3 by mint (keyless, includes 24h change)
+    if (spl.length > 0) {
+      // v1.4.17 — Jupiter primary, DexScreener fallback (same mint set)
+      let priceMap: Record<string, { usdPrice?: number; priceChange24h?: number | null }> = {};
       try {
-        const jup = await fetchJson<Record<string, { usdPrice?: number; priceChange24h?: number }>>(
-          `https://lite-api.jup.ag/price/v3?ids=${withBalance.map((x) => x.mint).join(',')}`
+        priceMap = await fetchJson<Record<string, { usdPrice?: number; priceChange24h?: number }>>(
+          `https://lite-api.jup.ag/price/v3?ids=${spl.map((x) => x.mint).join(',')}`
         );
-        for (const x of withBalance) {
-          const price = jup[x.mint]?.usdPrice ?? 0;
-          tokens.push({
-            symbol: mintSymbol(x.mint),
-            name: mintSymbol(x.mint),
-            kind: 'token',
-            qty: x.qty,
-            priceUsd: price,
-            change24hPct: jup[x.mint]?.priceChange24h ?? null,
-            valueUsd: x.qty * price,
-            network: 'solana',
-          });
-        }
-      } catch {
-        for (const x of withBalance) {
-          tokens.push({
-            symbol: mintSymbol(x.mint),
-            name: mintSymbol(x.mint),
-            kind: 'token',
-            qty: x.qty,
-            priceUsd: 0,
-            change24hPct: null,
-            valueUsd: 0,
-            network: 'solana',
-          });
-        }
+      } catch {}
+      const missingForDs = spl.filter((x) => !priceMap[x.mint]?.usdPrice);
+      if (missingForDs.length > 0) {
+        try {
+          const ds = await fetchJson<{ pairs?: { baseToken?: { address?: string }; priceUsd?: string; priceChange?: { h24?: number } }[] }>(
+            `https://api.dexscreener.com/latest/dex/tokens/${missingForDs.map((x) => x.mint).join(',')}`
+          );
+          for (const p of ds?.pairs ?? []) {
+            const mint = p.baseToken?.address;
+            if (!mint) continue;
+            const price = parseFloat(p.priceUsd ?? '');
+            if (Number.isFinite(price) && price > 0 && !priceMap[mint]) {
+              priceMap[mint] = {
+                usdPrice: price,
+                priceChange24h: p.priceChange?.h24 ?? null,
+              };
+            }
+          }
+        } catch {}
+      }
+      for (const x of spl) {
+        const price = priceMap[x.mint]?.usdPrice ?? 0;
+        const symbol = mintSymbol(x.mint);
+        tokens.push({
+          symbol,
+          name: symbol,
+          kind: 'token' as const,
+          qty: x.qty,
+          priceUsd: price,
+          change24hPct: priceMap[x.mint]?.priceChange24h ?? null,
+          valueUsd: x.qty * price,
+          binancePair: binancePairFor(symbol),
+          network,
+        });
       }
     }
   } catch {
@@ -906,80 +951,812 @@ async function fetchSolanaBalances(address: string): Promise<BlockchainTokenBala
   return tokens;
 }
 
-/** Well-known Solana mints → symbol (Jupiter prices are keyed by mint). */
+/** Well-known Solana mints → symbol (prices keyed by mint). */
 const KNOWN_MINTS: Record<string, string> = {
   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
   'Es9vMFrzaCERMLJz2bZhufEhZLXBAPhbhcTXt4y2zKdd': 'USDT',
-  'So11111111111111111111111111111111111111112': 'WSOL',
+  'So11111111111111111111111111111111111111112': 'SOL',
   'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN': 'JUP',
   'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263': 'BONK',
-  '85VBFQZC9TZKEktBGjDZM1thZccqPzftMZQPx6UkyUat': 'WIF',
+  '85VBFQZC9TZKEktBGjDZM1thZccqulu6o3dyiDrcC4US': 'WIF',
+  'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm': 'USDC',
   'J1tigo1qU4of4uLQaGE8y3vjgapYgBLptDLtDypqulN': 'JTO',
   'EwjBaeR7WMw7GhERv9Bh1n6tY3sWw6MDrBS3JcZKrfU': 'PYTH',
+  '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr': 'POPCAT',
+  '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump': 'GOAT',
+  '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU': 'PONKE',
 };
 
 function mintSymbol(mint: string): string {
-  const s = KNOWN_MINTS[mint];
-  if (s) return s;
-  if (mint === 'So11111111111111111111111111111111111111112') return 'WSOL';
-  return `${mint.slice(0, 4)}…${mint.slice(-4)}`;
+  return (
+    KNOWN_MINTS[mint] ??
+    (mint === 'So11111111111111111111111111111111111111112' ? 'SOL' : `${mint.slice(0, 4)}…${mint.slice(-4)}`)
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Public entry — fetch ONE wallet across ALL of its selected networks
+// TON — tonapi.io v2 (Tonkeeper / Trust / MyTonWallet addresses)
 // ---------------------------------------------------------------------------
 
-const NETWORK_FETCHERS: Record<BlockchainNetwork, (a: string) => Promise<BlockchainTokenBalance[]>> = {
-  ethereum: (a) => fetchEvmBalances('ethereum', a),
-  bsc: (a) => fetchEvmBalances('bsc', a),
-  polygon: (a) => fetchEvmBalances('polygon', a),
-  arbitrum: (a) => fetchEvmBalances('arbitrum', a),
-  base: (a) => fetchEvmBalances('base', a),
-  filecoin: fetchFilecoinBalances,
-  tron: fetchTronBalances,
-  bitcoin: fetchBitcoinBalances,
-  solana: fetchSolanaBalances,
-};
+async function fetchTonBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const tokens: BlockchainTokenBalance[] = [];
+  let nativeNano: number | null = null;
 
-export async function fetchBlockchainWalletData(wallet: BlockchainWallet): Promise<BlockchainWalletData> {
-  const address = wallet.address.trim();
-  // v1.4.17 — read the SAME address on EVERY selected network in parallel.
-  const results = await Promise.allSettled(
-    wallet.networks.map((n) => NETWORK_FETCHERS[n](address))
+  // tonapi v2 (user-friendly EQ/UQ or raw)
+  try {
+    const acc = await fetchJson<{ balance?: string | number }>(
+      `https://tonapi.io/v2/accounts/${encodeURIComponent(address)}`
+    );
+    nativeNano = bigStrToNumber(acc?.balance);
+  } catch {}
+
+  // toncenter fallback (raw or user-friendly)
+  if (nativeNano === null || nativeNano === undefined) {
+    try {
+      const d = await fetchJson<{ result?: { balance?: string | number } }>(
+        `https://toncenter.com/api/v2/getExtendedAddressInformation?address=${encodeURIComponent(address)}`
+      );
+      nativeNano = bigStrToNumber(d?.result?.balance);
+    } catch {}
+  }
+
+  if (nativeNano && nativeNano > 0) {
+    tokens.push({
+      symbol: 'TON',
+      name: 'تون (The Open Network)',
+      kind: 'native' as const,
+      qty: nativeNano / 1e9,
+      priceUsd: 0,
+      change24hPct: null,
+      valueUsd: 0,
+      binancePair: 'TONUSDT',
+      network,
+    });
+  }
+
+  // jettons (TON's fungible tokens) — full discovery via tonapi
+  try {
+    const jets = await fetchJson<{
+      balances?: {
+        balance: string | number;
+        jetton?: { symbol?: string; name?: string; decimals?: number | string; address?: string };
+      }[];
+    }>(`https://tonapi.io/v2/accounts/${encodeURIComponent(address)}/jettons`);
+    for (const j of jets?.balances ?? []) {
+      const sym = (j.jetton?.symbol ?? '?').toUpperCase();
+      const dec = bigStrToNumber(j.jetton?.decimals ?? 9) || 9;
+      const qty = bigStrToNumber(j.balance) / Math.pow(10, dec);
+      if (!(qty > 0)) continue;
+      tokens.push({
+        symbol: sym,
+        name: j.jetton?.name ?? sym,
+        kind: 'token' as const,
+        qty,
+        priceUsd: isStableSymbol(sym) ? 1 : 0,
+        change24hPct: isStableSymbol(sym) ? 0 : null,
+        valueUsd: isStableSymbol(sym) ? qty : 0,
+        binancePair: binancePairFor(sym),
+        network,
+      });
+    }
+  } catch {}
+
+  await fillPricesFromBinance(tokens);
+  return tokens;
+}
+
+// ---------------------------------------------------------------------------
+// UTXO family — Bitcoin / Litecoin / Dogecoin / BCH
+// ---------------------------------------------------------------------------
+
+interface UtxoAddrStats {
+  chain_stats: { funded_txo_sum: number; spent_txo_sum: number };
+  mempool_stats: { funded_txo_sum: number; spent_txo_sum: number };
+}
+
+async function fetchMempoolStyle(
+  hosts: string[],
+  address: string,
+  symbol: string,
+  faName: string,
+  network: BlockchainNetwork,
+  decimals: number
+): Promise<BlockchainTokenBalance[]> {
+  let lastErr: unknown = null;
+  for (const host of hosts) {
+    try {
+      const d = await fetchJson<UtxoAddrStats>(`${host}/address/${encodeURIComponent(address)}`);
+      const raw =
+        d.chain_stats.funded_txo_sum -
+        d.chain_stats.spent_txo_sum +
+        d.mempool_stats.funded_txo_sum -
+        d.mempool_stats.spent_txo_sum;
+      const qty = raw / Math.pow(10, decimals);
+      if (qty <= 0) return [];
+      return [
+        {
+          symbol,
+          name: faName,
+          kind: 'native' as const,
+          qty,
+          priceUsd: 0,
+          change24hPct: null,
+          valueUsd: 0,
+          binancePair: `${symbol}USDT`,
+          network,
+        },
+      ];
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr ?? new Error(`دریافت موجودی ${faName} ناموفق بود`);
+}
+
+async function fetchBitcoinBalances(network: BlockchainNetwork, address: string) {
+  return fetchMempoolStyle(
+    ['https://mempool.space/api', 'https://blockstream.info/api'],
+    address, 'BTC', 'بیت‌کوین', network, 8
+  );
+}
+
+async function fetchLitecoinBalances(network: BlockchainNetwork, address: string) {
+  return fetchMempoolStyle(
+    ['https://litecoin.space/api', 'https://blockstream.info/api'],
+    address, 'LTC', 'لایت‌کوین', network, 8
+  ).catch(async () => {
+    // blockchair fallback
+    const d = await fetchJson<{ data?: Record<string, { address?: { balance?: number } }> }>(
+      `https://api.blockchair.com/litecoin/dashboards/address/${encodeURIComponent(address)}`
+    );
+    const sats = d?.data?.[address]?.address?.balance ?? 0;
+    if (!(sats > 0)) return [] as BlockchainTokenBalance[];
+    return [
+      {
+        symbol: 'LTC', name: 'لایت‌کوین', kind: 'native' as const,
+        qty: sats / 1e8, priceUsd: 0, change24hPct: null, valueUsd: 0,
+        binancePair: 'LTCUSDT', network,
+      },
+    ];
+  });
+}
+
+async function fetchDogecoinBalances(network: BlockchainNetwork, address: string) {
+  const d = await fetchJson<{ balance?: number | string }>(
+    `https://dogechain.info/api/v1/address/balance/${encodeURIComponent(address)}`
+  );
+  const qty = bigStrToNumber(d?.balance);
+  if (!(qty > 0)) return [] as BlockchainTokenBalance[];
+  return [
+    {
+      symbol: 'DOGE', name: 'دوج‌کوین', kind: 'native' as const,
+      qty, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'DOGEUSDT', network,
+    },
+  ];
+}
+
+async function fetchBchBalances(network: BlockchainNetwork, address: string) {
+  const d = await fetchJson<{ data?: Record<string, { address?: { balance?: number } }> }>(
+    `https://api.blockchair.com/bitcoin-cash/dashboards/address/${encodeURIComponent(address.replace(/^bitcoincash:/i, ''))}`
+  );
+  const sats = d?.data?.[address]?.address?.balance ?? d?.data?.[address.replace(/^bitcoincash:/i, '')]?.address?.balance ?? 0;
+  if (!(sats > 0)) return [] as BlockchainTokenBalance[];
+  return [
+    {
+      symbol: 'BCH', name: 'بیت‌کوین کش', kind: 'native' as const,
+      qty: sats / 1e8, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'BCHUSDT', network,
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// XRP / Stellar / Algorand / Tezos / MultiversX / Cosmos / Cardano
+// ---------------------------------------------------------------------------
+
+async function fetchXrpBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const d = await postJson<{ result?: { account_data?: { Balance?: string } } }>(
+    'https://xrplcluster.com',
+    { method: 'account_info', params: [{ account: address, ledger_index: 'validated' }] }
+  );
+  const drops = bigStrToNumber(d?.result?.account_data?.Balance);
+  if (!(drops > 0)) return [];
+  return [
+    {
+      symbol: 'XRP', name: 'ریپل', kind: 'native' as const,
+      qty: drops / 1e6, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'XRPUSDT', network,
+    },
+  ];
+}
+
+async function fetchStellarBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const d = await fetchJson<{
+    balances?: { asset_type: string; asset_code?: string; balance: string }[];
+  }>(`https://horizon.stellar.org/accounts/${encodeURIComponent(address)}`);
+  const tokens: BlockchainTokenBalance[] = [];
+  for (const b of d?.balances ?? []) {
+    const qty = parseFloat(b.balance ?? '');
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+    const isNative = b.asset_type === 'native';
+    const symbol = isNative ? 'XLM' : (b.asset_code ?? '?').toUpperCase();
+    tokens.push({
+      symbol,
+      name: isNative ? 'استلار' : `${symbol} (Stellar)`,
+      kind: isNative ? 'native' : 'token',
+      qty,
+      priceUsd: isStableSymbol(symbol) ? 1 : 0,
+      change24hPct: isStableSymbol(symbol) ? 0 : null,
+      valueUsd: isStableSymbol(symbol) ? qty : 0,
+      binancePair: binancePairFor(symbol),
+      network,
+    });
+  }
+  await fillPricesFromBinance(tokens);
+  return tokens;
+}
+
+async function fetchAlgorandBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const d = await fetchJson<{
+    amount?: number;
+    'min-balance'?: number;
+    assets?: { 'asset-id': number; amount: number; decimals?: number; 'unit-name'?: string; name?: string }[];
+  }>(`https://mainnet-api.algonode.cloud/v2/accounts/${encodeURIComponent(address)}`);
+  const tokens: BlockchainTokenBalance[] = [];
+  const algoQty = ((d?.amount ?? 0) - (d?.['min-balance'] ?? 0)) / 1e6;
+  if (algoQty > 0) {
+    tokens.push({
+      symbol: 'ALGO', name: 'الگورند', kind: 'native' as const,
+      qty: algoQty, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'ALGOUSDT', network,
+    });
+  }
+  for (const a of d?.assets ?? []) {
+    const dec = a.decimals ?? 0;
+    const qty = a.amount / Math.pow(10, dec);
+    if (!(qty > 0)) continue;
+    const symbol = (a['unit-name'] ?? a.name ?? `ASA${a['asset-id']}`).toUpperCase();
+    tokens.push({
+      symbol: symbol.slice(0, 12),
+      name: a.name ?? symbol,
+      kind: 'token' as const,
+      qty,
+      priceUsd: isStableSymbol(symbol) ? 1 : 0,
+      change24hPct: isStableSymbol(symbol) ? 0 : null,
+      valueUsd: isStableSymbol(symbol) ? qty : 0,
+      binancePair: binancePairFor(symbol),
+      network,
+    });
+  }
+  await fillPricesFromBinance(tokens);
+  return tokens;
+}
+
+async function fetchTezosBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const acct = await fetchJson<{ balance?: number | string }>(
+    `https://api.tzkt.io/v1/accounts/${encodeURIComponent(address)}`
   );
   const tokens: BlockchainTokenBalance[] = [];
-  const failedLabels: string[] = [];
-  results.forEach((r, i) => {
-    if (r.status === 'fulfilled') {
-      for (const t of r.value) {
-        tokens.push({ ...t, network: t.network ?? wallet.networks[i] });
-      }
-    } else {
-      failedLabels.push(NETWORKS[wallet.networks[i]].label);
+  const xtzQty = bigStrToNumber(acct?.balance) / 1e6;
+  if (xtzQty > 0) {
+    tokens.push({
+      symbol: 'XTZ', name: 'تزوس', kind: 'native' as const,
+      qty: xtzQty, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'XTZUSDT', network,
+    });
+  }
+  try {
+    const list = await fetchJson<{
+      token?: { symbol?: string; name?: string; decimals?: number };
+      balance: string | number;
+    }[]>(`https://api.tzkt.io/v1/tokens/balances?account=${encodeURIComponent(address)}&limit=100`);
+    for (const t of list ?? []) {
+      const sym = (t.token?.symbol ?? '?').toUpperCase();
+      const dec = bigStrToNumber(t.token?.decimals ?? 0);
+      const qty = bigStrToNumber(t.balance) / Math.pow(10, dec || 0);
+      if (!(qty > 0)) continue;
+      tokens.push({
+        symbol: sym.slice(0, 12),
+        name: t.token?.name ?? sym,
+        kind: 'token' as const,
+        qty,
+        priceUsd: isStableSymbol(sym) ? 1 : 0,
+        change24hPct: isStableSymbol(sym) ? 0 : null,
+        valueUsd: isStableSymbol(sym) ? qty : 0,
+        binancePair: binancePairFor(sym),
+        network,
+      });
     }
+  } catch {}
+  await fillPricesFromBinance(tokens);
+  return tokens;
+}
+
+async function fetchMultiversxBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const acct = await fetchJson<{ balance?: string }>(
+    `https://api.multiversx.com/accounts/${encodeURIComponent(address)}`
+  );
+  const tokens: BlockchainTokenBalance[] = [];
+  const egldQty = bigStrToNumber(acct?.balance) / 1e18;
+  if (egldQty > 0) {
+    tokens.push({
+      symbol: 'EGLD', name: 'مالتی‌ورس‌ایکس', kind: 'native' as const,
+      qty: egldQty, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'EGLDUSDT', network,
+    });
+  }
+  try {
+    const list = await fetchJson<{
+      symbol?: string; name?: string; decimals?: number; balance?: string;
+    }[]>(`https://api.multiversx.com/accounts/${encodeURIComponent(address)}/tokens`);
+    for (const t of list ?? []) {
+      const sym = (t.symbol ?? '?').toUpperCase();
+      const qty = bigStrToNumber(t.balance) / Math.pow(10, bigStrToNumber(t.decimals ?? 18));
+      if (!(qty > 0)) continue;
+      tokens.push({
+        symbol: sym.slice(0, 12),
+        name: t.name ?? sym,
+        kind: 'token' as const,
+        qty,
+        priceUsd: isStableSymbol(sym) ? 1 : 0,
+        change24hPct: isStableSymbol(sym) ? 0 : null,
+        valueUsd: isStableSymbol(sym) ? qty : 0,
+        binancePair: binancePairFor(sym),
+        network,
+      });
+    }
+  } catch {}
+  await fillPricesFromBinance(tokens);
+  return tokens;
+}
+
+async function fetchCosmosBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const d = await fetchJson<{ balances?: { denom: string; amount: string | number }[] }>(
+    `https://cosmos-rest.publicnode.com/cosmos/bank/v1beta1/balances/${encodeURIComponent(address)}`
+  );
+  const tokens: BlockchainTokenBalance[] = [];
+  for (const b of d?.balances ?? []) {
+    const raw = bigStrToNumber(b.amount);
+    if (!(raw > 0)) continue;
+    if (b.denom === 'uatom') {
+      tokens.push({
+        symbol: 'ATOM', name: 'کازموس هاب', kind: 'native' as const,
+        qty: raw / 1e6, priceUsd: 0, change24hPct: null, valueUsd: 0,
+        binancePair: 'ATOMUSDT', network,
+      });
+    } else if (b.denom === 'uusd' || b.denom === 'uusdc') {
+      tokens.push({
+        symbol: 'USDC', name: 'USDC (Cosmos)', kind: 'token' as const,
+        qty: raw / 1e6, priceUsd: 1, change24hPct: 0, valueUsd: raw / 1e6,
+        network,
+      });
+    } else if (!b.denom.startsWith('ibc/')) {
+      tokens.push({
+        symbol: b.denom.toUpperCase().slice(0, 12),
+        name: `${b.denom} (Cosmos)`,
+        kind: 'token' as const,
+        qty: raw / 1e6, priceUsd: 0, change24hPct: null, valueUsd: 0,
+        network,
+      });
+    }
+  }
+  await fillPricesFromBinance(tokens);
+  return tokens;
+}
+
+async function fetchCardanoBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  // koios POST account_info — native lovelace (stake addresses AND payment
+  // addresses are accepted; empty result = nothing held)
+  const d = await postJson<{ status?: string; balance?: { amount?: string | number } }[]>(
+    'https://api.koios.rest/api/v1/account_info',
+    { _addresses: [address] }
+  );
+  const lovelace = bigStrToNumber(d?.[0]?.balance?.amount);
+  if (!(lovelace > 0)) return [];
+  return [
+    {
+      symbol: 'ADA', name: 'کاردانو', kind: 'native' as const,
+      qty: lovelace / 1e6, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'ADAUSDT', network,
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Near / Aptos / Sui / Hedera / Zilliqa / VeChain / Kaspa / Polkadot
+// ---------------------------------------------------------------------------
+
+async function fetchNearBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const named = /^[a-z0-9_-]/.test(address) && !address.startsWith('0x');
+  const d = await postJson<{ result?: { amount?: string } }>(
+    'https://rpc.mainnet.near.org',
+    {
+      jsonrpc: '2.0',
+      id: 'dontcare',
+      method: 'query',
+      params: named
+        ? { request_type: 'view_account', finality: 'final', account_id: address }
+        : {
+            request_type: 'view_account',
+            finality: 'final',
+            account_id: 'system',
+          },
+    }
+  );
+  // hex form is not supported by view_account directly — named accounts only
+  const yocto = bigStrToNumber(d?.result?.amount);
+  if (!(yocto > 0)) return [];
+  return [
+    {
+      symbol: 'NEAR', name: 'نیر پروتکل', kind: 'native' as const,
+      qty: yocto / 1e24, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'NEARUSDT', network,
+    },
+  ];
+}
+
+async function fetchAptosBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const d = await fetchJson<Record<string, unknown>[]>(
+    `https://fullnode.mainnet.aptoslabs.com/v1/accounts/${encodeURIComponent(address)}/resources`
+  );
+  const tokens: BlockchainTokenBalance[] = [];
+  for (const res of d ?? []) {
+    const type = String((res as { type?: string }).type ?? '');
+    const data = (res as { data?: Record<string, unknown> }).data ?? {};
+    // CoinStore<T> → { coin: { value: "123" } }
+    const m = /^0x[0-9a-fA-F]+::coin::CoinStore<(.+)>$/.exec(type);
+    if (!m) continue;
+    const coinType = m[1];
+    const value = bigStrToNumber((data.coin as { value?: string } | undefined)?.value);
+    if (!(value > 0)) continue;
+    const isApt = /aptos_coin::AptosCoin$/i.test(coinType);
+    const tail = coinType.split('::').pop() ?? '?';
+    const symbol = isApt ? 'APT' : tail.toUpperCase().slice(0, 12);
+    tokens.push({
+      symbol,
+      name: isApt ? 'آپتوس' : `${symbol} (Aptos)`,
+      kind: isApt ? 'native' : 'token',
+      qty: value,
+      priceUsd: isStableSymbol(symbol) ? 1 : 0,
+      change24hPct: isStableSymbol(symbol) ? 0 : null,
+      valueUsd: isStableSymbol(symbol) ? value : 0,
+      binancePair: binancePairFor(symbol),
+      network,
+    });
+  }
+  await fillPricesFromBinance(tokens);
+  return tokens;
+}
+
+async function fetchSuiBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const d = await postJson<{
+    data?: { owner?: { balances?: { edges?: { node?: { totalBalance?: string; coinType?: { repr?: string } } }[] } } };
+  }>('https://sui-mainnet.mystenlabs.com/graphql', {
+    query:
+      'query b($o: SuiAddress!) { owner(address: $o) { address balances { edges { node { coinObjectCount totalBalance coinType { repr } } } } } }',
+    variables: { o: address },
   });
-  // drop dust rows worth < $0.01 (Blockscout returns hundreds of spam tokens)
-  const visible = tokens
-    .filter((t) => t.qty > 0)
-    .filter((t) => (t.priceUsd > 0 ? t.valueUsd >= 0.01 : true))
+  const edges = d?.data?.owner?.balances?.edges ?? [];
+  const tokens: BlockchainTokenBalance[] = [];
+  for (const e of edges) {
+    const raw = bigStrToNumber(e?.node?.totalBalance);
+    if (!(raw > 0)) continue;
+    const repr = e?.node?.coinType?.repr ?? '';
+    const isSui = /::sui::SUI$/i.test(repr);
+    const tail = (repr.split('::').pop() ?? '?').toUpperCase().slice(0, 12);
+    const symbol = isSui ? 'SUI' : isStableSymbol(tail) ? tail : tail;
+    tokens.push({
+      symbol,
+      name: isSui ? 'سویی' : `${symbol} (Sui)`,
+      kind: isSui ? 'native' : 'token',
+      qty: isSui ? raw / 1e9 : raw,
+      priceUsd: isStableSymbol(symbol) ? 1 : 0,
+      change24hPct: isStableSymbol(symbol) ? 0 : null,
+      valueUsd: isStableSymbol(symbol) ? raw : 0,
+      binancePair: binancePairFor(symbol),
+      network,
+    });
+  }
+  await fillPricesFromBinance(tokens);
+  return tokens;
+}
+
+async function fetchHederaBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const acct = await fetchJson<{ balance?: { balance?: number | string } }>(
+    `https://mainnet-public.mirrornode.hedera.com/api/v1/accounts/${encodeURIComponent(address)}`
+  );
+  const tiny = bigStrToNumber(acct?.balance?.balance);
+  if (!(tiny > 0)) return [];
+  return [
+    {
+      symbol: 'HBAR', name: 'هدرا', kind: 'native' as const,
+      qty: tiny / 1e8, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'HBARUSDT', network,
+    },
+  ];
+}
+
+async function fetchZilliqaBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const base16 = zilliqaBase16(address) ?? address;
+  const d = await postJson<{ result?: { balance?: string } }>(
+    'https://api.zilliqa.com',
+    { id: 1, jsonrpc: '2.0', method: 'GetBalance', params: [base16.replace(/^0x/i, '')] }
+  );
+  const qa = bigStrToNumber(d?.result?.balance);
+  if (!(qa > 0)) return [];
+  return [
+    {
+      symbol: 'ZIL', name: 'زیلیکا', kind: 'native' as const,
+      qty: qa / 1e12, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'ZILUSDT', network,
+    },
+  ];
+}
+
+async function fetchVechainBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const d = await fetchJson<{ balance?: string }>(
+    `https://mainnet.veblocks.net/accounts/${encodeURIComponent(address)}`
+  );
+  const wei = bigStrToNumber(d?.balance);
+  if (!(wei > 0)) return [];
+  return [
+    {
+      symbol: 'VET', name: 'وی‌چین', kind: 'native' as const,
+      qty: wei / 1e18, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'VETUSDT', network,
+    },
+  ];
+}
+
+async function fetchKaspaBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const d = await fetchJson<{ balance?: number | string }>(
+    `https://api.kaspa.org/addresses/${encodeURIComponent(address)}/balance`
+  );
+  const sompi = bigStrToNumber(d?.balance);
+  if (!(sompi > 0)) return [];
+  return [
+    {
+      symbol: 'KAS', name: 'کسپا', kind: 'native' as const,
+      qty: sompi / 1e8, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'KASUSDT', network,
+    },
+  ];
+}
+
+async function fetchPolkadotBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const accountId = ss58Decode(address);
+  if (!accountId) throw new Error('آدرس پولکادات قابل رمزگشایی نیست');
+  const key = polkadotStorageKey(accountId);
+  const raw = await rpcCall<string | null>(['https://rpc.polkadot.io', 'https://polkadot.api.onfinality.io/public'], 'state_getStorage', [key]);
+  if (!raw || raw === '0x' || raw === 'null') {
+    return []; // account never used → zero balance is a VALID result
+  }
+  // SCALE AccountInfo: nonce u32, consumers u32, providers u32, sufficients u32
+  // (4 × 8 hex chars = 32 hex chars), then Data { free u128, reserved u128, … }
+  const hex = raw.replace(/^0x/i, '');
+  const readU128 = (off: number): number => {
+    const words = hex.slice(off, off + 32).match(/../g) ?? [];
+    return Number(BigInt('0x' + [...words].reverse().join('')));
+  };
+  const free = readU128(32);
+  const reserved = readU128(64);
+  const transferable = free + reserved;
+  if (!(transferable > 0)) return [];
+  return [
+    {
+      symbol: 'DOT', name: 'پولکادات', kind: 'native' as const,
+      qty: transferable / 1e10, priceUsd: 0, change24hPct: null, valueUsd: 0,
+      binancePair: 'DOTUSDT', network,
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Filecoin — f1/f3/f4/f0 (Trust Wallet) OR 0x FEVM addresses
+// ---------------------------------------------------------------------------
+
+const GLIF_RPC = 'https://api.node.glif.io/rpc/v1';
+
+/** f0/f1/f3/f4 → 0x FEVM form ('0x' + actor-ID padded to 20 bytes), else null. */
+async function filecoinToEvm(address: string): Promise<string | null> {
+  const a = address.trim();
+  if (/^0x[0-9a-fA-F]{40}$/.test(a)) return a;
+  let idAddress = a;
+  if (/^f[134][0-9a-zA-Z]+$/.test(a)) {
+    try {
+      const d = await postJson<{ result?: string }>(GLIF_RPC, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'Filecoin.StateLookupID',
+        params: [a, null],
+      });
+      if (d?.result) idAddress = d.result;
+    } catch {
+      return null;
+    }
+  }
+  const m = /^f0(\d+)$/.exec(idAddress);
+  if (!m) return null;
+  const id = BigInt(m[1]);
+  return '0x' + id.toString(16).padStart(40, '0');
+}
+
+async function fetchFilecoinBalances(network: BlockchainNetwork, address: string): Promise<BlockchainTokenBalance[]> {
+  const tokens: BlockchainTokenBalance[] = [];
+  let evmAddress: string | null = null;
+
+  // native FIL via StateGetActor (works for f1/f0/… forms)
+  try {
+    const d = await postJson<{ result?: { Balance?: string } }>(GLIF_RPC, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'Filecoin.StateGetActor',
+      params: [address.trim(), null],
+    });
+    const atto = bigStrToNumber(d?.result?.Balance);
+    if (atto > 0) {
+      tokens.push({
+        symbol: 'FIL', name: 'فایل‌کوین', kind: 'native' as const,
+        qty: atto / 1e18, priceUsd: 0, change24hPct: null, valueUsd: 0,
+        binancePair: 'FILUSDT', network,
+      });
+    }
+  } catch {}
+
+  // FEVM (0x) path — native + ERC-20 tokens via glif RPC + filecoin.blockscout
+  evmAddress = await filecoinToEvm(address);
+  if (evmAddress) {
+    try {
+      const evmTokens = await fetchEvmBalances('filecoin' as BlockchainNetwork, evmAddress);
+      for (const t of evmTokens) {
+        if (t.kind === 'native') continue; // already counted via StateGetActor (0x → skip double)
+        tokens.push(t);
+      }
+      // if the address is 0x-form, StateGetActor may fail — include native from EVM path
+      if (/^0x/.test(address.trim()) && !tokens.some((t) => t.symbol === 'FIL')) {
+        const native = evmTokens.find((t) => t.kind === 'native');
+        if (native) tokens.unshift({ ...native, symbol: 'FIL', binancePair: 'FILUSDT' });
+      }
+    } catch {}
+  }
+
+  await fillPricesFromBinance(tokens);
+  return tokens;
+}
+
+// ---------------------------------------------------------------------------
+// Public entry — fetch ONE wallet across ALL its selected networks
+// ---------------------------------------------------------------------------
+
+async function fetchNetworkBalances(
+  network: BlockchainNetwork,
+  address: string
+): Promise<BlockchainTokenBalance[]> {
+  if (isEvmNetwork(network)) return fetchEvmBalances(network, address);
+  switch (network) {
+    case 'filecoin': return fetchFilecoinBalances(network, address);
+    case 'tron': return fetchTronBalances(network, address);
+    case 'solana': return fetchSolanaBalances(network, address);
+    case 'ton': return fetchTonBalances(network, address);
+    case 'bitcoin': return fetchBitcoinBalances(network, address);
+    case 'litecoin': return fetchLitecoinBalances(network, address);
+    case 'dogecoin': return fetchDogecoinBalances(network, address);
+    case 'bitcoin-cash': return fetchBchBalances(network, address);
+    case 'xrp': return fetchXrpBalances(network, address);
+    case 'stellar': return fetchStellarBalances(network, address);
+    case 'algorand': return fetchAlgorandBalances(network, address);
+    case 'tezos': return fetchTezosBalances(network, address);
+    case 'multiversx': return fetchMultiversxBalances(network, address);
+    case 'cosmos': return fetchCosmosBalances(network, address);
+    case 'cardano': return fetchCardanoBalances(network, address);
+    case 'near': return fetchNearBalances(network, address);
+    case 'aptos': return fetchAptosBalances(network, address);
+    case 'sui': return fetchSuiBalances(network, address);
+    case 'hedera': return fetchHederaBalances(network, address);
+    case 'zilliqa': return fetchZilliqaBalances(network, address);
+    case 'vechain': return fetchVechainBalances(network, address);
+    case 'kaspa': return fetchKaspaBalances(network, address);
+    case 'polkadot': return fetchPolkadotBalances(network, address);
+  }
+  return [];
+}
+
+const NETWORK_FETCH_CONCURRENCY = 4;
+
+/**
+ * Reads one wallet on every selected network (EVM networks share the 0x
+ * address; each independent network uses its own address form). Merges rows
+ * by symbol, keeps unknown-price rows VISIBLE (v1.4.17 — user demand), and
+ * writes the balance snapshot cache.
+ */
+export async function fetchBlockchainWalletData(wallet: BlockchainWallet): Promise<BlockchainWalletData> {
+  const networks = wallet.networks.length > 0 ? wallet.networks : (['ethereum'] as BlockchainNetwork[]);
+  const address = wallet.address.trim();
+  const notices: string[] = [];
+  const collected: BlockchainTokenBalance[] = [];
+
+  // small concurrency pool across networks (one EVM registry fetch is shared)
+  let cursor = 0;
+  async function worker(): Promise<void> {
+    while (cursor < networks.length) {
+      const idx = cursor++;
+      const net = networks[idx];
+      try {
+        const rows = await fetchNetworkBalances(net, address);
+        collected.push(...rows);
+      } catch (e) {
+        notices.push(`${NETWORKS[net].label}: دریافت ناموفق (${e instanceof Error ? e.message.slice(0, 60) : 'خطا'})`);
+      }
+    }
+  }
+  await Promise.all(
+    new Array(Math.min(NETWORK_FETCH_CONCURRENCY, networks.length)).fill(0).map(() => worker())
+  );
+
+  // merge rows with the same symbol (same asset on several networks, e.g.
+  // USDT on Ethereum + BSC + Tron in one multi-network wallet)
+  const merged = new Map<string, BlockchainTokenBalance>();
+  for (const t of collected) {
+    const key = t.symbol.toUpperCase();
+    const existing = merged.get(key);
+    if (existing) {
+      existing.qty += t.qty;
+      existing.valueUsd += t.valueUsd;
+      if (existing.priceUsd <= 0 && t.priceUsd > 0) {
+        existing.priceUsd = t.priceUsd;
+        existing.change24hPct = t.change24hPct;
+      }
+      if (!existing.network && t.network) existing.network = t.network;
+    } else {
+      merged.set(key, { ...t });
+    }
+  }
+
+  // v1.4.17 — sanity cap: spam/airdrop tokens carry absurd supplies and fake
+  // prices (a trillion-dollar row was observed in live testing). A personal
+  // wallet NEVER holds > $1B of one token — such rows lose their price and
+  // fall back to «قیمت نامشخص» (the row itself stays visible).
+  for (const t of merged.values()) {
+    if (t.priceUsd > 0 && t.qty * t.priceUsd > 1e9) {
+      t.priceUsd = 0;
+      t.change24hPct = null;
+      t.valueUsd = 0;
+    }
+  }
+
+  // dust filter: drop rows worth < $0.01 ONLY when their price is KNOWN;
+  // unknown-price rows stay visible (max 15 of them) — «فلان ارز نمایش
+  // داده نمی‌شود» is exactly what v1.4.17 must never do again.
+  const known = [...merged.values()]
+    .filter((t) => t.priceUsd > 0)
+    .filter((t) => t.valueUsd >= 0.01);
+  const unknown = [...merged.values()]
+    .filter((t) => t.priceUsd <= 0 && t.qty > 0)
+    .sort((a, b) => b.qty - a.qty)
+    .slice(0, 15);
+
+  const tokens = [...known, ...unknown]
     .sort((a, b) => b.valueUsd - a.valueUsd)
-    .slice(0, 120);
-  const totalUsd = visible.reduce((s, t) => s + (Number.isFinite(t.valueUsd) ? t.valueUsd : 0), 0);
+    .slice(0, 60);
+
+  const totalUsd = tokens.reduce((s, t) => s + (Number.isFinite(t.valueUsd) ? t.valueUsd : 0), 0);
   const data: BlockchainWalletData = {
     walletId: wallet.id,
-    tokens: visible,
+    tokens,
     totalUsd,
     fetchedAt: Date.now(),
+    notice: notices.length > 0 ? notices.join(' • ') : undefined,
   };
-  if (failedLabels.length > 0) {
-    data.notice = `خواندن شبکه‌های ${failedLabels.join('، ')} موفق نشد — با «تازه‌سازی» دوباره تلاش می‌شود`;
-  }
   await writeBlockchainBalanceCache(data);
   return data;
 }
 
 // ---------------------------------------------------------------------------
-// PnL — current holdings × historical prices (۷/۳۰/۹۰/۱۸۰ روز)
+// PnL — per-WALLET and per-token market change over ۷/۳۰/۹۰/۱۸۰ days
+// v1.4.17: three levels — total (all wallets), per wallet (one line), and
+// per token inside each wallet. Binance klines for Binance coins, CoinGecko
+// market_chart for CG-known tokens (TOSHI, MOONKIN-style coverage).
 // ---------------------------------------------------------------------------
 
 export const PNL_PERIODS = [7, 30, 90, 180] as const;
@@ -1003,46 +1780,63 @@ export interface BlockchainPnlPeriod {
 
 export interface BlockchainPnlSummary {
   byPeriod: Record<number, BlockchainPnlPeriod>;
+  /** v1.4.17 — per-wallet breakdown (the one-line PnL under each wallet). */
+  perWallet: Record<string, Record<number, BlockchainPnlPeriod>>;
   fetchedAt: number;
 }
 
 const klineCache = new Map<string, { at: number; closes: { t: number; c: number }[] }>();
 const KLINE_TTL = 10 * 60_000;
 
-/**
- * Daily closes for a Binance pair covering the last ~185 days (1 call).
- * Spot klines first; futures-only coins (POPCAT…) fall back to fapi klines.
- */
+const BINANCE_KLINE_HOSTS = ['https://data-api.binance.vision', 'https://api.binance.com'];
+
+/** Daily closes for a Binance pair covering the last ~185 days (1 call). */
 async function fetchDailyCloses(pair: string): Promise<{ t: number; c: number }[]> {
   const cached = klineCache.get(pair);
   if (cached && Date.now() - cached.at < KLINE_TTL) return cached.closes;
   const start = Date.now() - 186 * 86_400_000;
-  const parse = (k: unknown[][]) =>
-    k.map((c) => ({ t: Number(c[0]), c: parseFloat(String(c[4])) }));
   let lastErr: unknown = null;
-  for (const host of BINANCE_HOSTS) {
+  for (const host of BINANCE_KLINE_HOSTS) {
     try {
       const k = await fetchJson<unknown[][]>(
         `${host}/api/v3/klines?symbol=${pair}&interval=1d&startTime=${start}&limit=1000`
       );
-      const closes = parse(k);
+      const closes = k.map((c) => ({ t: Number(c[0]), c: parseFloat(String(c[4])) }));
       klineCache.set(pair, { at: Date.now(), closes });
       return closes;
     } catch (e) {
       lastErr = e;
     }
   }
-  // futures klines (coin has no spot pair)
-  try {
-    const k = await fetchJson<unknown[][]>(
-      `${FAPI_HOST}/fapi/v1/klines?symbol=${pair}&interval=1d&startTime=${start}&limit=1000`
-    );
-    const closes = parse(k);
-    klineCache.set(pair, { at: Date.now(), closes });
-    return closes;
-  } catch (e) {
-    throw lastErr ?? e;
+  throw lastErr ?? new Error('klines ناموفق');
+}
+
+/** v1.4.17 — CoinGecko daily closes (days=180; free API auto-daily >90d). */
+const cgKlineCache = new Map<string, { at: number; closes: { t: number; c: number }[] }>();
+async function fetchCgCloses(cgId: string): Promise<{ t: number; c: number }[]> {
+  const cached = cgKlineCache.get(cgId);
+  if (cached && Date.now() - cached.at < KLINE_TTL) return cached.closes;
+  const d = await fetchJson<{ prices?: [number, number][] }>(
+    `https://api.coingecko.com/api/v3/coins/${cgId}/market_chart?days=180`
+  );
+  const closes = (d?.prices ?? []).map(([t, p]) => ({ t, c: p }));
+  cgKlineCache.set(cgId, { at: Date.now(), closes });
+  return closes;
+}
+
+/** CG id lookup by symbol for tokens that carry no id (best-effort, cached). */
+let cgSymbolIndex: { at: number; map: Map<string, string> } | null = null;
+async function cgIdForSymbol(symbol: string): Promise<string | undefined> {
+  if (!cgSymbolIndex || Date.now() - cgSymbolIndex.at > REGISTRY_TTL) {
+    const coins = await fetchCgCoins().catch(() => null);
+    const map = new Map<string, string>();
+    for (const c of coins ?? []) {
+      const s = (c.symbol ?? '').toUpperCase();
+      if (s && !map.has(s)) map.set(s, c.id);
+    }
+    cgSymbolIndex = { at: Date.now(), map };
   }
+  return cgSymbolIndex.map.get(symbol.toUpperCase());
 }
 
 function closeAtOrBefore(series: { t: number; c: number }[], target: number): number | null {
@@ -1058,84 +1852,157 @@ function closeAtOrBefore(series: { t: number; c: number }[], target: number): nu
   return series[lo].c;
 }
 
+interface PnlEntry {
+  key: string;
+  symbol: string;
+  qty: number;
+  pair?: string;
+  cgId?: string;
+  stable: boolean;
+}
+
+/** Aggregate a wallet's holdings into price-source-keyed entries. */
+function aggregateEntries(
+  wallets: BlockchainWallet[],
+  balanceByWallet: Record<string, BlockchainWalletData | undefined>,
+  onlyWalletId?: string
+): Map<string, PnlEntry> {
+  const agg = new Map<string, PnlEntry>();
+  for (const w of wallets) {
+    if (onlyWalletId && w.id !== onlyWalletId) continue;
+    const data = balanceByWallet[w.id];
+    if (!data) continue;
+    for (const t of data.tokens) {
+      if (!(t.qty > 0)) continue;
+      const key = t.binancePair ?? t.coingeckoId ?? t.symbol;
+      const cur = agg.get(key) ?? {
+        key,
+        symbol: t.symbol,
+        qty: 0,
+        pair: t.binancePair,
+        cgId: t.coingeckoId,
+        stable: isStableSymbol(t.symbol),
+      };
+      cur.qty += t.qty;
+      if (!cur.cgId && t.coingeckoId) cur.cgId = t.coingeckoId;
+      agg.set(key, cur);
+    }
+  }
+  return agg;
+}
+
+/** Adds one entry's period math into a period map. */
+async function addEntryToPeriods(
+  e: PnlEntry,
+  byPeriod: Record<number, BlockchainPnlPeriod>,
+  live: Record<string, BinancePriceEntry>
+): Promise<{ series?: { t: number; c: number }[] }> {
+  let series: { t: number; c: number }[] | undefined;
+  if (!e.stable) {
+    if (e.pair) {
+      try {
+        series = await fetchDailyCloses(e.pair);
+      } catch {}
+    }
+    if (!series && e.cgId) {
+      try {
+        series = await fetchCgCloses(e.cgId);
+      } catch {}
+    }
+    // v1.4.17 — Binance-less, id-less token (TOSHI/MOONKIN style): resolve
+    // its CoinGecko id by symbol so its PnL history still works.
+    if (!series && !e.pair && !e.cgId) {
+      const id = await cgIdForSymbol(e.symbol).catch(() => undefined);
+      if (id) {
+        e.cgId = id;
+        try {
+          series = await fetchCgCloses(id);
+        } catch {}
+      }
+    }
+  }
+  const nowPrice = e.stable
+    ? 1
+    : e.pair && live[e.pair]
+      ? live[e.pair].price
+      : series && series.length > 0
+        ? series[series.length - 1].c
+        : 0;
+  for (const p of PNL_PERIODS) {
+    const target = Date.now() - p * 86_400_000;
+    let thenPrice: number | null = null;
+    if (e.stable) thenPrice = 1;
+    else if (series) thenPrice = closeAtOrBefore(series, target);
+    if (nowPrice <= 0 || thenPrice === null || thenPrice <= 0) continue;
+    const per = byPeriod[p];
+    const pnl = e.qty * (nowPrice - thenPrice);
+    const basis = e.qty * thenPrice;
+    per.usdNow += e.qty * nowPrice;
+    per.usdThen += basis;
+    const existing = per.tokens.find((x) => x.label === e.symbol);
+    if (existing) {
+      existing.pnl += pnl;
+      existing.basis += basis;
+    } else {
+      per.tokens.push({ label: e.symbol, pnl, basis });
+    }
+  }
+  return { series };
+}
+
 /**
- * Computes the market-change PnL of the CURRENT blockchain holdings over all
- * four periods at once (same semantics as the rial/metals PnL card: change of
- * market value of what you hold today, not your actual trade PnL).
+ * Computes the market-change PnL of the CURRENT holdings over all four
+ * periods at once — total AND per-wallet (v1.4.17). Same semantics as the
+ * rial/metals PnL card: change of market value of what you hold today.
  */
 export async function computeBlockchainPnl(
   wallets: BlockchainWallet[],
   balanceByWallet: Record<string, BlockchainWalletData | undefined>
 ): Promise<BlockchainPnlSummary> {
-  // aggregate token quantities across wallets AND networks keyed by price source
-  const agg = new Map<string, { symbol: string; qty: number; pair?: string; stable: boolean }>();
-  for (const w of wallets) {
-    const data = balanceByWallet[w.id];
-    if (!data) continue;
-    for (const t of data.tokens) {
-      if (!(t.qty > 0)) continue;
-      const key = t.binancePair ?? t.symbol;
-      const cur = agg.get(key) ?? {
-        symbol: t.symbol,
-        qty: 0,
-        pair: t.binancePair,
-        // stable assumption capped (fake "USDT" junk never counts as $1)
-        stable: STABLE_SYMBOLS.includes(t.symbol.toUpperCase()) && t.qty <= 1e12,
-      };
-      cur.qty += t.qty;
-      agg.set(key, cur);
-    }
-  }
-
-  const entries = [...agg.values()].filter((e) => e.qty > 0);
   const byPeriod: Record<number, BlockchainPnlPeriod> = {};
   for (const p of PNL_PERIODS) byPeriod[p] = { usdNow: 0, usdThen: 0, tokens: [] };
-  if (entries.length === 0) {
-    return { byPeriod, fetchedAt: Date.now() };
+  const perWallet: Record<string, Record<number, BlockchainPnlPeriod>> = {};
+
+  // live prices once for everything
+  let live: Record<string, BinancePriceEntry> = {};
+  try {
+    live = (await getBinancePriceMap()).bySymbol;
+  } catch {}
+
+  // total across all wallets
+  const totalEntries = [...aggregateEntries(wallets, balanceByWallet).values()].filter((e) => e.qty > 0);
+  for (const e of totalEntries) {
+    await addEntryToPeriods(e, byPeriod, live);
   }
 
-  // live prices (for "now" legs — spot + futures) + history (for "then" legs)
-  const pairs = entries.filter((e) => e.pair).map((e) => e.pair as string);
-  let live: Record<string, { price: number; chg: number | null }> = {};
-  if (pairs.length > 0) {
-    try {
-      live = await fetchBinanceSpotAndFutures([...new Set(pairs)]);
-    } catch {}
-  }
-
-  const seriesMap = new Map<string, { t: number; c: number }[]>();
-  await Promise.allSettled(
-    [...new Set(pairs)].map(async (pair) => {
-      seriesMap.set(pair, await fetchDailyCloses(pair));
-    })
-  );
-
-  for (const e of entries) {
-    const nowPrice = e.stable ? 1 : e.pair && live[e.pair] ? live[e.pair].price : 0;
-    const series = e.pair ? seriesMap.get(e.pair) : undefined;
-    for (const p of PNL_PERIODS) {
-      const target = Date.now() - p * 86_400_000;
-      let thenPrice: number | null = null;
-      if (e.stable) thenPrice = 1;
-      else if (series) thenPrice = closeAtOrBefore(series, target);
-      if (nowPrice <= 0 || thenPrice === null || thenPrice <= 0) continue;
-      const per = byPeriod[p];
-      const pnl = e.qty * (nowPrice - thenPrice);
-      const basis = e.qty * thenPrice;
-      per.usdNow += e.qty * nowPrice;
-      per.usdThen += basis;
-      const existing = per.tokens.find((x) => x.label === e.symbol);
-      if (existing) {
-        existing.pnl += pnl;
-        existing.basis += basis;
-      } else {
-        per.tokens.push({ label: e.symbol, pnl, basis });
-      }
+  // per wallet (single-line PnL under each wallet card)
+  for (const w of wallets) {
+    const wp: Record<number, BlockchainPnlPeriod> = {};
+    for (const p of PNL_PERIODS) wp[p] = { usdNow: 0, usdThen: 0, tokens: [] };
+    const entries = [...aggregateEntries(wallets, balanceByWallet, w.id).values()].filter((e) => e.qty > 0);
+    for (const e of entries) {
+      await addEntryToPeriods(e, wp, live);
     }
+    perWallet[w.id] = wp;
   }
 
   for (const p of PNL_PERIODS) {
     byPeriod[p].tokens.sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl));
   }
-  return { byPeriod, fetchedAt: Date.now() };
+  for (const w of Object.keys(perWallet)) {
+    for (const p of PNL_PERIODS) {
+      perWallet[w][p].tokens.sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl));
+    }
+  }
+  return { byPeriod, perWallet, fetchedAt: Date.now() };
+}
+
+/** v1.4.17 — helper: resolve CG ids for tokens that lack them (background). */
+export async function ensureCgIds(tokens: BlockchainTokenBalance[]): Promise<void> {
+  for (const t of tokens) {
+    if (!t.coingeckoId && !t.binancePair && !isStableSymbol(t.symbol)) {
+      const id = await cgIdForSymbol(t.symbol).catch(() => undefined);
+      if (id) t.coingeckoId = id;
+    }
+  }
 }

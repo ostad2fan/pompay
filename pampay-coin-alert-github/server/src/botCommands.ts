@@ -64,7 +64,34 @@ async function putPending(list: PendingBotCommand[]): Promise<void> {
 }
 
 /** Commands the APP must answer (data lives in AsyncStorage on the phone). */
-const APP_RELAY_COMMANDS = new Set(["/balance", "/positions", "/signals", "/whale"]);
+const APP_RELAY_COMMANDS = new Set(["/balance", "/positions", "/signals", "/portfolio"]);
+
+/** v1.4.17 — server-side whale snapshot answer (data from whaleWatch). */
+async function whaleText(): Promise<string> {
+  const cfg = (await store.get<{ whaleWallets?: { id: string; address: string; label: string }[] }>("config")) ?? {};
+  const whales = cfg.whaleWallets ?? [];
+  const snapshots = (await store.get<Record<string, { positions: { coin: string; side: string; size: number; value: number; pnl: number }[]; at: number }>>("whaleWatchSnapshots")) ?? {};
+  if (whales.length === 0) {
+    return "🐋 هیچ نهنگی روی سرور ثبت نشده است. در برنامه، تب «ردیابی نهنگ‌ها» را باز کنید تا آدرس‌ها همگام شوند.";
+  }
+  const lines = [`🐋 <b>نهنگ‌های تحت ردیابی (${whales.length})</b>\n`];
+  for (const w of whales.slice(0, 15)) {
+    const snap = snapshots[w.id];
+    lines.push(`<b>${w.label}</b>`);
+    if (!snap || snap.positions.length === 0) {
+      lines.push("   بدون موقعیت باز");
+    } else {
+      for (const p of snap.positions.slice(0, 8)) {
+        const icon = p.side === "long" ? "🟢" : "🔴";
+        lines.push(
+          `   ${icon} ${p.coin} — ${p.side === "long" ? "لانگ" : "شورت"} | ارزش $${Math.round(p.value).toLocaleString("en-US")} | ${p.pnl >= 0 ? "سود" : "زیان"} $${Math.abs(Math.round(p.pnl)).toLocaleString("en-US")}`
+        );
+      }
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
 
 // ---------------------------------------------------------------------------
 // Server-side answer builders (mirror the app's Persian texts)
@@ -83,7 +110,7 @@ async function helpText(): Promise<string> {
     "❓ <b>راهنمای ربات PomPay</b>",
     "",
     "این دستورات <b>حتی وقتی برنامه بسته است</b> پاسخ می‌گیرند (پاسخ از سرور):",
-    "/start - 🚀 منوی اصلی",
+    "/start - 🚀 منوی اصلی و لیست قابلیت‌ها",
     "/status - 📊 وضعیت اسکن سرور و اعلان‌ها",
     "/scanner - 🔍 سیگنال‌های پامپ/دامپ آخرین اسکن",
     "/gainz - 📊 سیگنال‌های GainzAlgo",
@@ -91,21 +118,23 @@ async function helpText(): Promise<string> {
     "/hook - 🪝 سیگنال‌های هوک ریورسال",
     "/meme - 💀 سیگنال‌های میم‌کوین",
     "/price - 💵 قیمت لحظه‌ای تتر (تومان)",
+    "/whale - 🐋 نهنگ‌های تحت ردیابی و موقعیت‌های باز",
     "",
     "این دستورات به داده داخل گوشی نیاز دارند؛ اگر برنامه بسته باشد،",
     "به‌محض باز شدن برنامه پاسخ خود را دریافت می‌کنید:",
-    "/balance - 💰 موجودی صرافی‌ها",
+    "/balance - 💰 موجودی صرافی‌ها + کیف بلاکچین",
     "/positions - 📈 پوزیشن‌های باز",
     "/signals - 🎯 سیگنال‌های AI",
-    "/whale - 🐋 نهنگ‌های تحت ردیابی",
+    "/portfolio - 👛 خلاصه دارایی (صرافی + ریالی/فلزات + کیف بلاکچین)",
     "",
     `🏦 سرور: متصل • آخرین پاسخ ${faDate(Date.now())}`,
   ].join("\n");
 }
 
 async function statusText(): Promise<string> {
-  const cfg = (await store.get<BotConfig>("config")) ?? ({} as Partial<BotConfig>);
-  const [lastScanAt, lastFastScanAt, pump, meme, pre, gainz, hook, custom] = await Promise.all([
+  const cfg = (await store.get<BotConfig & { whaleWallets?: unknown[]; hookEnabled?: boolean }>("config")) ??
+    ({} as Partial<BotConfig> & { whaleWallets?: unknown[]; hookEnabled?: boolean });
+  const [lastScanAt, lastFastScanAt, pump, meme, pre, gainz, hook, custom, lastWhaleWatchAt] = await Promise.all([
     store.get<number>("lastScanAt"),
     store.get<number>("lastFastScanAt"),
     store.get<unknown[]>("pumpDumpSignals"),
@@ -114,6 +143,7 @@ async function statusText(): Promise<string> {
     store.get<unknown[]>("gainzSignals"),
     store.get<unknown[]>("hookSignals"),
     store.get<unknown[]>("customSignals"),
+    store.get<number>("whaleWatchLastRun"),
   ]);
   const pending = await getPending();
   return [
@@ -121,6 +151,7 @@ async function statusText(): Promise<string> {
     "",
     `🔍 اسکن سریع (پامپ/دامپ/میم): ${lastFastScanAt ? faDate(lastFastScanAt) : "هنوز اجرا نشده"}`,
     `📈 اسکن کندلی (Gainz/هوک/اندیکاتور): ${lastScanAt ? faDate(lastScanAt) : "هنوز اجرا نشده"}`,
+    `🐋 نهنگ‌ها (Hyperliquid): ${lastWhaleWatchAt ? faDate(lastWhaleWatchAt) : "هنوز اجرا نشده"} — ${Array.isArray(cfg.whaleWallets) ? cfg.whaleWallets.length : 0} نهنگ`,
     "",
     `🟢 پامپ/دامپ ذخیره‌شده: ${Array.isArray(pump) ? pump.length : 0}`,
     `💀 میم‌کوین: ${Array.isArray(meme) ? meme.length : 0}`,
@@ -291,6 +322,9 @@ async function handleCommand(
       return;
     case "/price":
       await sendTelegram(target, await priceText());
+      return;
+    case "/whale":
+      await sendTelegram(target, await whaleText());
       return;
     default:
       if (APP_RELAY_COMMANDS.has(command)) {

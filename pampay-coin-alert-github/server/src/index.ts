@@ -26,6 +26,7 @@ import type { ScanConfig, CustomSignal, GainzSignal, HookSignal } from "./scanEn
 import { runFastScanCycle, pumpDumpResponse } from "./fastScan";
 import { registerPushToken, unregisterPushToken, pushStatus } from "./push";
 import { sendTelegram, getLastTelegramError } from "./telegram";
+import { runWhaleWatch } from "./whaleWatch";
 import {
   startBotCommandPoller,
   getPendingForApp,
@@ -167,18 +168,21 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/scan/status") {
-      const [config, lastScanDate, lastScanAt, lastFastScanAt, lastTelegramError, lastTelegramSuccessAt] = await Promise.all([
-        store.get<{ secret: string; botToken: string; chatId: string }>("config"),
+      const [config, lastScanDate, lastScanAt, lastFastScanAt, lastTelegramError, lastTelegramSuccessAt, lastWhaleRun] = await Promise.all([
+        store.get<{ secret: string; botToken: string; chatId: string; whaleWallets?: unknown[] }>("config"),
         store.get<string>("lastScanDate"),
         store.get<number>("lastScanAt"),
         store.get<number>("lastFastScanAt"),
         getLastTelegramError(),
         store.get<number>("lastTelegramSuccessAt"),
+        store.get<number>("whaleWatchLastRun"),
       ]);
       return json(res, 200, {
         ok: true,
         hasConfig: Boolean(config),
         telegramConfigured: Boolean(config?.botToken && config?.chatId),
+        whaleWallets: Array.isArray(config?.whaleWallets) ? config.whaleWallets.length : 0,
+        lastWhaleWatchAt: lastWhaleRun ?? null,
         serverBotCommands: true,
         lastScanDate: lastScanDate ?? null,
         lastScanAt: lastScanAt ?? null,
@@ -328,6 +332,49 @@ server.listen(PORT, () => {
   } catch (e) {
     console.log("[Server] bot command poller failed to start (non-fatal):", e);
   }
+  // v1.4.17 — CONFIG SELF-HEAL: Railway restarts wipe the ephemeral
+  // filesystem, which used to destroy the stored bot-token config →
+  // «اعلان‌ها فقط وقتی برنامه باز است می‌آیند». On boot, when the store has
+  // NO config, re-seed it from (in priority order):
+  //   1. /data/pompay-config.json — a Railway volume mount (best)
+  //   2. env vars TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (+ INSTALL_SECRET)
+  // Either way the 24/7 scan + notifications survive restarts.
+  void (async () => {
+    try {
+      const existing = await store.get<{ botToken?: string; chatId?: string }>("config");
+      if (existing && existing.botToken && existing.chatId) return;
+      const fs = await import("node:fs");
+      let seeded = false;
+      try {
+        if (fs.existsSync("/data/pompay-config.json")) {
+          const cfg = JSON.parse(fs.readFileSync("/data/pompay-config.json", "utf8"));
+          if (cfg?.botToken && cfg?.chatId) {
+            await store.put("config", cfg);
+            seeded = true;
+            console.log("[Server] config re-seeded from /data volume");
+          }
+        }
+      } catch {}
+      if (!seeded && process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID) {
+        const cfg = {
+          secret: process.env.INSTALL_SECRET || "env-seed",
+          botToken: process.env.TELEGRAM_BOT_TOKEN,
+          chatId: process.env.TELEGRAM_CHAT_ID,
+          gainzAlgoEnabled: true,
+          gainzTimeframes: ["1d"],
+          indicators: [],
+          hookEnabled: true,
+          hookTimeframes: ["1d"],
+          whaleWallets: [],
+          whaleNotifications: true,
+        };
+        await store.put("config", cfg);
+        console.log("[Server] config re-seeded from TELEGRAM_BOT_TOKEN env");
+      }
+    } catch (e) {
+      console.log("[Server] config re-seed failed (non-fatal):", e);
+    }
+  })();
 });
 
 // --- v1.4.5: global crash protection -----------------------------------------
@@ -432,6 +479,12 @@ async function fastTick(reason: string): Promise<void> {
     await scanEngine.quickTick();
   } catch (e) {
     console.log(`[Scheduler] ${reason} quick tick failed:`, e);
+  }
+  // v1.4.17 — whale position watch (open/close/size-change announcements)
+  try {
+    await runWhaleWatch();
+  } catch (e) {
+    console.log(`[Scheduler] ${reason} whale watch failed:`, e);
   }
 }
 

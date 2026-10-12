@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { View, Text, StyleSheet, Pressable, TextInput, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, StyleSheet, Pressable, TextInput, ActivityIndicator, Alert, ScrollView } from 'react-native';
 import {
   Link as LinkIcon,
   Plus,
@@ -16,7 +16,6 @@ import {
   RefreshCcw,
   Check,
   Pencil,
-  X,
 } from 'lucide-react-native';
 import colors from '@/constants/colors';
 import { createThemedStyles } from '@/utils/themeStyles';
@@ -28,13 +27,10 @@ import {
   BlockchainWalletData,
   BlockchainNetwork,
   NETWORKS,
+  NETWORK_GROUPS,
+  EVM_NETWORKS,
   shortAddress,
-  validateBlockchainAddress,
-  detectAddressKind,
-  compatibleNetworksFor,
-  defaultNetworksFor,
-  addressKindLabel,
-  networksShortLabel,
+  validateAddressForNetworks,
 } from '@/utils/blockchainWallets';
 import {
   BlockchainPnlSummary,
@@ -48,18 +44,14 @@ import {
  * The 4th top tab of the asset-management screen: «کیف پول بلاکچین».
  *
  * READ-ONLY blockchain wallets (Trust Wallet & any personal wallet):
- *   - The user enters ONLY a public address + a display name + the NETWORKS
- *     to read that address on. v1.4.17: one 0x address can be ticked on MANY
- *     networks at once (Ethereum / BNB Chain / Polygon / Arbitrum / Base /
- *     Filecoin-FEVM) — «این کیف پول شبکه‌های اتریوم و بایننس و آربیتروم و
- *     فایل‌کوین را داشته باشد». Existing wallets can edit their networks
- *     any time (ویرایش شبکه‌ها).
- *   - Balances/prices are read from public keyless APIs (blockchainWalletApi).
- *   - The add form carries the step-by-step READ-ONLY GUIDE (how to copy an
- *     address from Trust Wallet) + a red security warning (never enter the
- *     seed phrase / private key anywhere).
- *   - Total card: USD value + TOMAN value + overall PnL with the same
- *     ۷/۳۰/۹۰/۱۸۰-day period chips as the other sections.
+ *   - ONE public address tracked on MANY networks at once.
+ *   - v1.4.17 NEW: the network picker is a COLLAPSIBLE multi-select dropdown
+ *     («منوی کشویی شبکه‌ها») with a manual check-mark per network — every
+ *     Trust-Wallet-supported network is listed (51 networks), grouped into
+ *     «شبکه‌های اتریومی (یک آدرس 0x)» + «شبکه‌های مستقل».
+ *   - 3-LEVEL PnL: total (top, with timeframe chips) → one line per wallet
+ *     → per-token rows when the wallet is expanded.
+ *   - Per-wallet refresh button actually refetches (v1.4.16 bug fix).
  */
 
 const PNL_PERIOD_LABEL: Record<PnlPeriod, string> = {
@@ -81,10 +73,16 @@ export interface BlockchainWalletsSectionProps {
   vpnStatus: VpnStatus;
   vpnChecking: boolean;
   onRecheckVpn: () => void;
-  /** v1.4.17 — multi-network add: networks[] for the pasted address. */
-  onAddWallet: (name: string, networks: BlockchainNetwork[], address: string) => Promise<boolean>;
-  /** v1.4.17 — change the networks an existing wallet is read on. */
-  onEditWalletNetworks: (id: string, networks: BlockchainNetwork[]) => void;
+  onAddWallet: (
+    name: string,
+    networks: BlockchainNetwork[],
+    address: string
+  ) => Promise<boolean>;
+  onEditWallet: (
+    id: string,
+    name: string,
+    networks: BlockchainNetwork[]
+  ) => Promise<boolean>;
   onRemoveWallet: (id: string, name: string) => void;
   onRefreshAll: () => void;
   onRefreshWallet: (id: string) => void;
@@ -100,13 +98,14 @@ export default function BlockchainWalletsSection({
   vpnChecking,
   onRecheckVpn,
   onAddWallet,
-  onEditWalletNetworks,
+  onEditWallet,
   onRemoveWallet,
   onRefreshAll,
   onRefreshWallet,
 }: BlockchainWalletsSectionProps) {
   const [expandedWallet, setExpandedWallet] = useState<string | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
+  const [editingWalletId, setEditingWalletId] = useState<string | null>(null);
   const [pnlPeriod, setPnlPeriod] = useState<PnlPeriod>(7);
 
   const totalUsd = useMemo(
@@ -120,11 +119,6 @@ export default function BlockchainWalletsSection({
   const totalToman = usdtToToman > 0 ? totalUsd * usdtToToman : 0;
   const anyFetching = wallets.some((w) => balanceByWallet[w.id]?.isFetching);
   const vpnBlocked = vpnStatus === 'iran';
-
-  const pnl = pnlSummary?.byPeriod[pnlPeriod];
-  const pnlUsd = pnl ? pnl.usdNow - pnl.usdThen : 0;
-  const pnlPct = pnl && pnl.usdThen > 0 ? (pnlUsd / pnl.usdThen) * 100 : 0;
-  const pnlPositive = pnlUsd >= 0;
 
   return (
     <>
@@ -168,30 +162,7 @@ export default function BlockchainWalletsSection({
           </Text>
         </View>
 
-        <View style={styles.portfolioBreakdown}>
-          {wallets.map((w) => (
-            <View key={w.id} style={styles.portfolioBreakdownRow}>
-              <Text style={styles.portfolioBreakdownName}>
-                {w.name} ({networksShortLabel(w.networks)})
-              </Text>
-              <Text style={styles.portfolioBreakdownValue}>
-                {balanceByWallet[w.id]?.data
-                  ? `$${balanceByWallet[w.id].data!.totalUsd.toLocaleString('en-US', {
-                      maximumFractionDigits: 2,
-                    })}`
-                  : '—'}
-              </Text>
-            </View>
-          ))}
-        </View>
-
-        <Text style={styles.portfolioSub}>
-          {wallets.length > 0
-            ? `${wallets.length.toLocaleString('fa-IR')} کیف پول متصل • فقط خواندنی`
-            : 'هنوز کیف پولی اضافه نشده'}
-        </Text>
-
-        {/* ── سود/زیان کلی (همه تایم‌فریم‌ها مثل بقیه بخش‌ها) ── */}
+        {/* ── سود/زیان کلی (بالا صفحه + انتخاب تایم‌فریم) ── */}
         {wallets.length > 0 && (
           <BlockchainPnlCard
             pnlSummary={pnlSummary}
@@ -201,6 +172,14 @@ export default function BlockchainWalletsSection({
             usdtToToman={usdtToToman}
           />
         )}
+
+        <Text style={styles.portfolioSub}>
+          {wallets.length > 0
+            ? `${wallets.length.toLocaleString('fa-IR')} کیف پول • ${wallets
+                .reduce((s, w) => s + w.networks.length, 0)
+                .toLocaleString('fa-IR')} شبکه • فقط خواندنی`
+            : 'هنوز کیف پولی اضافه نشده'}
+        </Text>
       </View>
 
       {/* ── گیت فیلترشکن: بلاکچین‌ها API خارجی هستند ── */}
@@ -229,7 +208,7 @@ export default function BlockchainWalletsSection({
         <AddBlockchainWalletForm
           onCancel={() => setShowAddForm(false)}
           onSubmit={async (name, networks, address) => {
-            const ok = await onAddWallet(name, networks, address);
+            const ok = await onAddWallet(name, networks, address ?? '');
             if (ok) setShowAddForm(false);
             return ok;
           }}
@@ -245,7 +224,7 @@ export default function BlockchainWalletsSection({
         </Pressable>
       )}
 
-      {/* ── کارت هر کیف پول ── */}
+      {/* ── کارت هر کیف پول (یک خط خلاصه + PnL همان تایم‌فریم) ── */}
       {wallets.map((wallet) => (
         <BlockchainWalletCard
           key={wallet.id}
@@ -255,14 +234,37 @@ export default function BlockchainWalletsSection({
           isFetching={balanceByWallet[wallet.id]?.isFetching ?? false}
           error={balanceByWallet[wallet.id]?.error}
           usdtToToman={usdtToToman}
+          pnlPeriod={pnlPeriod}
+          walletPnl={pnlSummary?.perWallet?.[wallet.id]?.[pnlPeriod]}
           onToggle={() =>
             setExpandedWallet(expandedWallet === wallet.id ? null : wallet.id)
           }
           onRemove={() => onRemoveWallet(wallet.id, wallet.name)}
           onRefresh={() => onRefreshWallet(wallet.id)}
-          onEditNetworks={(networks) => onEditWalletNetworks(wallet.id, networks)}
+          onEdit={() => {
+            setEditingWalletId(wallet.id);
+            setShowAddForm(false);
+          }}
         />
       ))}
+
+      {/* ── فرم ویرایش کیف پول (تغییر نام/شبکه‌ها) ── */}
+      {editingWalletId &&
+        (() => {
+          const wallet = wallets.find((w) => w.id === editingWalletId);
+          if (!wallet) return null;
+          return (
+            <AddBlockchainWalletForm
+              editWallet={wallet}
+              onCancel={() => setEditingWalletId(null)}
+              onSubmit={async (name, networks) => {
+                const ok = await onEditWallet(wallet.id, name, networks);
+                if (ok) setEditingWalletId(null);
+                return ok;
+              }}
+            />
+          );
+        })()}
 
       {/* ── حالت خالی ── */}
       {wallets.length === 0 && !showAddForm && (
@@ -270,9 +272,9 @@ export default function BlockchainWalletsSection({
           <Lock size={44} color={colors.dark.textMuted} />
           <Text style={styles.emptyTitle}>کیف پول بلاکچینی اضافه نشده</Text>
           <Text style={styles.emptySubtitle}>
-            کیف پول خود را در حالت فقط‌خواندنی اضافه کنید (مثل تراست ولتم) — فقط با آدرس عمومی،
-            بدون کلید خصوصی. یک آدرس 0x را می‌توانید هم‌زمان روی چند شبکه (اتریوم، BNB چین،
-            آربیتروم، فایل‌کوین و…) خواند؛ موجودی و سود/زیان آن همراه دارایی‌هایتان محاسبه می‌شود.
+            کیف پول خود را در حالت فقط‌خواندنی اضافه کنید (مثل تراست ولتم یا تون‌کیپر) — فقط با
+            آدرس عمومی، بدون کلید خصوصی؛ یک آدرس را روی هر تعداد شبکه (۵۱ شبکه) همزمان دنبال کنید
+            و موجودی و سود/زیان آن همراه دارایی‌هایتان محاسبه می‌شود.
           </Text>
         </View>
       )}
@@ -281,7 +283,7 @@ export default function BlockchainWalletsSection({
 }
 
 // ---------------------------------------------------------------------------
-// PnL card — same period chips / layout as the other sections
+// PnL card (total) — timeframe chips + total + per-token rows
 // ---------------------------------------------------------------------------
 
 function BlockchainPnlCard({
@@ -311,7 +313,7 @@ function BlockchainPnlCard({
         ) : (
           <TrendingDown size={14} color={colors.dark.red} />
         )}
-        <Text style={styles.pnlTitle}>سود / زیان کیف پول‌ها (تغییر قیمت بازار)</Text>
+        <Text style={styles.pnlTitle}>سود / زیان کل دارایی‌ها (تغییر قیمت بازار)</Text>
       </View>
 
       <View style={styles.pnlPeriodRow}>
@@ -374,7 +376,7 @@ function BlockchainPnlCard({
             </View>
           ))}
           <Text style={styles.pnlNote}>
-            مبنا: موجودی امروز × قیمت پایان روزِ {PNL_PERIOD_LABEL[period]} پیش (بایننس).
+            مبنا: موجودی امروز × قیمت پایان روزِ {PNL_PERIOD_LABEL[period]} پیش (بایننس/CoinGecko).
             تغییر ارزش بازار است، نه سود واقعی نسبت به قیمت خرید شما.
           </Text>
         </>
@@ -384,114 +386,188 @@ function BlockchainPnlCard({
 }
 
 // ---------------------------------------------------------------------------
-// Network picker — multi-select chips (v1.4.17)
+// Network multi-select DROPDOWN («منوی کشویی شبکه‌ها»)
 // ---------------------------------------------------------------------------
 
-function NetworkPicker({
-  options,
+function NetworkDropdown({
   selected,
-  onToggle,
-  single,
-  testIDPrefix = 'net',
+  onChange,
 }: {
-  options: BlockchainNetwork[];
   selected: BlockchainNetwork[];
-  onToggle: (n: BlockchainNetwork) => void;
-  /** Only one compatible network — chip is informational, not toggleable. */
-  single?: boolean;
-  testIDPrefix?: string;
+  onChange: (next: BlockchainNetwork[]) => void;
 }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+
+  const toggle = (n: BlockchainNetwork) => {
+    onChange(selected.includes(n) ? selected.filter((x) => x !== n) : [...selected, n]);
+  };
+
+  const allEvmSelected = EVM_NETWORKS.every((n) => selected.includes(n));
+  const toggleAllEvm = () => {
+    if (allEvmSelected) {
+      onChange(selected.filter((n) => !EVM_NETWORKS.includes(n)));
+    } else {
+      const set = new Set([...selected, ...EVM_NETWORKS]);
+      onChange([...set]);
+    }
+  };
+
+  const filter = (list: BlockchainNetwork[]) =>
+    query.trim()
+      ? list.filter(
+          (n) =>
+            NETWORKS[n].label.includes(query.trim()) ||
+            NETWORKS[n].native.toLowerCase().includes(query.trim().toLowerCase()) ||
+            NETWORKS[n].short.toLowerCase().includes(query.trim().toLowerCase())
+        )
+      : list;
+
   return (
-    <View style={styles.networkGrid}>
-      {options.map((n) => {
-        const active = selected.includes(n);
-        const meta = NETWORKS[n];
-        return (
-          <Pressable
-            key={n}
-            style={[styles.networkChip, active && styles.networkChipActive]}
-            onPress={() => {
-              if (!single) onToggle(n);
-            }}
-            testID={`${testIDPrefix}-chip-${n}`}
-          >
-            <View style={styles.networkChipTop}>
-              <View style={[styles.netDot, { backgroundColor: meta.color }]} />
-              <Text style={[styles.networkChipLabel, active && styles.networkChipLabelActive]}>
-                {meta.label}
-              </Text>
-              {active && <Check size={12} color={colors.dark.blue} />}
-            </View>
-            <Text style={styles.networkChipHint}>{meta.addrHint}</Text>
-          </Pressable>
-        );
-      })}
+    <View>
+      <Pressable
+        style={styles.dropdownBtn}
+        onPress={() => setOpen((v) => !v)}
+        testID="network-dropdown-button"
+      >
+        <View style={styles.dropdownBtnLeft}>
+          {selected.slice(0, 4).map((n) => (
+            <View
+              key={n}
+              style={[styles.dropdownDot, { backgroundColor: NETWORKS[n].color }]}
+            />
+          ))}
+          <Text style={styles.dropdownBtnText}>
+            {selected.length === 0
+              ? 'انتخاب شبکه‌ها (منوی کشویی)'
+              : `${selected.length.toLocaleString('fa-IR')} شبکه انتخاب شد`}
+          </Text>
+        </View>
+        {open ? (
+          <ChevronUp size={16} color={colors.dark.accent} />
+        ) : (
+          <ChevronDown size={16} color={colors.dark.accent} />
+        )}
+      </Pressable>
+
+      {open && (
+        <View style={styles.dropdownPanel}>
+          <TextInput
+            style={styles.dropdownSearch}
+            value={query}
+            onChangeText={setQuery}
+            placeholder="جستجوی شبکه (مثلاً بیس یا SOL)…"
+            placeholderTextColor={colors.dark.textMuted}
+          />
+          {NETWORK_GROUPS.map((group) => {
+            const list = filter(group.networks);
+            if (list.length === 0) return null;
+            return (
+              <View key={group.id} style={styles.dropdownGroup}>
+                <View style={styles.dropdownGroupHead}>
+                  <Text style={styles.dropdownGroupTitle}>{group.label}</Text>
+                  {group.id === 'evm' && (
+                    <Pressable style={styles.dropdownGroupAction} onPress={toggleAllEvm}>
+                      <Text style={styles.dropdownGroupActionText}>
+                        {allEvmSelected ? 'حذف همه' : 'انتخاب همه'}
+                      </Text>
+                    </Pressable>
+                  )}
+                </View>
+                <Text style={styles.dropdownGroupNote}>{group.note}</Text>
+                <ScrollView
+                  nestedScrollEnabled
+                  style={styles.dropdownScroll}
+                  contentContainerStyle={styles.dropdownScrollContent}
+                >
+                  {list.map((n) => {
+                    const meta = NETWORKS[n];
+                    const active = selected.includes(n);
+                    return (
+                      <Pressable
+                        key={n}
+                        style={[styles.dropdownRow, active && styles.dropdownRowActive]}
+                        onPress={() => toggle(n)}
+                        testID={`network-row-${n}`}
+                      >
+                        <View style={[styles.dropdownRowDot, { backgroundColor: meta.color }]} />
+                        <View style={styles.dropdownRowTexts}>
+                          <Text style={styles.dropdownRowLabel}>{meta.label}</Text>
+                          <Text style={styles.dropdownRowHint}>
+                            {meta.addrHint}
+                            {meta.wallets ? ` • ${meta.wallets}` : ''}
+                          </Text>
+                        </View>
+                        <View
+                          style={[
+                            styles.checkbox,
+                            active && { backgroundColor: colors.dark.accent, borderColor: colors.dark.accent },
+                          ]}
+                        >
+                          {active && <Check size={13} color={colors.dark.background} />}
+                        </View>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
+              </View>
+            );
+          })}
+        </View>
+      )}
     </View>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Add-wallet form — name / address / MULTI-network picker + guide + warning
+// Add / Edit wallet form — name / networks dropdown / address + guide
 // ---------------------------------------------------------------------------
 
 function AddBlockchainWalletForm({
+  editWallet,
   onCancel,
   onSubmit,
 }: {
+  editWallet?: BlockchainWallet;
   onCancel: () => void;
-  onSubmit: (name: string, networks: BlockchainNetwork[], address: string) => Promise<boolean>;
+  onSubmit: (
+    name: string,
+    networks: BlockchainNetwork[],
+    address?: string
+  ) => Promise<boolean>;
 }) {
-  const [name, setName] = useState('');
-  const [address, setAddress] = useState('');
-  const [selected, setSelected] = useState<BlockchainNetwork[]>([]);
+  const [name, setName] = useState(editWallet?.name ?? '');
+  const [networks, setNetworks] = useState<BlockchainNetwork[]>(
+    editWallet?.networks ?? ['ethereum', 'bsc']
+  );
+  const [address, setAddress] = useState(editWallet?.address ?? '');
   const [busy, setBusy] = useState(false);
-  const [lastKind, setLastKind] = useState<string>('');
-
-  // auto-detect the address family as the user types/pastes
-  const kind = useMemo(() => detectAddressKind(address.trim()), [address]);
-  useEffect(() => {
-    const k = kind ?? '';
-    if (k !== lastKind) {
-      setLastKind(k);
-      setSelected(kind ? defaultNetworksFor(kind) : []);
-    }
-  }, [kind, lastKind]);
-
-  const options = kind ? compatibleNetworksFor(kind) : [];
-  const single = options.length === 1;
-  const multiHint =
-    kind === 'evm'
-      ? 'آدرس 0x در همه شبکه‌های اتریوم‌مانند یکسان است — چند شبکه را با هم تیک بزنید تا موجودی همه خوانده شود (پیش‌فرض: همه روشن).'
-      : null;
 
   const validation = useMemo(
     () =>
-      address.trim() && selected.length > 0
-        ? validateBlockchainAddress(selected[0], address.trim())
+      address.trim() && networks.length > 0
+        ? validateAddressForNetworks(networks, address.trim())
         : null,
-    [address, selected]
+    [networks, address]
   );
-
-  const toggle = (n: BlockchainNetwork) => {
-    setSelected((prev) => (prev.includes(n) ? prev.filter((x) => x !== n) : [...prev, n]));
-  };
 
   const submit = async () => {
     if (busy) return;
-    if (!kind || selected.length === 0) {
-      Alert.alert('شبکه انتخاب نشده', 'ابتدا آدرس کیف پول را وارد کنید تا شبکه‌های سازگار نمایش داده شود');
+    const finalName = name.trim() || `کیف پول ${NETWORKS[networks[0] ?? 'ethereum']?.label ?? 'بلاکچین'}`;
+    if (networks.length === 0) {
+      Alert.alert('شبکه انتخاب نشده', 'حداقل یک شبکه از منوی کشویی انتخاب کنید');
       return;
     }
-    const finalName =
-      name.trim() || `کیف پول ${single ? NETWORKS[selected[0]]?.label ?? '' : 'بلاکچین'}`;
-    const v = validateBlockchainAddress(selected[0], address.trim());
-    if (!v.ok) {
-      Alert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
-      return;
+    if (!editWallet) {
+      const v = validateAddressForNetworks(networks, address.trim());
+      if (!v.ok) {
+        Alert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
+        return;
+      }
     }
     setBusy(true);
     try {
-      await onSubmit(finalName, selected, address.trim());
+      await onSubmit(finalName, networks, editWallet ? undefined : address.trim());
     } finally {
       setBusy(false);
     }
@@ -499,7 +575,9 @@ function AddBlockchainWalletForm({
 
   return (
     <View style={styles.addForm}>
-      <Text style={styles.addFormTitle}>افزودن کیف پول بلاکچین</Text>
+      <Text style={styles.addFormTitle}>
+        {editWallet ? 'ویرایش کیف پول بلاکچین' : 'افزودن کیف پول بلاکچین'}
+      </Text>
       <View style={styles.readonlyBadge}>
         <Lock size={12} color={colors.dark.green} />
         <Text style={styles.readonlyBadgeText}>
@@ -517,46 +595,39 @@ function AddBlockchainWalletForm({
         maxLength={40}
       />
 
-      <Text style={styles.inputLabel}>آدرس عمومی کیف پول</Text>
-      <TextInput
-        style={[styles.input, validation?.ok && styles.inputValid]}
-        value={address}
-        onChangeText={(t) => setAddress(t.replace(/\s+/g, ''))}
-        placeholder="0x… / T… / bc1… / f1…"
-        placeholderTextColor={colors.dark.textMuted}
-        autoCapitalize="none"
-        autoCorrect={false}
-        keyboardType="default"
-        testID="blockchain-address-input"
-      />
-      {kind && (
-        <Text style={[styles.inputHint, styles.inputHintOk]}>{addressKindLabel(kind)}</Text>
-      )}
-      {validation && !kind && (
-        <Text style={[styles.inputHint, styles.inputHintErr]}>
-          قالب آدرس شناخته نشد — آدرس را کامل کپی کنید
-        </Text>
-      )}
-
       <Text style={styles.inputLabel}>
-        {single ? 'شبکه این آدرس' : 'شبکه‌های این آدرس (چند انتخابی)'}
+        شبکه‌ها (منوی کشویی — چند انتخاب با تیک){' '}
+        {editWallet ? '— با ویرایش شبکه‌ها، موجودی دوباره خوانده می‌شود' : ''}
       </Text>
-      {options.length > 0 ? (
-        <NetworkPicker
-          options={options}
-          selected={selected}
-          onToggle={toggle}
-          single={single}
-          testIDPrefix="form-net"
-        />
-      ) : (
-        <Text style={styles.networkPendingHint}>
-          آدرس را وارد کنید تا شبکه‌های سازگار با آن نمایش داده شود
-        </Text>
-      )}
-      {multiHint && selected.length > 0 && <Text style={styles.multiHint}>{multiHint}</Text>}
+      <NetworkDropdown selected={networks} onChange={setNetworks} />
 
-      {/* ── راهنمای فقط‌خواندنی (خواستهٔ کاربر: زیر فرم) ── */}
+      {!editWallet && (
+        <>
+          <Text style={styles.inputLabel}>آدرس عمومی کیف پول</Text>
+          <TextInput
+            style={[styles.input, validation?.ok && styles.inputValid]}
+            value={address}
+            onChangeText={(t) => setAddress(t.replace(/\s+/g, ''))}
+            placeholder={
+              networks.length > 0
+                ? NETWORKS[networks[0] ?? 'ethereum'].addrHint
+                : 'اول شبکه را انتخاب کنید'
+            }
+            placeholderTextColor={colors.dark.textMuted}
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType="default"
+            testID="blockchain-address-input"
+          />
+          {validation && (
+            <Text style={[styles.inputHint, validation.ok ? styles.inputHintOk : styles.inputHintErr]}>
+              {validation.ok ? '✓ آدرس برای همه شبکه‌های انتخابی معتبر است' : validation.message}
+            </Text>
+          )}
+        </>
+      )}
+
+      {/* ── راهنمای فقط‌خواندنی ── */}
       <View style={styles.guideBox}>
         <View style={styles.guideTitleRow}>
           <Info size={14} color={colors.dark.blue} />
@@ -576,8 +647,8 @@ function AddBlockchainWalletForm({
             <Text style={styles.guideStepNumText}>۲</Text>
           </View>
           <Text style={styles.guideStepText}>
-            آدرس بالای صفحه را <Text style={styles.guideBold}>لمس کنید تا کپی شود</Text> (آیکون
-            کپی کنار آدرس) — یا منوی <Text style={styles.guideBold}>⋯ ← View on Block Explorer</Text>.
+            آدرس بالای صفحه را <Text style={styles.guideBold}>لمس کنید تا کپی شود</Text> — یا منوی{' '}
+            <Text style={styles.guideBold}>⋯ ← View on Block Explorer</Text>.
           </Text>
         </View>
         <View style={styles.guideStep}>
@@ -585,10 +656,10 @@ function AddBlockchainWalletForm({
             <Text style={styles.guideStepNumText}>۳</Text>
           </View>
           <Text style={styles.guideStepText}>
-            هر شبکه آدرس جدا دارد: دکمه{' '}
-            <Text style={styles.guideBold}>دریافت (Receive)</Text> ← انتخاب شبکه ←{' '}
-            <Text style={styles.guideBold}>کپی آدرس</Text>. مثلاً ترون با T شروع می‌شود و اتریوم
-            با 0x.
+            برای <Text style={styles.guideBold}>تون (TON)</Text> کیف{' '}
+            <Text style={styles.guideBold}>Tonkeeper</Text> را هم می‌توانید اضافه کنید — آدرس
+            UQ/EQ آن مستقیماً پذیرفته می‌شود؛ برای سولانا کیف Phantom یا Trust، هر دو base58
+            هستند.
           </Text>
         </View>
         <View style={styles.guideStep}>
@@ -596,10 +667,9 @@ function AddBlockchainWalletForm({
             <Text style={styles.guideStepNumText}>۴</Text>
           </View>
           <Text style={styles.guideStepText}>
-            آدرس را در کادر بالا <Text style={styles.guideBold}>Paste</Text> کنید. آدرس 0x در همه
-            شبکه‌های اتریوم‌مانند (اتریوم، BNB چین، پالیگان، آربیتروم، بیس، فایل‌کوین){' '}
-            <Text style={styles.guideBold}>یکسان</Text> است — چند شبکه را با هم تیک بزنید تا
-            همه ارزهای همان آدرس خوانده شود. برای کیف‌های دیگر دوباره «افزودن کیف پول» را بزنید.
+            همه شبکه‌های اتریومی (EVM) <Text style={styles.guideBold}>یک آدرس 0x مشترک</Text>{' '}
+            دارند — از منوی کشویی هر چند شبکه را که خواستید تیک بزنید؛ فقط شبکه‌های مستقل
+            (ترون، تون، بیت‌کوین و…) آدرس جدا می‌خواهند.
           </Text>
         </View>
       </View>
@@ -629,7 +699,9 @@ function AddBlockchainWalletForm({
           ) : (
             <>
               <Plus size={16} color={colors.dark.background} />
-              <Text style={styles.formBtnSaveText}>افزودن و نمایش موجودی</Text>
+              <Text style={styles.formBtnSaveText}>
+                {editWallet ? 'ذخیره تغییرات' : 'افزودن و نمایش موجودی'}
+              </Text>
             </>
           )}
         </Pressable>
@@ -642,8 +714,7 @@ function AddBlockchainWalletForm({
 }
 
 // ---------------------------------------------------------------------------
-// Per-wallet card (collapsible) — network chips, per-token network badges,
-// inline network editor (v1.4.17), token rows + read-only footer
+// Per-wallet card — one summary line (USD + PnL) + expandable tokens
 // ---------------------------------------------------------------------------
 
 function BlockchainWalletCard({
@@ -653,10 +724,12 @@ function BlockchainWalletCard({
   isFetching,
   error,
   usdtToToman,
+  pnlPeriod,
+  walletPnl,
   onToggle,
   onRemove,
   onRefresh,
-  onEditNetworks,
+  onEdit,
 }: {
   wallet: BlockchainWallet;
   isExpanded: boolean;
@@ -664,43 +737,49 @@ function BlockchainWalletCard({
   isFetching: boolean;
   error?: unknown;
   usdtToToman: number;
+  pnlPeriod: PnlPeriod;
+  walletPnl?: { usdNow: number; usdThen: number; tokens: { label: string; pnl: number; basis: number }[] };
   onToggle: () => void;
   onRemove: () => void;
   onRefresh: () => void;
-  onEditNetworks: (networks: BlockchainNetwork[]) => void;
+  onEdit: () => void;
 }) {
-  const primary = NETWORKS[wallet.networks[0]] ?? NETWORKS.ethereum;
-  const multi = wallet.networks.length > 1;
-  const avatarText = `${primary.short}${multi ? '+' : ''}`;
+  const meta = NETWORKS[wallet.networks[0] ?? 'ethereum'];
   const tomanValue = data && usdtToToman > 0 ? data.totalUsd * usdtToToman : 0;
-
-  // v1.4.17 — inline network editor for 0x wallets (multi-compatible address)
-  const editableOptions = useMemo(
-    () => compatibleNetworksFor(detectAddressKind(wallet.address)),
-    [wallet.address]
-  );
-  const canEditNetworks = editableOptions.length > 1;
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState<BlockchainNetwork[]>(wallet.networks);
-  useEffect(() => {
-    setDraft(wallet.networks);
-  }, [wallet.networks]);
-
-  const toggleDraft = (n: BlockchainNetwork) => {
-    setDraft((prev) => (prev.includes(n) ? prev.filter((x) => x !== n) : [...prev, n]));
-  };
+  const pnlUsd = walletPnl ? walletPnl.usdNow - walletPnl.usdThen : 0;
+  const pnlPct = walletPnl && walletPnl.usdThen > 0 ? (pnlUsd / walletPnl.usdThen) * 100 : 0;
+  const pnlPositive = pnlUsd >= 0;
 
   return (
     <View style={styles.walletCard}>
       <Pressable style={styles.walletHeader} onPress={onToggle}>
-        <View style={[styles.walletAvatar, { backgroundColor: primary.color + '33' }]}>
-          <Text style={[styles.walletAvatarText, { color: primary.color }]}>{avatarText}</Text>
+        <View style={[styles.walletAvatar, { backgroundColor: meta.color + '33' }]}>
+          <Text style={[styles.walletAvatarText, { color: meta.color }]}>{meta.short}</Text>
         </View>
         <View style={styles.walletNameCol}>
-          <Text style={styles.walletName}>{wallet.name}</Text>
-          <Text style={styles.walletAddress}>
-            {shortAddress(wallet.address)} • {networksShortLabel(wallet.networks)}
+          <Text style={styles.walletName} numberOfLines={1}>
+            {wallet.name}
           </Text>
+          <Text style={styles.walletAddress}>{shortAddress(wallet.address)}</Text>
+          <View style={styles.walletNetChips}>
+            {wallet.networks.slice(0, 4).map((n) => (
+              <View
+                key={n}
+                style={[styles.walletNetChip, { backgroundColor: NETWORKS[n].color + '26' }]}
+              >
+                <Text style={[styles.walletNetChipText, { color: NETWORKS[n].color }]}>
+                  {NETWORKS[n].short}
+                </Text>
+              </View>
+            ))}
+            {wallet.networks.length > 4 && (
+              <View style={[styles.walletNetChip, { backgroundColor: colors.dark.card }]}>
+                <Text style={[styles.walletNetChipText, { color: colors.dark.textSecondary }]}>
+                  +{(wallet.networks.length - 4).toLocaleString('fa-IR')}
+                </Text>
+              </View>
+            )}
+          </View>
         </View>
         <View style={styles.walletTotalCol}>
           {isFetching && !data ? (
@@ -713,6 +792,20 @@ function BlockchainWalletCard({
               {tomanValue > 0 && (
                 <Text style={styles.walletTotalToman}>{formatToman(tomanValue)} ت</Text>
               )}
+              {walletPnl && walletPnl.usdThen > 0 && (
+                <Text
+                  style={[
+                    styles.walletPnlLine,
+                    { color: pnlPositive ? colors.dark.green : colors.dark.red },
+                  ]}
+                >
+                  {pnlPositive ? '▲' : '▼'} {Math.abs(pnlUsd).toLocaleString('en-US', {
+                    maximumFractionDigits: 2,
+                  })}$ ({Math.abs(pnlPct).toLocaleString('fa-IR', {
+                    maximumFractionDigits: 1,
+                  })}٪ {PNL_PERIOD_LABEL[pnlPeriod]})
+                </Text>
+              )}
             </>
           )}
         </View>
@@ -720,8 +813,14 @@ function BlockchainWalletCard({
           <Pressable style={styles.walletIconBtn} onPress={onRemove} hitSlop={8}>
             <Trash2 size={13} color={colors.dark.red} />
           </Pressable>
+          <Pressable style={styles.walletIconBtn} onPress={onEdit} hitSlop={8}>
+            <Pencil size={13} color={colors.dark.blue} />
+          </Pressable>
           <Pressable style={styles.walletIconBtn} onPress={onRefresh} hitSlop={8}>
-            <RefreshCw size={13} color={data ? colors.dark.accent : colors.dark.textMuted} />
+            <RefreshCw
+              size={13}
+              color={isFetching ? colors.dark.accent : data ? colors.dark.accent : colors.dark.textMuted}
+            />
           </Pressable>
           {isExpanded ? (
             <ChevronUp size={15} color={colors.dark.textSecondary} />
@@ -734,105 +833,68 @@ function BlockchainWalletCard({
       {isExpanded && (
         <View style={styles.walletBody}>
           <View style={styles.networkBadgeRow}>
-            <View style={styles.netChipsWrap}>
-              {wallet.networks.map((n) => (
-                <View
-                  key={n}
-                  style={[styles.netChip, { borderColor: NETWORKS[n].color + '55' }]}
-                >
-                  <View style={[styles.netDot, { backgroundColor: NETWORKS[n].color }]} />
-                  <Text style={[styles.netChipText, { color: NETWORKS[n].color }]}>
-                    {NETWORKS[n].label}
-                  </Text>
-                </View>
-              ))}
-            </View>
+            <Text style={styles.networkBadge}>
+              {wallet.networks.length.toLocaleString('fa-IR')} شبکه:{' '}
+              {wallet.networks
+                .slice(0, 6)
+                .map((n) => NETWORKS[n].label)
+                .join('، ')}
+              {wallet.networks.length > 6 ? ' و…' : ''}
+            </Text>
             <Text style={styles.networkBadgeReadonly}>
               <Lock size={9} color={colors.dark.green} /> فقط‌خواندنی
             </Text>
           </View>
-
-          {/* ── ویرایش شبکه‌های این کیف (فقط آدرس‌های 0x) ── */}
-          {canEditNetworks && !editing && (
-            <Pressable
-              style={styles.editNetworksBtn}
-              onPress={() => {
-                setDraft(wallet.networks);
-                setEditing(true);
-              }}
-              testID={`edit-networks-${wallet.id}`}
-            >
-              <Pencil size={12} color={colors.dark.blue} />
-              <Text style={styles.editNetworksBtnText}>ویرایش شبکه‌های این کیف</Text>
-            </Pressable>
-          )}
-          {editing && (
-            <View style={styles.editNetworksBox}>
-              <Text style={styles.editNetworksTitle}>شبکه‌های خوانده‌شده از این آدرس:</Text>
-              <NetworkPicker
-                options={editableOptions}
-                selected={draft}
-                onToggle={toggleDraft}
-                testIDPrefix={`edit-net-${wallet.id}`}
-              />
-              <View style={styles.editNetworksActions}>
-                <Pressable
-                  style={[styles.editNetworksActionBtn, styles.editNetworksSaveBtn]}
-                  disabled={draft.length === 0}
-                  onPress={() => {
-                    onEditNetworks(draft);
-                    setEditing(false);
-                  }}
-                >
-                  <Check size={13} color={colors.dark.background} />
-                  <Text style={styles.editNetworksSaveText}>ذخیره شبکه‌ها</Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.editNetworksActionBtn, styles.editNetworksCancelBtn]}
-                  onPress={() => setEditing(false)}
-                >
-                  <X size={13} color={colors.dark.textSecondary} />
-                  <Text style={styles.editNetworksCancelText}>انصراف</Text>
-                </Pressable>
-              </View>
-            </View>
-          )}
 
           {!data && !!error && (
             <Text style={styles.walletError}>
               دریافت موجودی ناموفق بود — دوباره تلاش کنید (آدرس/شبکه را بررسی کنید)
             </Text>
           )}
-          {data?.notice && <Text style={styles.walletNotice}>{data.notice}</Text>}
           {data && data.tokens.length === 0 && (
             <Text style={styles.walletEmptyText}>
-              این آدرس در شبکه‌های انتخاب‌شده موجودی مثبتی ندارد یا هنوز تراکنشی انجام نداده است
+              این آدرس موجودی مثبتی ندارد یا هنوز تراکنشی انجام نداده است
             </Text>
           )}
+          {data?.notice && <Text style={styles.walletNotice}>{data.notice}</Text>}
 
           {data?.tokens.map((t) => {
-            const tokenNet = t.network ? NETWORKS[t.network] : primary;
+            const tokenPnl = walletPnl?.tokens.find((x) => x.label === t.symbol);
             return (
-              <View key={`${t.symbol}-${t.network}-${t.name}`} style={styles.tokenRow}>
-                <View style={[styles.tokenIcon, { backgroundColor: tokenNet.color + '26' }]}>
-                  <Text style={[styles.tokenIconText, { color: tokenNet.color }]}>
+              <View key={`${t.symbol}-${t.name}`} style={styles.tokenRow}>
+                <View style={[styles.tokenIcon, { backgroundColor: (t.network ? NETWORKS[t.network].color : meta.color) + '26' }]}>
+                  <Text
+                    style={[
+                      styles.tokenIconText,
+                      { color: t.network ? NETWORKS[t.network].color : meta.color },
+                    ]}
+                  >
                     {t.symbol.slice(0, 1)}
                   </Text>
                 </View>
                 <View style={styles.tokenMain}>
-                  <View style={styles.tokenSymbolRow}>
-                    <Text style={styles.tokenSymbol}>{t.symbol}</Text>
-                    {multi && t.network && (
-                      <View style={[styles.tokenNetBadge, { backgroundColor: tokenNet.color + '1A' }]}>
-                        <Text style={[styles.tokenNetBadgeText, { color: tokenNet.color }]}>
-                          {tokenNet.short}
-                        </Text>
-                      </View>
-                    )}
-                  </View>
+                  <Text style={styles.tokenSymbol}>
+                    {t.symbol}
+                    {t.network && wallet.networks.length > 1 ? (
+                      <Text style={styles.tokenNetTag}> ({NETWORKS[t.network].short})</Text>
+                    ) : null}
+                  </Text>
                   <Text style={styles.tokenName} numberOfLines={1}>
                     {t.name}
                   </Text>
+                  {tokenPnl && (
+                    <Text
+                      style={[
+                        styles.tokenPnl,
+                        { color: tokenPnl.pnl >= 0 ? colors.dark.green : colors.dark.red },
+                      ]}
+                    >
+                      {PNL_PERIOD_LABEL[pnlPeriod]}: {tokenPnl.pnl >= 0 ? '+' : '−'} $
+                      {Math.abs(tokenPnl.pnl).toLocaleString('en-US', {
+                        maximumFractionDigits: 2,
+                      })}
+                    </Text>
+                  )}
                 </View>
                 <Text style={styles.tokenQty}>
                   {t.qty.toLocaleString('en-US', {
@@ -866,8 +928,7 @@ function BlockchainWalletCard({
           {data && (
             <Text style={styles.walletFetchedAt}>
               آخرین دریافت: {new Date(data.fetchedAt).toLocaleTimeString('fa-IR')} •{' '}
-              {data.tokens.length.toLocaleString('fa-IR')} دارایی •{' '}
-              {wallet.networks.length.toLocaleString('fa-IR')} شبکه
+              {data.tokens.length.toLocaleString('fa-IR')} دارایی
             </Text>
           )}
 
@@ -958,31 +1019,11 @@ const styles = createThemedStyles(() =>
       fontWeight: '800' as const,
       color: colors.dark.accent,
     },
-    portfolioBreakdown: {
-      marginTop: 10,
-      paddingTop: 10,
-      borderTopWidth: 1,
-      borderTopColor: colors.dark.border,
-      gap: 4,
-    },
-    portfolioBreakdownRow: {
-      flexDirection: 'row',
-      justifyContent: 'space-between',
-      alignItems: 'center',
-    },
-    portfolioBreakdownName: {
-      fontSize: 12,
-      color: colors.dark.textSecondary,
-    },
-    portfolioBreakdownValue: {
-      fontSize: 12,
-      fontWeight: '600' as const,
-      color: colors.dark.text,
-    },
     portfolioSub: {
       fontSize: 10.5,
       color: colors.dark.textMuted,
       marginTop: 9,
+      textAlign: 'right',
     },
 
     // ── VPN gate card ──
@@ -1086,69 +1127,145 @@ const styles = createThemedStyles(() =>
     inputHintErr: {
       color: colors.dark.red,
     },
-    networkPendingHint: {
-      fontSize: 9.5,
-      color: colors.dark.textMuted,
-      textAlign: 'right',
-      paddingVertical: 8,
-    },
-    multiHint: {
-      fontSize: 9,
-      lineHeight: 15,
-      color: colors.dark.textMuted,
-      textAlign: 'right',
-      marginTop: 7,
-    },
-    networkGrid: {
+
+    // ── network dropdown (v1.4.17 «منوی کشویی شبکه‌ها») ──
+    dropdownBtn: {
       flexDirection: 'row',
-      flexWrap: 'wrap',
-      gap: 6,
-    },
-    networkChip: {
-      backgroundColor: colors.dark.card,
-      borderWidth: 1,
-      borderColor: colors.dark.border,
-      borderRadius: 10,
-      paddingHorizontal: 10,
-      paddingVertical: 7,
-      minWidth: '30%' as unknown as number,
-      flexGrow: 1,
-      flexBasis: '30%' as unknown as number,
       alignItems: 'center',
+      justifyContent: 'space-between',
+      backgroundColor: colors.dark.surfaceLight,
+      borderWidth: 1,
+      borderColor: colors.dark.accent + '55',
+      borderRadius: 10,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
     },
-    networkChipActive: {
-      backgroundColor: colors.dark.blueDim,
-      borderColor: colors.dark.blue + '77',
-    },
-    networkChipTop: {
+    dropdownBtnLeft: {
       flexDirection: 'row',
       alignItems: 'center',
       gap: 4,
+      flex: 1,
     },
-    networkChipLabel: {
-      fontSize: 10.5,
-      fontWeight: '700' as const,
-      color: colors.dark.text,
-    },
-    networkChipLabelActive: {
-      color: colors.dark.blue,
-    },
-    networkChipHint: {
-      fontSize: 8,
-      color: colors.dark.textMuted,
-      marginTop: 1,
-    },
-    netDot: {
-      width: 7,
-      height: 7,
+    dropdownDot: {
+      width: 8,
+      height: 8,
       borderRadius: 4,
     },
-
-    // ── guide box (blue) ──
-    guideBox: {
-      backgroundColor: colors.dark.blueDim,
+    dropdownBtnText: {
+      fontSize: 12.5,
+      fontWeight: '700' as const,
+      color: colors.dark.text,
+      marginRight: 8,
+    },
+    dropdownPanel: {
+      marginTop: 8,
+      backgroundColor: colors.dark.card,
       borderWidth: 1,
-      borderColor: colors.dark.blue + '40',
+      borderColor: colors.dark.border,
+      borderRadius: 12,
+      padding: 10,
+    },
+    dropdownSearch: {
+      backgroundColor: colors.dark.surfaceLight,
+      borderWidth: 1,
+      borderColor: colors.dark.border,
+      borderRadius: 8,
+      color: colors.dark.text,
+      fontSize: 12,
+      paddingHorizontal: 10,
+      paddingVertical: 7,
+      textAlign: 'right',
+      marginBottom: 8,
+    },
+    dropdownGroup: {
+      marginBottom: 10,
+    },
+    dropdownGroupHead: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginBottom: 3,
+    },
+    dropdownGroupTitle: {
+      fontSize: 11.5,
+      fontWeight: '800' as const,
+      color: colors.dark.accent,
+      textAlign: 'right',
+    },
+    dropdownGroupAction: {
+      padding: 4,
+      borderRadius: 6,
+      backgroundColor: colors.dark.accentDim,
+    },
+    dropdownGroupActionText: {
+      fontSize: 10,
+      fontWeight: '700' as const,
+      color: colors.dark.accent,
+    },
+    dropdownGroupNote: {
+      fontSize: 9,
+      lineHeight: 14,
+      color: colors.dark.textMuted,
+      textAlign: 'right',
+      marginBottom: 6,
+    },
+    dropdownScroll: {
+      maxHeight: 260,
+    },
+    dropdownScrollContent: {
+      paddingBottom: 4,
+    },
+    dropdownRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      paddingVertical: 7,
+      paddingHorizontal: 8,
+      borderRadius: 8,
+      marginBottom: 2,
+      backgroundColor: colors.dark.surfaceLight,
+      borderWidth: 1,
+      borderColor: 'transparent',
+    },
+    dropdownRowActive: {
+      borderColor: colors.dark.accent + '66',
+      backgroundColor: colors.dark.accent + '14',
+    },
+    dropdownRowDot: {
+      width: 10,
+      height: 10,
+      borderRadius: 5,
+    },
+    dropdownRowTexts: {
+      flex: 1,
+      gap: 1,
+    },
+    dropdownRowLabel: {
+      fontSize: 11.5,
+      fontWeight: '700' as const,
+      color: colors.dark.text,
+      textAlign: 'right',
+    },
+    dropdownRowHint: {
+      fontSize: 9,
+      color: colors.dark.textMuted,
+      textAlign: 'right',
+    },
+    checkbox: {
+      width: 20,
+      height: 20,
+      borderRadius: 6,
+      borderWidth: 1.5,
+      borderColor: colors.dark.border,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+
+    // ── guide + warning ──
+    guideBox: {
+      backgroundColor: colors.dark.blue + '10',
+      borderWidth: 1,
+      borderColor: colors.dark.blue + '30',
       borderRadius: 12,
       padding: 12,
       marginTop: 14,
@@ -1169,16 +1286,15 @@ const styles = createThemedStyles(() =>
     guideStep: {
       flexDirection: 'row',
       gap: 8,
-      marginBottom: 7,
+      marginBottom: 8,
     },
     guideStepNum: {
-      width: 17,
-      height: 17,
+      width: 18,
+      height: 18,
       borderRadius: 9,
-      backgroundColor: colors.dark.blue + '22',
+      backgroundColor: colors.dark.blue + '26',
       alignItems: 'center',
       justifyContent: 'center',
-      marginTop: 1,
     },
     guideStepNumText: {
       fontSize: 9.5,
@@ -1188,20 +1304,18 @@ const styles = createThemedStyles(() =>
     guideStepText: {
       flex: 1,
       fontSize: 10,
-      lineHeight: 17,
+      lineHeight: 16,
       color: colors.dark.textSecondary,
       textAlign: 'right',
     },
     guideBold: {
+      fontWeight: '800' as const,
       color: colors.dark.text,
-      fontWeight: '700' as const,
     },
-
-    // ── security warning (red) ──
     warnBox: {
       backgroundColor: colors.dark.redDim,
       borderWidth: 1,
-      borderColor: colors.dark.red + '42',
+      borderColor: colors.dark.red + '40',
       borderRadius: 12,
       padding: 12,
       marginTop: 10,
@@ -1210,26 +1324,25 @@ const styles = createThemedStyles(() =>
       flexDirection: 'row',
       alignItems: 'center',
       gap: 6,
-      marginBottom: 5,
+      marginBottom: 6,
     },
     warnTitle: {
-      fontSize: 11,
+      fontSize: 11.5,
       fontWeight: '800' as const,
       color: colors.dark.red,
       flex: 1,
       textAlign: 'right',
     },
     warnText: {
-      fontSize: 9.8,
-      lineHeight: 17,
+      fontSize: 10,
+      lineHeight: 16,
       color: colors.dark.textSecondary,
       textAlign: 'right',
     },
-
     formActions: {
       flexDirection: 'row',
       gap: 8,
-      marginTop: 16,
+      marginTop: 14,
     },
     formBtn: {
       flexDirection: 'row',
@@ -1237,72 +1350,54 @@ const styles = createThemedStyles(() =>
       justifyContent: 'center',
       gap: 6,
       borderRadius: 10,
-      paddingVertical: 11,
-      paddingHorizontal: 12,
+      paddingVertical: 10,
+      paddingHorizontal: 14,
     },
     formBtnSave: {
-      flex: 1.7,
+      flex: 1,
       backgroundColor: colors.dark.accent,
     },
     formBtnSaveText: {
-      fontSize: 12.5,
+      fontSize: 12,
       fontWeight: '800' as const,
       color: colors.dark.background,
     },
     formBtnCancel: {
-      flex: 1,
-      backgroundColor: colors.dark.card,
+      paddingHorizontal: 16,
+      backgroundColor: colors.dark.surfaceLight,
       borderWidth: 1,
       borderColor: colors.dark.border,
     },
     formBtnCancelText: {
-      fontSize: 12.5,
+      fontSize: 12,
       fontWeight: '700' as const,
       color: colors.dark.textSecondary,
-    },
-
-    addButton: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'center',
-      gap: 8,
-      backgroundColor: colors.dark.accentDim,
-      borderWidth: 1,
-      borderColor: colors.dark.accent + '55',
-      borderRadius: 14,
-      paddingVertical: 13,
-      marginBottom: 14,
-    },
-    addButtonText: {
-      fontSize: 13,
-      fontWeight: '800' as const,
-      color: colors.dark.accent,
     },
 
     // ── wallet card ──
     walletCard: {
       backgroundColor: colors.dark.surface,
-      borderRadius: 16,
-      borderWidth: 1,
-      borderColor: colors.dark.border,
+      borderRadius: 14,
       padding: 14,
       marginBottom: 12,
+      borderWidth: 1,
+      borderColor: colors.dark.border,
     },
     walletHeader: {
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 9,
+      gap: 8,
     },
     walletAvatar: {
-      width: 38,
-      height: 38,
-      borderRadius: 12,
+      width: 36,
+      height: 36,
+      borderRadius: 18,
       alignItems: 'center',
       justifyContent: 'center',
     },
     walletAvatarText: {
-      fontSize: 10.5,
-      fontWeight: '900' as const,
+      fontSize: 10,
+      fontWeight: '800' as const,
     },
     walletNameCol: {
       flex: 1,
@@ -1310,44 +1405,62 @@ const styles = createThemedStyles(() =>
     },
     walletName: {
       fontSize: 13,
-      fontWeight: '800' as const,
+      fontWeight: '700' as const,
       color: colors.dark.text,
-      textAlign: 'right',
     },
     walletAddress: {
-      fontSize: 9.5,
+      fontSize: 10,
       color: colors.dark.textMuted,
-      textAlign: 'right',
+    },
+    walletNetChips: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 3,
+      marginTop: 2,
+    },
+    walletNetChip: {
+      borderRadius: 5,
+      paddingHorizontal: 5,
+      paddingVertical: 1,
+    },
+    walletNetChipText: {
+      fontSize: 8.5,
+      fontWeight: '800' as const,
     },
     walletTotalCol: {
-      alignItems: 'flex-start',
-      minWidth: 70,
+      alignItems: 'flex-end',
       gap: 2,
+      maxWidth: 130,
     },
     walletTotalUsd: {
-      fontSize: 14,
+      fontSize: 13,
       fontWeight: '800' as const,
-      color: colors.dark.green,
+      color: colors.dark.text,
     },
     walletTotalToman: {
-      fontSize: 9,
+      fontSize: 10,
       color: colors.dark.textSecondary,
+    },
+    walletPnlLine: {
+      fontSize: 9.5,
+      fontWeight: '800' as const,
+      textAlign: 'left',
     },
     walletActions: {
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 4,
+      gap: 6,
     },
     walletIconBtn: {
-      padding: 6,
+      padding: 5,
       borderRadius: 8,
-      backgroundColor: colors.dark.card,
+      backgroundColor: colors.dark.surfaceLight,
     },
     walletBody: {
       marginTop: 10,
-      paddingTop: 10,
       borderTopWidth: 1,
       borderTopColor: colors.dark.border,
+      paddingTop: 10,
     },
     networkBadgeRow: {
       flexDirection: 'row',
@@ -1356,119 +1469,33 @@ const styles = createThemedStyles(() =>
       gap: 8,
       marginBottom: 8,
     },
-    netChipsWrap: {
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      gap: 5,
-      flex: 1,
-    },
-    netChip: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: 4,
-      backgroundColor: colors.dark.card,
-      borderWidth: 1,
-      borderRadius: 8,
-      paddingHorizontal: 7,
-      paddingVertical: 3,
-    },
-    netChipText: {
+    networkBadge: {
       fontSize: 9.5,
-      fontWeight: '700' as const,
-    },
-    networkBadgeReadonly: {
-      fontSize: 9.5,
-      fontWeight: '700' as const,
-      color: colors.dark.green,
-      backgroundColor: colors.dark.greenDim,
-      borderRadius: 8,
-      paddingHorizontal: 9,
-      paddingVertical: 4,
-      overflow: 'hidden',
-    },
-    editNetworksBtn: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'center',
-      gap: 6,
-      backgroundColor: colors.dark.blueDim,
-      borderWidth: 1,
-      borderColor: colors.dark.blue + '44',
-      borderRadius: 10,
-      paddingVertical: 8,
-      marginBottom: 10,
-    },
-    editNetworksBtnText: {
-      fontSize: 11,
-      fontWeight: '700' as const,
-      color: colors.dark.blue,
-    },
-    editNetworksBox: {
-      backgroundColor: colors.dark.card,
-      borderWidth: 1,
-      borderColor: colors.dark.blue + '33',
-      borderRadius: 12,
-      padding: 12,
-      marginBottom: 10,
-    },
-    editNetworksTitle: {
-      fontSize: 10.5,
-      fontWeight: '700' as const,
-      color: colors.dark.text,
-      textAlign: 'right',
-      marginBottom: 8,
-    },
-    editNetworksActions: {
-      flexDirection: 'row',
-      gap: 8,
-      marginTop: 10,
-    },
-    editNetworksActionBtn: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'center',
-      gap: 6,
-      borderRadius: 9,
-      paddingVertical: 8,
-      paddingHorizontal: 10,
-    },
-    editNetworksSaveBtn: {
-      flex: 1.4,
-      backgroundColor: colors.dark.blue,
-    },
-    editNetworksSaveText: {
-      fontSize: 11,
-      fontWeight: '800' as const,
-      color: colors.dark.background,
-    },
-    editNetworksCancelBtn: {
-      flex: 1,
-      backgroundColor: colors.dark.surfaceLight,
-      borderWidth: 1,
-      borderColor: colors.dark.border,
-    },
-    editNetworksCancelText: {
-      fontSize: 11,
       fontWeight: '700' as const,
       color: colors.dark.textSecondary,
+      flex: 1,
+      textAlign: 'right',
+    },
+    networkBadgeReadonly: {
+      fontSize: 9,
+      fontWeight: '700' as const,
+      color: colors.dark.green,
     },
     walletError: {
-      fontSize: 10,
+      fontSize: 10.5,
       color: colors.dark.red,
       textAlign: 'right',
       marginBottom: 8,
-      lineHeight: 16,
     },
     walletNotice: {
-      fontSize: 9.5,
-      color: colors.dark.accent,
+      fontSize: 9,
+      color: colors.dark.orange ?? '#F7931A',
       textAlign: 'right',
-      marginBottom: 8,
-      lineHeight: 15,
+      marginBottom: 6,
     },
     walletEmptyText: {
       fontSize: 10.5,
-      color: colors.dark.textSecondary,
+      color: colors.dark.textMuted,
       textAlign: 'right',
       paddingVertical: 8,
     },
@@ -1476,15 +1503,14 @@ const styles = createThemedStyles(() =>
       flexDirection: 'row',
       alignItems: 'center',
       gap: 8,
-      backgroundColor: colors.dark.card,
-      borderRadius: 10,
-      padding: 9,
-      marginBottom: 6,
+      paddingVertical: 7,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.dark.border + '66',
     },
     tokenIcon: {
-      width: 28,
-      height: 28,
-      borderRadius: 14,
+      width: 30,
+      height: 30,
+      borderRadius: 15,
       alignItems: 'center',
       justifyContent: 'center',
     },
@@ -1495,104 +1521,73 @@ const styles = createThemedStyles(() =>
     tokenMain: {
       flex: 1,
       gap: 1,
-      overflow: 'hidden',
-    },
-    tokenSymbolRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: 5,
     },
     tokenSymbol: {
       fontSize: 11.5,
-      fontWeight: '700' as const,
+      fontWeight: '800' as const,
       color: colors.dark.text,
     },
-    tokenNetBadge: {
-      borderRadius: 6,
-      paddingHorizontal: 5,
-      paddingVertical: 1,
-    },
-    tokenNetBadgeText: {
-      fontSize: 8,
-      fontWeight: '800' as const,
+    tokenNetTag: {
+      fontSize: 8.5,
+      color: colors.dark.textMuted,
     },
     tokenName: {
       fontSize: 9,
       color: colors.dark.textMuted,
     },
+    tokenPnl: {
+      fontSize: 9,
+      fontWeight: '700' as const,
+    },
     tokenQty: {
-      fontSize: 10.5,
-      fontWeight: '600' as const,
+      fontSize: 10,
       color: colors.dark.textSecondary,
-      minWidth: 64,
+      minWidth: 60,
       textAlign: 'left',
     },
     tokenValueCol: {
-      minWidth: 74,
-      alignItems: 'flex-start',
-      gap: 1,
+      alignItems: 'flex-end',
+      minWidth: 70,
     },
     tokenValue: {
-      fontSize: 11.5,
-      fontWeight: '700' as const,
+      fontSize: 11,
+      fontWeight: '800' as const,
       color: colors.dark.text,
     },
     tokenChange: {
       fontSize: 9,
-      fontWeight: '600' as const,
+      fontWeight: '700' as const,
     },
     walletFetchedAt: {
       fontSize: 9,
       color: colors.dark.textMuted,
-      marginTop: 4,
       textAlign: 'right',
+      marginTop: 8,
     },
     lockNote: {
       flexDirection: 'row',
       alignItems: 'center',
       gap: 6,
-      backgroundColor: colors.dark.greenDim,
-      borderRadius: 9,
-      paddingHorizontal: 10,
-      paddingVertical: 7,
       marginTop: 8,
+      backgroundColor: colors.dark.greenDim,
+      borderRadius: 8,
+      padding: 8,
     },
     lockNoteText: {
       flex: 1,
       fontSize: 9,
-      lineHeight: 14,
       color: colors.dark.green,
-      fontWeight: '600' as const,
       textAlign: 'right',
     },
 
-    // ── empty state ──
-    emptyState: {
-      alignItems: 'center',
-      paddingVertical: 34,
-      gap: 8,
-    },
-    emptyTitle: {
-      fontSize: 14,
-      fontWeight: '700' as const,
-      color: colors.dark.text,
-    },
-    emptySubtitle: {
-      fontSize: 10.5,
-      lineHeight: 18,
-      color: colors.dark.textSecondary,
-      textAlign: 'center',
-      paddingHorizontal: 14,
-    },
-
-    // ── PnL card ──
+    // ── PnL box ──
     pnlBox: {
-      marginTop: 12,
       backgroundColor: colors.dark.card,
       borderRadius: 12,
-      padding: 14,
-      borderWidth: 1,
-      borderColor: colors.dark.border,
+      padding: 12,
+      marginTop: 10,
+      borderTopWidth: 1,
+      borderTopColor: colors.dark.border,
     },
     pnlHeadRow: {
       flexDirection: 'row',
@@ -1601,107 +1596,143 @@ const styles = createThemedStyles(() =>
       marginBottom: 8,
     },
     pnlTitle: {
-      fontSize: 12,
+      fontSize: 11,
       fontWeight: '700' as const,
-      color: colors.dark.text,
+      color: colors.dark.textSecondary,
       flex: 1,
       textAlign: 'right',
     },
     pnlPeriodRow: {
       flexDirection: 'row',
-      gap: 6,
+      gap: 5,
       marginBottom: 10,
     },
     pnlPeriodChip: {
-      flex: 1,
-      alignItems: 'center',
-      paddingVertical: 5,
       borderRadius: 8,
-      backgroundColor: colors.dark.surface,
+      paddingHorizontal: 9,
+      paddingVertical: 4,
+      backgroundColor: colors.dark.surfaceLight,
       borderWidth: 1,
       borderColor: colors.dark.border,
     },
     pnlPeriodChipActive: {
-      backgroundColor: colors.dark.accentDim,
+      backgroundColor: colors.dark.accent,
       borderColor: colors.dark.accent,
     },
     pnlPeriodText: {
-      fontSize: 10.5,
-      fontWeight: '600' as const,
+      fontSize: 10,
+      fontWeight: '700' as const,
       color: colors.dark.textSecondary,
     },
     pnlPeriodTextActive: {
-      color: colors.dark.accent,
-      fontWeight: '700' as const,
+      color: colors.dark.background,
     },
     pnlLoading: {
       flexDirection: 'row',
       alignItems: 'center',
       gap: 8,
-      justifyContent: 'center',
       paddingVertical: 10,
     },
     pnlLoadingText: {
-      fontSize: 11,
-      color: colors.dark.textSecondary,
+      fontSize: 10.5,
+      color: colors.dark.textMuted,
     },
     pnlEmpty: {
-      fontSize: 10.5,
-      lineHeight: 17,
-      color: colors.dark.textSecondary,
-      textAlign: 'center',
+      fontSize: 10,
+      color: colors.dark.textMuted,
+      textAlign: 'right',
       paddingVertical: 8,
     },
     pnlTotal: {
-      fontSize: 20,
+      fontSize: 19,
       fontWeight: '800' as const,
-      textAlign: 'right',
+      textAlign: 'left',
     },
     pnlPctRow: {
       flexDirection: 'row',
-      justifyContent: 'flex-start',
-      marginVertical: 6,
+      marginTop: 6,
+      marginBottom: 4,
     },
     pnlPctChip: {
-      backgroundColor: colors.dark.green + '18',
-      borderRadius: 9,
-      paddingHorizontal: 10,
+      backgroundColor: colors.dark.green + '1C',
+      borderRadius: 8,
+      paddingHorizontal: 9,
       paddingVertical: 4,
     },
     pnlPctText: {
-      fontSize: 11,
+      fontSize: 10,
       fontWeight: '800' as const,
       color: colors.dark.green,
     },
     pnlToman: {
-      fontSize: 10.5,
+      fontSize: 11,
       fontWeight: '700' as const,
-      marginBottom: 6,
       textAlign: 'right',
+      marginTop: 2,
+      marginBottom: 6,
     },
     pnlRow: {
       flexDirection: 'row',
       justifyContent: 'space-between',
       alignItems: 'center',
-      paddingVertical: 5,
-      borderTopWidth: 1,
-      borderTopColor: colors.dark.border + '33',
+      paddingVertical: 4,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.dark.border + '66',
     },
     pnlRowLabel: {
-      fontSize: 11,
-      fontWeight: '600' as const,
-      color: colors.dark.textSecondary,
+      fontSize: 10.5,
+      fontWeight: '700' as const,
+      color: colors.dark.text,
     },
     pnlRowValue: {
-      fontSize: 12,
-      fontWeight: '700' as const,
+      fontSize: 10.5,
+      fontWeight: '800' as const,
     },
     pnlNote: {
-      fontSize: 9,
-      lineHeight: 15,
+      fontSize: 8.5,
+      lineHeight: 13,
       color: colors.dark.textMuted,
       textAlign: 'right',
       marginTop: 8,
+    },
+
+    // ── empty state + add button ──
+    addButton: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+      backgroundColor: colors.dark.accent + '1A',
+      borderWidth: 1,
+      borderColor: colors.dark.accent + '55',
+      borderRadius: 12,
+      paddingVertical: 12,
+      marginBottom: 12,
+    },
+    addButtonText: {
+      fontSize: 12.5,
+      fontWeight: '800' as const,
+      color: colors.dark.accent,
+    },
+    emptyState: {
+      alignItems: 'center',
+      padding: 24,
+      backgroundColor: colors.dark.surface,
+      borderRadius: 14,
+      borderWidth: 1,
+      borderColor: colors.dark.border,
+      gap: 10,
+    },
+    emptyTitle: {
+      fontSize: 13,
+      fontWeight: '800' as const,
+      color: colors.dark.text,
+    },
+    emptySubtitle: {
+      fontSize: 10.5,
+      lineHeight: 17,
+      color: colors.dark.textMuted,
+      textAlign: 'center',
     },
   })
 );

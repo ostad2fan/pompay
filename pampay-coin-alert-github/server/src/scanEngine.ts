@@ -9,6 +9,7 @@ import store from "./store";
 import { evaluatePineSubset, PineCandle } from "./pine";
 import { sendPushToAll } from "./push";
 import { sendTelegram } from "./telegram";
+import type { WhaleWalletConfig } from "./whaleWatch";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -39,6 +40,10 @@ export interface ScanConfig {
   memeEnabled?: boolean;
   preListingEnabled?: boolean;
   volumeThreshold?: number;
+  /** v1.4.17 — whale wallets monitored 24/7 by whaleWatch.ts (Hyperliquid). */
+  whaleWallets?: WhaleWalletConfig[];
+  /** v1.4.17 — master switch for whale notifications (default ON). */
+  whaleNotifications?: boolean;
 }
 
 export interface GainzSignal {
@@ -684,6 +689,8 @@ class ScanEngine {
       memeEnabled?: boolean;
       preListingEnabled?: boolean;
       volumeThreshold?: number;
+      whaleWallets?: WhaleWalletConfig[];
+      whaleNotifications?: boolean;
     };
 
     if (!b?.secret || typeof b.secret !== "string") {
@@ -695,6 +702,10 @@ class ScanEngine {
       return { status: 403, payload: { ok: false, error: "unauthorized" } };
     }
 
+    // v1.4.17 — MISSING fields MERGE with the existing config instead of
+    // wiping it. Root fix for «چند اعلان را خاموش کردم و دیگر هیچ اعلانی با
+    // برنامه بسته نیامد»: an app version (or a partial sync) that omits
+    // `indicators` / `whaleWallets` / flags no longer erases them server-side.
     const indicators: ServerIndicator[] = Array.isArray(b.indicators)
       ? b.indicators
           .filter((i) => i && typeof i.id === "string" && typeof i.code === "string")
@@ -708,7 +719,18 @@ class ScanEngine {
               : "1d",
             receiveSignals: !!i.receiveSignals,
           }))
-      : [];
+      : (existing?.indicators ?? []);
+
+    const whaleWallets: WhaleWalletConfig[] = Array.isArray(b.whaleWallets)
+      ? b.whaleWallets
+          .filter((w) => w && typeof w.address === "string")
+          .slice(0, 40)
+          .map((w) => ({
+            id: String(w.id ?? `wh-${w.address}`),
+            address: String(w.address).slice(0, 100),
+            label: String(w.label ?? "نهنگ").slice(0, 60),
+          }))
+      : (existing?.whaleWallets ?? []);
 
     const rawTfs = Array.isArray(b.gainzTimeframes) ? b.gainzTimeframes : [];
     const gainzTimeframes = rawTfs.filter(
@@ -722,22 +744,32 @@ class ScanEngine {
 
     const cfg: ScanConfig = {
       secret: b.secret,
-      botToken: (b.botToken ?? "").trim(),
-      chatId: (b.chatId ?? "").trim(),
-      gainzAlgoEnabled: b.gainzAlgoEnabled !== false,
-      gainzTimeframes: gainzTimeframes.length > 0 ? gainzTimeframes : ["1d"],
+      botToken: (b.botToken ?? existing?.botToken ?? "").trim(),
+      chatId: (b.chatId ?? existing?.chatId ?? "").trim(),
+      gainzAlgoEnabled: b.gainzAlgoEnabled !== undefined ? b.gainzAlgoEnabled !== false : (existing?.gainzAlgoEnabled ?? true),
+      gainzTimeframes: gainzTimeframes.length > 0 ? gainzTimeframes : (existing?.gainzTimeframes ?? ["1d"]),
       indicators,
-      hookEnabled: b.hookEnabled === true,
-      hookTimeframes: hookTimeframes.length > 0 ? hookTimeframes : ["1d"],
-      scannerEnabled: b.scannerEnabled !== false,
-      memeEnabled: b.memeEnabled !== false,
-      preListingEnabled: b.preListingEnabled !== false,
+      hookEnabled: b.hookEnabled !== undefined ? b.hookEnabled : (existing?.hookEnabled ?? false),
+      hookTimeframes: hookTimeframes.length > 0 ? hookTimeframes : (existing?.hookTimeframes ?? ["1d"]),
+      scannerEnabled: b.scannerEnabled !== undefined ? b.scannerEnabled : (existing?.scannerEnabled ?? true),
+      memeEnabled: b.memeEnabled !== undefined ? b.memeEnabled : (existing?.memeEnabled ?? true),
+      preListingEnabled: b.preListingEnabled !== undefined ? b.preListingEnabled : (existing?.preListingEnabled ?? true),
       volumeThreshold:
         typeof b.volumeThreshold === "number" && b.volumeThreshold >= 1 && b.volumeThreshold <= 10
           ? b.volumeThreshold
-          : 2.0,
+          : (existing?.volumeThreshold ?? 2.0),
+      whaleWallets,
+      whaleNotifications: b.whaleNotifications !== undefined ? b.whaleNotifications : (existing?.whaleNotifications ?? true),
     };
     await store.put("config", cfg);
+    // v1.4.17 — ALSO persist the config to /data (Railway volume mount point)
+    // so a restart/ redeploy no longer wipes the 24/7 notification path.
+    try {
+      const fs = await import("node:fs");
+      if (fs.existsSync("/data")) {
+        fs.writeFileSync("/data/pompay-config.json", JSON.stringify(cfg));
+      }
+    } catch {}
 
     // Catch-up: if today's scan hasn't happened yet (app was closed across
     // midnight), run it right away so the user gets missed signals.
@@ -796,7 +828,10 @@ class ScanEngine {
     const lastScanDate = (await store.get<string>("lastScanDate")) ?? "";
     const dailyDue = trigger === "manual" || isMidnight || lastScanDate !== utcDateStr();
 
-    if (tickTfs.length === 0 && !dailyDue) return { skipped: "not-due" };
+    // v1.4.17 — hooks are scanned on EVERY hourly tick, so a 1d-only
+    // selection no longer short-circuits the cycle as "not due".
+    const hookTickDue = cfg.hookEnabled;
+    if (tickTfs.length === 0 && !dailyDue && !hookTickDue) return { skipped: "not-due" };
 
     if (trigger !== "manual") {
       if (isMidnight) {
@@ -896,40 +931,40 @@ class ScanEngine {
         }
       }
 
-      // --- Hook Reversal (4h at every 4h candle close + hourly forming-candle
-      // check; 1d once per day on the confirmed candle) ---
+      // --- Hook Reversal (v1.4.17: EVERY hourly tick scans both selected
+      // timeframes with the forming-candle check — notify-key dedupe makes
+      // the extra runs harmless, and 1d-only users no longer wait until UTC
+      // midnight for their candle-close signal. Root fix for «هوک با برنامه
+      // بسته اعلان نمی‌فرستد».) ---
       if (cfg.hookEnabled) {
         const hookTfs = cfg.hookTimeframes ?? ["1d"];
-        const hook4hDue = hookTfs.includes("4h") && hour % 4 === 0;
-        if (dailyDue || hook4hDue) {
-          try {
-            const tfs: HookTimeframe[] = dailyDue ? hookTfs : ["4h"];
-            const fresh = await scanHookReversal(tfs, marketSets);
-            const stored = (await store.get<HookSignal[]>("hookSignals")) ?? [];
-            const ids = new Set(stored.map((s) => s.id));
-            const merged = [...fresh.filter((s) => !ids.has(s.id)), ...stored].slice(0, 200);
+        try {
+          const tfs: HookTimeframe[] = dailyDue ? hookTfs : hookTfs;
+          const fresh = await scanHookReversal(tfs, marketSets);
+          const stored = (await store.get<HookSignal[]>("hookSignals")) ?? [];
+          const ids = new Set(stored.map((s) => s.id));
+          const merged = [...fresh.filter((s) => !ids.has(s.id)), ...stored].slice(0, 200);
 
-            const keys = (await store.get<Record<string, boolean>>("hookNotifyKeys")) ?? {};
-            const isFirstRun = Object.keys(keys).length === 0;
-            const announce = fresh.filter((s) => !keys[s.id] && (!isFirstRun || freshSignal(s)));
-            for (const s of fresh) keys[s.id] = true;
+          const keys = (await store.get<Record<string, boolean>>("hookNotifyKeys")) ?? {};
+          const isFirstRun = Object.keys(keys).length === 0;
+          const announce = fresh.filter((s) => !keys[s.id] && (!isFirstRun || freshSignal(s)));
+          for (const s of fresh) keys[s.id] = true;
 
-            await store.put("hookNotifyKeys", boundKeys(keys, 700));
-            await store.put("hookSignals", merged);
+          await store.put("hookNotifyKeys", boundKeys(keys, 700));
+          await store.put("hookSignals", merged);
 
-            if (announce.length > 0) {
-              hookNew = announce.length;
-              await sendTelegram(cfg, buildHookText(announce));
-              await sendPushToAll(
-                "🪝 سیگنال هوک ریورسال",
-                signalPushText("hook", announce),
-                { kind: "hook", count: announce.length }
-              );
-            }
-            console.log(`[ScanServer] hook cycle: ${fresh.length} current, ${hookNew} new`);
-          } catch (e) {
-            console.log("[ScanServer] hook scan failed:", e);
+          if (announce.length > 0) {
+            hookNew = announce.length;
+            await sendTelegram(cfg, buildHookText(announce));
+            await sendPushToAll(
+              "🪝 سیگنال هوک ریورسال",
+              signalPushText("hook", announce),
+              { kind: "hook", count: announce.length }
+            );
           }
+          console.log(`[ScanServer] hook cycle: ${fresh.length} current, ${hookNew} new`);
+        } catch (e) {
+          console.log("[ScanServer] hook scan failed:", e);
         }
       }
 

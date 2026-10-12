@@ -23,6 +23,7 @@ const EXCHANGE_CONFIGS_KEY = '@real_trade_exchange_configs';
 const AUTO_TRADE_CONFIG_KEY = '@real_trade_auto_config';
 const AUTO_TRADE_LOG_KEY = '@real_trade_auto_log';
 const TRACKED_WALLETS_KEY = '@tracked_whale_wallets';
+const WALLETS_KEY = '@exchange_wallets';
 const TELEGRAM_OFFSET_KEY = '@telegram_last_update_id';
 
 interface TelegramSettings {
@@ -234,6 +235,9 @@ async function handleCommand(command: string, token: string, chatId: string): Pr
     case '/whale':
       await handleWhaleCommand(token, chatId);
       break;
+    case '/portfolio':
+      await handlePortfolioCommand(token, chatId);
+      break;
     case '/gainz':
       await handleGainzCommand(token, chatId);
       break;
@@ -262,27 +266,35 @@ async function handleStartCommand(token: string, chatId: string): Promise<void> 
     '/status - 📊 وضعیت کلی حساب و ربات',
     '/signals - 🎯 آخرین سیگنال‌های AI',
     '/positions - 📈 پوزیشن‌های باز',
-    '/balance - 💰 موجودی حساب',
+    '/balance - 💰 موجودی صرافی‌ها + کیف بلاکچین',
+    '/portfolio - 👛 خلاصه کل دارایی (صرافی + ریالی/فلزات + کیف بلاکچین)',
     '/scanner - 🔍 وضعیت اسکنر سیگنال',
     '/meme - 💀 اسکنر میم‌کوین',
-    '/whale - 🐋 ردیابی نهنگ‌ها',
+    '/whale - 🐋 ردیابی نهنگ‌ها و موقعیت‌های باز آن‌ها',
     '/gainz - 📊 سیگنال اندیکاتور GainzAlgo (روزانه)',
     '/indicators - 🧩 اندیکاتورهای دستی شما',
     '/hook - 🪝 سیگنال‌های هوک ریورسال (۴ ساعته/روزانه)',
     '/help - ❓ راهنمای کامل',
     '',
-    '🔔 <b>اعلان‌های فعال</b>',
+    '🔔 <b>اعلان‌های فعال (۲۴ ساعته — حتی با برنامه بسته)</b>',
     '• سیگنال‌های اسکنر (پامپ/دامپ)',
     '• سیگنال‌های AI و Confluence',
     '• باز/بسته شدن پوزیشن‌ها (دمو و واقعی)',
     '• اسکنر شورت میم‌کوین',
     '• اسکنر قبل لیست شدن',
-    '• فعالیت نهنگ‌ها',
+    '• فعالیت نهنگ‌ها + باز/بسته شدن پوزیشن نهنگ‌های ردیابی‌شده (Hyperliquid)',
     '• 📊 سیگنال‌های خرید/فروش اندیکاتور GainzAlgo (۱ ساعته، ۴ ساعته یا روزانه — اسکن سرور حتی با برنامه بسته)',
     '• 🧩 سیگنال‌های اندیکاتورهای دستی شما',
+    '• 🪝 هوک ریورسال — هر ساعت بررسی می‌شود',
+    '',
+    '🆕 <b>بخش‌های جدید برنامه (از تنظیمات داخلی برنامه مدیریت می‌شوند)</b>',
+    '👛 مدیریت دارایی — ۴ تب: ارز دیجیتال (صرافی‌ها) / دارایی ریالی و فلزات / پیش‌بینی طلا / کیف پول بلاکچین',
+    '⛓ کیف پول بلاکچین فقط‌خواندنی: یک آدرس روی ۵۱ شبکه (EVM + سولانا + تون/تون‌کیپر + ترون + بیت‌کوین و…) با PnL سه‌سطحی',
+    '💵 دارایی ریالی و فلزات: ارزش دلاری/تتری/تومانی کل کیف‌ها در همان بخش + سود/زیان ۷/۳۰/۹۰/۱۸۰ روزه',
+    '🥇 پیش‌بینی طلا (IME آتی شمش ۹۹۵)',
     '',
     '⚡️ تمام اعلان‌ها به صورت خودکار ارسال می‌شوند.',
-    '📱 مدیریت کامل تنظیمات از داخل برنامه اصلی انجام می‌شود.',
+    '📱 مدیریت کامل تنظیمات از داخل برنامه اصلی انجام می‌شود (برنامه پیش‌فرض روی صفحه تنظیمات باز می‌شود).',
   ].join('\n');
 
   await sendMessageDirect(token, chatId, text);
@@ -852,6 +864,119 @@ async function handleHookCommand(token: string, chatId: string): Promise<void> {
   } catch (e) {
     console.log('[Telegram] Hook command error', e);
     await sendMessageDirect(token, chatId, '❌ خطا در دریافت سیگنال‌های هوک ریورسال.');
+  }
+}
+
+/** v1.4.17 — live tether price for /portfolio (server price endpoints). */
+async function fetchLiveTetherToman(): Promise<number> {
+  for (const url of [
+    'https://api.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=rls',
+    'https://pompay-production.up.railway.app/nobitex/usdt-toman',
+    'https://pompay-production.up.railway.app/alanchand/usdt-toman',
+  ]) {
+    try {
+      const res = await fetch(url, { headers: { Accept: 'application/json' } });
+      if (!res.ok) continue;
+      const d = await res.json();
+      // Nobitex shape: rial (sub-10k digits) → convert to toman
+      const nobitexRls = Number(d?.stats?.usdt?.rls?.last);
+      if (nobitexRls > 1000) return nobitexRls / 10;
+      // server relay shape: already toman
+      const serverToman = Number(d?.usdtToToman) || Number(d?.price);
+      if (serverToman > 1000) return serverToman;
+    } catch {}
+  }
+  return 0;
+}
+
+/**
+ * v1.4.17 — /portfolio: خلاصه کل دارایی از داده‌های داخل برنامه:
+ * صرافی‌ها (دلاری) + دارایی ریالی/فلزات + کیف پول بلاکچین + تتر کل.
+ */
+async function handlePortfolioCommand(token: string, chatId: string): Promise<void> {
+  try {
+    const lines: string[] = ['👛 <b>خلاصه کل دارایی</b>\n'];
+
+    // صرافی‌ها
+    let exchangeUsd = 0;
+    let exchangeUsdt = 0;
+    try {
+      const raw = await AsyncStorage.getItem(WALLETS_KEY);
+      const wallets = raw ? JSON.parse(raw) : [];
+      for (const w of wallets) {
+        const cacheRaw = await AsyncStorage.getItem(`@wallet_balance_cache_${w.id}`);
+        if (!cacheRaw) continue;
+        const data = JSON.parse(cacheRaw);
+        if (typeof data?.totalValueUsd === 'number') exchangeUsd += data.totalValueUsd;
+        for (const b of data?.balances ?? []) {
+          if (b?.asset === 'USDT') exchangeUsdt += Number(b?.total) || 0;
+        }
+      }
+    } catch {}
+    if (exchangeUsd > 0) {
+      lines.push(`🏦 صرافی‌ها: $${exchangeUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}`);
+      lines.push(`   تتر صرافی‌ها: ${exchangeUsdt.toFixed(2)} USDT`);
+    }
+
+    // کیف بلاکچین
+    let bcUsd = 0;
+    let bcUsdt = 0;
+    try {
+      const raw = await AsyncStorage.getItem('@blockchain_wallets_v1');
+      const wallets = raw ? JSON.parse(raw) : [];
+      for (const w of wallets) {
+        const cacheRaw = await AsyncStorage.getItem('@blockchain_balance_cache_v1');
+        if (!cacheRaw) continue;
+        const map = JSON.parse(cacheRaw);
+        const data = map?.[w?.id];
+        if (typeof data?.totalUsd === 'number') bcUsd += data.totalUsd;
+        for (const t of data?.tokens ?? []) {
+          if (t?.symbol === 'USDT') bcUsdt += Number(t?.qty) || 0;
+        }
+      }
+    } catch {}
+    if (bcUsd > 0) {
+      lines.push(`⛓ کیف بلاکچین: $${bcUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}`);
+      lines.push(`   تتر بلاکچین: ${bcUsdt.toFixed(2)} USDT`);
+    }
+
+    // دارایی ریالی و فلزات
+    try {
+      const raw = await AsyncStorage.getItem('@local_assets_v1');
+      const a = raw ? JSON.parse(raw) : {};
+      const parts: string[] = [];
+      if (a.rialCash) parts.push(`ریال ${Number(a.rialCash).toLocaleString('fa-IR')}`);
+      if (a.usdCash) parts.push(`دلار کاغذی ${Number(a.usdCash)}`);
+      if (a.goldGrams) parts.push(`طلا ${a.goldGrams} گرم`);
+      if (a.silverGrams) parts.push(`نقره ${a.silverGrams} گرم`);
+      if (a.coinEmami || a.coinBahar) parts.push('سکه');
+      if (parts.length > 0) lines.push(`🥇 دارایی ریالی/فلزات: ${parts.join(' • ')}`);
+    } catch {}
+
+    // قیمت تتر + مجموع تومانی
+    try {
+      const tether = await fetchLiveTetherToman();
+      if (tether > 0) {
+        lines.push(`💵 قیمت تتر: ${tether.toLocaleString('fa-IR')} تومان`);
+        const totalUsd = exchangeUsd + bcUsd;
+        if (totalUsd > 0) {
+          lines.push(`💰 مجموع کریپتو: $${totalUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} ≈ ${Math.round(totalUsd * tether).toLocaleString('fa-IR')} تومان`);
+        }
+        const totalUsdt = exchangeUsdt + bcUsdt;
+        if (totalUsdt > 0) {
+          lines.push(`🪙 تتر کل: ${totalUsdt.toFixed(2)} USDT ≈ ${Math.round(totalUsdt * tether).toLocaleString('fa-IR')} تومان`);
+        }
+      }
+    } catch {}
+
+    if (lines.length <= 1) {
+      lines.push('هنوز کیف/دارایی‌ای ثبت نشده است. در برنامه تب «مدیریت دارایی» را باز کنید.');
+    }
+    lines.push('', '📱 جزئیات کامل در تب «مدیریت دارایی» برنامه');
+    await sendMessageDirect(token, chatId, lines.join('\n'));
+  } catch (e) {
+    console.log('[Telegram] /portfolio error:', e);
+    await sendMessageDirect(token, chatId, 'خطا در ساخت خلاصه دارایی.');
   }
 }
 

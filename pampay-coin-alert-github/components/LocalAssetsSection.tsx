@@ -113,6 +113,12 @@ interface Props {
   hasBlockchainWallet?: boolean;
   /** v1.4.16 — per-period TOMAN PnL (+basis) of the blockchain holdings. */
   blockchainPnlTomanByPeriod?: Record<number, { pnlToman: number; basisToman: number } | null>;
+  /** v1.4.17 — USD value of blockchain wallets (rial-tab summary rows). */
+  blockchainUsd?: number;
+  /** v1.4.17 — total USDT qty across exchange wallets (rial-tab row). */
+  exchangeUsdtQty?: number;
+  /** v1.4.17 — total USDT qty across blockchain wallets (rial-tab row). */
+  blockchainUsdtQty?: number;
 }
 
 const EXPANDED_KEY = '@local_assets_expanded_v1';
@@ -123,6 +129,9 @@ export default function LocalAssetsSection({
   blockchainToman = 0,
   hasBlockchainWallet = false,
   blockchainPnlTomanByPeriod,
+  blockchainUsd = 0,
+  exchangeUsdtQty = 0,
+  blockchainUsdtQty = 0,
 }: Props) {
   const [assets, setAssets] = useState<LocalAssets>(EMPTY_ASSETS);
   // v1.4.16 — «دارایی‌های من» collapsible with its own arrow; persisted.
@@ -193,6 +202,9 @@ export default function LocalAssetsSection({
   const cryptoToman = usdtToToman > 0 ? totalPortfolioUsd * usdtToToman : 0;
   // v1.4.16 — read-only blockchain wallets count toward the grand total.
   const blockchainValue = hasBlockchainWallet ? blockchainToman : 0;
+  // v1.4.17 — summary values for the crypto rows («همان الگوی طلا/دلار کاغذی»)
+  const totalUsdtQty = exchangeUsdtQty + blockchainUsdtQty;
+  const totalUsdtToman = usdtToToman > 0 ? totalUsdtQty * usdtToToman : 0;
   const grandTotal =
     rialValue + usdValue + goldValue + silverValue + coinsValue + cryptoToman + blockchainValue;
   const hasAnyInput =
@@ -332,6 +344,38 @@ export default function LocalAssetsSection({
                     p && p.dollar > 0 ? '' : ' (تتر)'
                   }`
                 : 'نرخ دلار در حال دریافت'
+            }
+          />
+
+          {/* ── v1.4.17 — crypto summary rows (الگوی طلا/دلار کاغذی):
+              ارزش دلاری همه کیف‌ها + تتر کل + معادل تومانی، فقط خواندنی ── */}
+          <CryptoSummaryRow
+            icon={<Coins size={14} color={'#F0B90B'} />}
+            label="ارز دیجیتال — کیف‌های صرافی"
+            qtyLabel={`$${totalPortfolioUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}`}
+            tomanValue={cryptoToman}
+            hint="مجموع موجودی همه صرافی‌های متصل (اسپات/ارن/فاندینگ/فیوچرز) — از تب «ارز دیجیتال»"
+          />
+          <CryptoSummaryRow
+            icon={<Lock size={14} color={colors.dark.green} />}
+            label="کیف پول بلاکچین (فقط خواندنی)"
+            qtyLabel={`$${blockchainUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}`}
+            tomanValue={blockchainValue}
+            hint={
+              hasBlockchainWallet
+                ? 'مجموع کیف‌های بلاکچین از تب «کیف پول بلاکچین»'
+                : 'هنوز کیف بلاکچینی اضافه نشده — از تب «کیف پول بلاکچین»'
+            }
+          />
+          <CryptoSummaryRow
+            icon={<Banknote size={14} color={colors.dark.accent} />}
+            label="تتر کل (USDT)"
+            qtyLabel={`${totalUsdtQty.toLocaleString('en-US', { maximumFractionDigits: 4 })} USDT`}
+            tomanValue={totalUsdtToman}
+            hint={
+              usdtToToman > 0
+                ? `قیمت هر تتر: ${formatFullToman(usdtToToman)} تومان • صرافی ${exchangeUsdtQty.toFixed(2)} + کیف بلاکچین ${blockchainUsdtQty.toFixed(2)}`
+                : 'قیمت تتر در حال دریافت'
             }
           />
 
@@ -807,6 +851,42 @@ function AssetRow({
   );
 }
 
+// v1.4.17 — read-only crypto summary row (الگوی طلا/دلار کاغذی): shows the
+// USD amount / USDT qty + its TOMAN value; data comes from the wallet tabs.
+function CryptoSummaryRow({
+  icon,
+  label,
+  qtyLabel,
+  tomanValue,
+  hint,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  qtyLabel: string;
+  tomanValue: number;
+  hint: string;
+}) {
+  return (
+    <View style={styles.assetRow}>
+      {icon}
+      <View style={styles.assetMain}>
+        <Text style={styles.assetLabel}>{label}</Text>
+        <View style={styles.assetInputRow}>
+          <View style={styles.summaryQtyBox}>
+            <Text style={styles.summaryQtyText}>{qtyLabel}</Text>
+          </View>
+        </View>
+        <Text style={styles.assetHint}>{hint}</Text>
+      </View>
+      <View style={styles.assetValueCol}>
+        <Text style={[styles.assetValue, !(tomanValue > 0) && styles.assetValueEmpty]}>
+          {tomanValue > 0 ? `${formatFullToman(Math.round(tomanValue))} ت` : '—'}
+        </Text>
+      </View>
+    </View>
+  );
+}
+
 function Selector({
   options,
   active,
@@ -932,6 +1012,20 @@ const styles = createThemedStyles(() =>
       height: 1,
       backgroundColor: colors.dark.border,
       marginVertical: 12,
+    },
+    summaryQtyBox: {
+      backgroundColor: colors.dark.surfaceLight,
+      borderWidth: 1,
+      borderColor: colors.dark.accent + '44',
+      borderRadius: 10,
+      paddingHorizontal: 12,
+      paddingVertical: 9,
+      alignItems: 'flex-end',
+    },
+    summaryQtyText: {
+      fontSize: 13,
+      fontWeight: '800' as const,
+      color: colors.dark.text,
     },
     assetRow: {
       flexDirection: 'row',

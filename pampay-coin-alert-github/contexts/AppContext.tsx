@@ -39,6 +39,8 @@ import { registerPushOnServer, ensureNotificationPermission } from '@/utils/push
 import { checkVpnStatus } from '@/utils/vpnGuard';
 import { setThemeMode as applyPalette, getThemeMode, type ThemeMode } from '@/constants/colors';
 
+const TRACKED_WALLETS_KEY = '@tracked_whale_wallets';
+
 const DEFAULT_SETTINGS: AppSettings = {
   apiKey: '',
   apiSecret: '',
@@ -559,6 +561,57 @@ export const [AppProvider, useApp] = createContextHook(() => {
     }
   }, [settings.telegramEnabled, settings.telegramBotToken, settings.telegramChatId]);
 
+  // v1.4.17 — tracked whale wallets are synced too so the SERVER watches
+  // their Hyperliquid positions 24/7 (open/close/size-change → Telegram).
+  const [whaleWalletsState, setWhaleWalletsState] = useState<
+    { id: string; address: string; label: string }[]
+  >([]);
+  const [whaleWalletsLoaded, setWhaleWalletsLoaded] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(TRACKED_WALLETS_KEY);
+        if (raw) {
+          const list = (JSON.parse(raw) as { id?: string; address?: string; label?: string }[])
+            .filter((w) => w && typeof w.address === 'string')
+            .map((w) => ({
+              id: String(w.id ?? `wh-${w.address}`),
+              address: String(w.address),
+              label: String(w.label ?? 'نهنگ'),
+            }));
+          if (!cancelled) setWhaleWalletsState(list);
+        }
+      } catch {}
+      if (!cancelled) setWhaleWalletsLoaded(true);
+    })();
+    // re-read when the whales tab saves its list (wallets query invalidation
+    // bumps this key)
+    const timer = setInterval(() => {
+      (async () => {
+        try {
+          const raw = await AsyncStorage.getItem(TRACKED_WALLETS_KEY);
+          const list = raw
+            ? (JSON.parse(raw) as { id?: string; address?: string; label?: string }[])
+                .filter((w) => w && typeof w.address === 'string')
+                .map((w) => ({
+                  id: String(w.id ?? `wh-${w.address}`),
+                  address: String(w.address),
+                  label: String(w.label ?? 'نهنگ'),
+                }))
+            : [];
+          setWhaleWalletsState((prev) =>
+            JSON.stringify(prev) === JSON.stringify(list) ? prev : list
+          );
+        } catch {}
+      })();
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
   // Sync the scan config to the server so the daily UTC-midnight scan runs
   // even when the app is fully closed (signals announced via Telegram).
   useEffect(() => {
@@ -574,6 +627,8 @@ export const [AppProvider, useApp] = createContextHook(() => {
       memeEnabled: settings.memeShortNotifications !== false,
       preListingEnabled: settings.preListingNotifications !== false,
       volumeThreshold: settings.volumeThreshold,
+      whaleWallets: whaleWalletsLoaded ? whaleWalletsState : undefined,
+      whaleNotifications: settings.whaleNotifications !== false,
     });
   }, [
     settings.telegramEnabled,
@@ -587,6 +642,9 @@ export const [AppProvider, useApp] = createContextHook(() => {
     settings.memeShortNotifications,
     settings.preListingNotifications,
     settings.volumeThreshold,
+    settings.whaleNotifications,
+    whaleWalletsState,
+    whaleWalletsLoaded,
   ]);
 
   // Pull the signals the server computed while the app was closed into local
@@ -654,6 +712,8 @@ export const [AppProvider, useApp] = createContextHook(() => {
         memeEnabled: settings.memeShortNotifications !== false,
         preListingEnabled: settings.preListingNotifications !== false,
         volumeThreshold: settings.volumeThreshold,
+        whaleWallets: whaleWalletsLoaded ? whaleWalletsState : undefined,
+        whaleNotifications: settings.whaleNotifications !== false,
       })
         .then((r) => {
           console.log('[AppContext] background config sync:', r.ok ? 'ok' : r.reason);
@@ -673,6 +733,9 @@ export const [AppProvider, useApp] = createContextHook(() => {
     settings.memeShortNotifications,
     settings.preListingNotifications,
     settings.volumeThreshold,
+    settings.whaleNotifications,
+    whaleWalletsState,
+    whaleWalletsLoaded,
   ]);
 
   useEffect(() => {
