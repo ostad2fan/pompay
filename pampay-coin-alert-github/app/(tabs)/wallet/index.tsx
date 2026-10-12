@@ -28,6 +28,7 @@ import {
   Bitcoin,
   Landmark,
   Sparkles,
+  Link as LinkIcon,
 } from 'lucide-react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -55,6 +56,26 @@ import { fetchForeignPeriodPnl } from '@/utils/foreignExchangePnl';
 import { exchangeNow, markClockStale } from '@/utils/exchangeClock';
 import LocalAssetsSection from '@/components/LocalAssetsSection';
 import GoldPredictionSection from '@/components/GoldPredictionSection';
+import BlockchainWalletsSection from '@/components/BlockchainWalletsSection';
+import {
+  BlockchainWallet,
+  BlockchainWalletData,
+  BlockchainNetwork,
+  loadBlockchainWallets,
+  saveBlockchainWallets,
+  readBlockchainBalanceCache,
+  removeBlockchainBalanceCache,
+  validateBlockchainAddress,
+} from '@/utils/blockchainWallets';
+import {
+  fetchBlockchainWalletData,
+  computeBlockchainPnl,
+} from '@/utils/blockchainWalletApi';
+import {
+  fetchTgjuCloses,
+  closeAtOrBefore,
+  TgjuHistorySymbol,
+} from '@/utils/tgjuHistoryApi';
 
 interface ExchangeWallet {
   id: string;
@@ -1988,16 +2009,17 @@ export default function WalletScreen() {
   const [expandedWallet, setExpandedWallet] = useState<string | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
 
-  // v1.4.14 — three top-level tabs of the asset-management screen:
-  //   ۱. ارز دیجیتال (exchanges)   ۲. دارایی ریالی و فلزات   ۳. پیش‌بینی قیمت طلا
+  // v1.4.14 — three top-level tabs of the asset-management screen + v1.4.16
+  // 4th tab «کیف پول بلاکچین» (read-only blockchain wallets):
+  //   ۱. ارز دیجیتال   ۲. دارایی ریالی و فلزات   ۳. پیش‌بینی طلا   ۴. کیف پول بلاکچین
   // Persisted so the user returns to the tab they last used.
-  const [activeMainTab, setActiveMainTab] = useState<'crypto' | 'rial' | 'gold'>('crypto');
+  const [activeMainTab, setActiveMainTab] = useState<'crypto' | 'rial' | 'gold' | 'blockchain'>('crypto');
   useEffect(() => {
     AsyncStorage.getItem('@wallet_main_tab_v1').then((t) => {
-      if (t === 'rial' || t === 'gold' || t === 'crypto') setActiveMainTab(t);
+      if (t === 'rial' || t === 'gold' || t === 'crypto' || t === 'blockchain') setActiveMainTab(t);
     }).catch(() => {});
   }, []);
-  const switchMainTab = useCallback((t: 'crypto' | 'rial' | 'gold') => {
+  const switchMainTab = useCallback((t: 'crypto' | 'rial' | 'gold' | 'blockchain') => {
     setActiveMainTab(t);
     AsyncStorage.setItem('@wallet_main_tab_v1', t).catch(() => {});
   }, []);
@@ -2070,6 +2092,10 @@ export default function WalletScreen() {
           queryClient.invalidateQueries({ queryKey: ['exchange-pnl', w.id] });
         }
       });
+      // v1.4.16 — blockchain wallets refresh themselves too when the VPN
+      // comes back (their balance/PnL APIs are all foreign).
+      queryClient.invalidateQueries({ queryKey: ['blockchain-balance'] });
+      queryClient.invalidateQueries({ queryKey: ['blockchain-pnl'] });
     }
     prevVpnRef.current = vpnStatus;
   }, [vpnStatus, wallets, queryClient]);
@@ -2169,6 +2195,210 @@ export default function WalletScreen() {
     }
     return found ? total : null;
   }, [wallets, balanceByWalletId]);
+
+  // ── v1.4.16 — READ-ONLY blockchain wallets (4th tab «کیف پول بلاکچین») ──
+  // Only PUBLIC addresses are stored; balances are read from keyless public
+  // APIs. The same query machinery pattern as the exchange wallets above:
+  // cache-first snapshots → staggered background refresh → VPN gate.
+  const blockchainWalletsQuery = useQuery({
+    queryKey: ['blockchain-wallets'],
+    queryFn: loadBlockchainWallets,
+    staleTime: Infinity,
+  });
+  const bcWallets = blockchainWalletsQuery.data ?? [];
+  const hasBlockchainWallet = bcWallets.length > 0;
+
+  // v1.4.3 pattern — persisted balance snapshots BEFORE the queries mount, so
+  // the whole blockchain portfolio appears INSTANTLY, then silently refreshes.
+  const bcWalletsKey = useMemo(() => bcWallets.map((w) => w.id).join('|'), [bcWallets]);
+  const [bcCaches, setBcCaches] = useState<Record<string, BlockchainWalletData | null>>({});
+  const [bcCachesLoaded, setBcCachesLoaded] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setBcCachesLoaded(false);
+    (async () => {
+      const ids = bcWalletsKey ? bcWalletsKey.split('|') : [];
+      const entries = await Promise.all(
+        ids.map(async (id) => [id, await readBlockchainBalanceCache(id)] as const)
+      );
+      if (!cancelled) {
+        setBcCaches(Object.fromEntries(entries));
+        setBcCachesLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [bcWalletsKey]);
+
+  const bcBalanceQueries = useQueries({
+    queries: bcCachesLoaded
+      ? bcWallets.map((w, idx) => ({
+          queryKey: ['blockchain-balance', w.id],
+          queryFn: async (): Promise<BlockchainWalletData> => {
+            // same stagger as exchange balances — smooths the cold-start burst
+            if (idx > 0) {
+              await new Promise((r) => setTimeout(r, Math.min(idx, 6) * 250));
+            }
+            return fetchBlockchainWalletData(w);
+          },
+          initialData: bcCaches[w.id] ?? undefined,
+          initialDataUpdatedAt: bcCaches[w.id]?.fetchedAt,
+          refetchInterval: vpnStatus === 'iran' ? false : refreshMs,
+          refetchOnMount: vpnStatus === 'iran' ? false : 'always',
+          staleTime: 30_000,
+          retry: 2,
+          retryDelay: (attempt: number) => 1200 * (attempt + 1),
+        }))
+      : [],
+  });
+
+  const bcBalanceByWallet = useMemo(() => {
+    const map: Record<
+      string,
+      { data?: BlockchainWalletData; isFetching: boolean; error?: unknown }
+    > = {};
+    bcWallets.forEach((w, i) => {
+      map[w.id] = {
+        data: bcBalanceQueries[i]?.data,
+        isFetching: bcBalanceQueries[i]?.isFetching ?? false,
+        error: bcBalanceQueries[i]?.error,
+      };
+    });
+    return map;
+  }, [bcWallets, bcBalanceQueries]);
+
+  const blockchainTotalUsd = useMemo(
+    () =>
+      bcWallets.reduce((s, w) => s + (bcBalanceByWallet[w.id]?.data?.totalUsd ?? 0), 0),
+    [bcWallets, bcBalanceByWallet]
+  );
+  const blockchainToman = usdtToToman > 0 ? blockchainTotalUsd * usdtToToman : 0;
+
+  // PnL over all four periods at once — keyed by the aggregated holdings so
+  // it recomputes whenever balances change (qty/asset shifts).
+  const bcTokensKey = useMemo(
+    () =>
+      bcWallets
+        .map((w) => {
+          const d = bcBalanceByWallet[w.id]?.data;
+          return d
+            ? `${w.id}:${d.tokens
+                .map((t) => `${t.symbol}:${t.qty.toFixed(6)}`)
+                .join(',')}`
+            : `${w.id}:-`;
+        })
+        .join('|'),
+    [bcWallets, bcBalanceByWallet]
+  );
+  const bcPnlQuery = useQuery({
+    queryKey: ['blockchain-pnl', bcTokensKey],
+    queryFn: () =>
+      computeBlockchainPnl(
+        bcWallets,
+        Object.fromEntries(bcWallets.map((w) => [w.id, bcBalanceByWallet[w.id]?.data]))
+      ),
+    enabled:
+      hasBlockchainWallet &&
+      vpnStatus !== 'iran' &&
+      bcWallets.some((w) => bcBalanceByWallet[w.id]?.data),
+    staleTime: 5 * 60_000,
+    retry: 1,
+  });
+
+  // Toman FX basis for the rial-tab blockchain PnL row — the free-market
+  // dollar daily series (TGJU has no tether history; same source the paper-USD
+  // PnL row already uses).
+  const bcDollarQuery = useQuery({
+    queryKey: ['tgju-history-blockchain-dollar'],
+    queryFn: () => fetchTgjuCloses(TgjuHistorySymbol.dollar),
+    enabled: hasBlockchainWallet,
+    staleTime: 10 * 60_000,
+    retry: 1,
+  });
+
+  /** Per-period TOMAN PnL of the blockchain holdings (market change incl. FX). */
+  const blockchainPnlTomanByPeriod = useMemo(() => {
+    const out: Record<number, { pnlToman: number; basisToman: number } | null> = {
+      7: null,
+      30: null,
+      90: null,
+      180: null,
+    };
+    const summary = bcPnlQuery.data;
+    const series = bcDollarQuery.data;
+    if (!summary) return out;
+    for (const p of [7, 30, 90, 180] as const) {
+      const per = summary.byPeriod[p];
+      if (!per || per.usdThen <= 0 || usdtToToman <= 0) continue;
+      if (!series || series.length === 0) continue;
+      const dollarThen = closeAtOrBefore(series, Date.now() - p * 86_400_000);
+      if (dollarThen === null || dollarThen <= 0) continue;
+      const basisToman = per.usdThen * dollarThen;
+      out[p] = { pnlToman: per.usdNow * usdtToToman - basisToman, basisToman };
+    }
+    return out;
+  }, [bcPnlQuery.data, bcDollarQuery.data, usdtToToman]);
+
+  const bcSaveMutation = useMutation({
+    mutationFn: async (list: BlockchainWallet[]) => {
+      await saveBlockchainWallets(list);
+      return list;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['blockchain-wallets'] });
+    },
+  });
+
+  const handleAddBlockchainWallet = useCallback(
+    async (name: string, network: BlockchainNetwork, address: string): Promise<boolean> => {
+      const v = validateBlockchainAddress(network, address);
+      if (!v.ok) {
+        Alert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
+        return false;
+      }
+      const wallet: BlockchainWallet = {
+        id: `bc-${Date.now()}`,
+        name,
+        network,
+        address,
+        addedAt: Date.now(),
+      };
+      bcSaveMutation.mutate([...bcWallets, wallet]);
+      return true;
+    },
+    [bcWallets, bcSaveMutation]
+  );
+
+  const handleRemoveBlockchainWallet = useCallback(
+    (id: string, name: string) => {
+      Alert.alert('حذف کیف پول', `آیا از حذف "${name}" اطمینان دارید؟`, [
+        { text: 'لغو', style: 'cancel' },
+        {
+          text: 'حذف',
+          style: 'destructive',
+          onPress: () => {
+            bcSaveMutation.mutate(bcWallets.filter((w) => w.id !== id));
+            queryClient.removeQueries({ queryKey: ['blockchain-balance', id] });
+            void removeBlockchainBalanceCache(id);
+          },
+        },
+      ]);
+    },
+    [bcWallets, bcSaveMutation]
+  );
+
+  const handleRefreshBlockchainAll = useCallback(() => {
+    bcWallets.forEach((w) => {
+      queryClient.invalidateQueries({ queryKey: ['blockchain-balance', w.id] });
+    });
+    queryClient.invalidateQueries({ queryKey: ['blockchain-pnl'] });
+    queryClient.invalidateQueries({ queryKey: ['usdt-toman-price'] });
+  }, [bcWallets]);
+
+  const handleRefreshBlockchainWallet = useCallback((id: string) => {
+    queryClient.invalidateQueries({ queryKey: ['blockchain-balance', id] });
+  }, []);
 
   const saveMutation = useMutation({
     mutationFn: async (newWallets: ExchangeWallet[]) => {
@@ -2328,17 +2558,21 @@ export default function WalletScreen() {
     >
       {/* ── هشدار امنیتی: فیلترشکن خاموش ── */}
       <VpnWarningBanner
-        show={hasForeignWallet || (showAddForm && isForeignExchange(selectedExchange))}
+        show={
+          hasForeignWallet ||
+          hasBlockchainWallet ||
+          (showAddForm && isForeignExchange(selectedExchange))
+        }
       />
 
-      {/* ── v1.4.14: سه تب بالای صفحه مدیریت دارایی ── */}
+      {/* ── v1.4.14: تب‌های بالای صفحه مدیریت دارایی + v1.4.16: تب چهارم ── */}
       <View style={styles.mainTabBar}>
         <Pressable
           style={[styles.mainTab, activeMainTab === 'crypto' && styles.mainTabActive]}
           onPress={() => switchMainTab('crypto')}
           testID="main-tab-crypto"
         >
-          <Bitcoin size={13} color={activeMainTab === 'crypto' ? colors.dark.accent : colors.dark.textSecondary} />
+          <Bitcoin size={12} color={activeMainTab === 'crypto' ? colors.dark.accent : colors.dark.textSecondary} />
           <Text style={[styles.mainTabText, activeMainTab === 'crypto' && styles.mainTabTextActive]}>
             ارز دیجیتال
           </Text>
@@ -2348,7 +2582,7 @@ export default function WalletScreen() {
           onPress={() => switchMainTab('rial')}
           testID="main-tab-rial"
         >
-          <Landmark size={13} color={activeMainTab === 'rial' ? colors.dark.accent : colors.dark.textSecondary} />
+          <Landmark size={12} color={activeMainTab === 'rial' ? colors.dark.accent : colors.dark.textSecondary} />
           <Text style={[styles.mainTabText, activeMainTab === 'rial' && styles.mainTabTextActive]}>
             دارایی ریالی و فلزات
           </Text>
@@ -2358,9 +2592,20 @@ export default function WalletScreen() {
           onPress={() => switchMainTab('gold')}
           testID="main-tab-gold"
         >
-          <Sparkles size={13} color={activeMainTab === 'gold' ? colors.dark.accent : colors.dark.textSecondary} />
+          <Sparkles size={12} color={activeMainTab === 'gold' ? colors.dark.accent : colors.dark.textSecondary} />
           <Text style={[styles.mainTabText, activeMainTab === 'gold' && styles.mainTabTextActive]}>
             پیش‌بینی قیمت طلا
+          </Text>
+        </Pressable>
+        {/* ── v1.4.16 — تب چهارم: کیف پول بلاکچین (فقط خواندنی) ── */}
+        <Pressable
+          style={[styles.mainTab, activeMainTab === 'blockchain' && styles.mainTabActive]}
+          onPress={() => switchMainTab('blockchain')}
+          testID="main-tab-blockchain"
+        >
+          <LinkIcon size={12} color={activeMainTab === 'blockchain' ? colors.dark.accent : colors.dark.textSecondary} />
+          <Text style={[styles.mainTabText, activeMainTab === 'blockchain' && styles.mainTabTextActive]}>
+            کیف پول بلاکچین
           </Text>
         </Pressable>
       </View>
@@ -2629,10 +2874,16 @@ export default function WalletScreen() {
       </>
       )}
 
-      {/* ── تب ۲: دارایی ریالی و فلزات (ریال + طلا + نقره + سکه + ارز) ── */}
+      {/* ── تب ۲: دارایی ریالی و فلزات (ریال + طلا + نقره + سکه + ارز + کیف بلاکچین) ── */}
       {activeMainTab === 'rial' && (
         <>
-          <LocalAssetsSection usdtToToman={usdtToToman} totalPortfolioUsd={totalPortfolioUsd} />
+          <LocalAssetsSection
+            usdtToToman={usdtToToman}
+            totalPortfolioUsd={totalPortfolioUsd}
+            blockchainToman={blockchainToman}
+            hasBlockchainWallet={hasBlockchainWallet}
+            blockchainPnlTomanByPeriod={blockchainPnlTomanByPeriod}
+          />
         </>
       )}
 
@@ -2641,6 +2892,24 @@ export default function WalletScreen() {
         <>
           <GoldPredictionSection />
         </>
+      )}
+
+      {/* ── تب ۴ (v1.4.16): کیف پول بلاکچین — فقط خواندنی ── */}
+      {activeMainTab === 'blockchain' && (
+        <BlockchainWalletsSection
+          wallets={bcWallets}
+          balanceByWallet={bcBalanceByWallet}
+          usdtToToman={usdtToToman}
+          pnlSummary={bcPnlQuery.data}
+          pnlLoading={bcPnlQuery.isLoading}
+          vpnStatus={vpnStatus}
+          vpnChecking={vpnChecking}
+          onRecheckVpn={() => void recheckVpn(true)}
+          onAddWallet={handleAddBlockchainWallet}
+          onRemoveWallet={handleRemoveBlockchainWallet}
+          onRefreshAll={handleRefreshBlockchainAll}
+          onRefreshWallet={handleRefreshBlockchainWallet}
+        />
       )}
 
       <View style={styles.disclaimer}>
@@ -3662,7 +3931,8 @@ const styles = createThemedStyles(() => StyleSheet.create({
     borderColor: colors.dark.accent + '55',
   },
   mainTabText: {
-    fontSize: 10,
+    // v1.4.16 — 9px (was 10): the 4th tab «کیف پول بلاکچین» needs the room
+    fontSize: 9,
     fontWeight: '700' as const,
     color: colors.dark.textSecondary,
     textAlign: 'center',
