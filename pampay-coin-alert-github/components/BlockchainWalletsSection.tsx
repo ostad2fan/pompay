@@ -14,6 +14,9 @@ import {
   AlertTriangle,
   ShieldAlert,
   RefreshCcw,
+  Check,
+  Pencil,
+  X,
 } from 'lucide-react-native';
 import colors from '@/constants/colors';
 import { createThemedStyles } from '@/utils/themeStyles';
@@ -25,9 +28,13 @@ import {
   BlockchainWalletData,
   BlockchainNetwork,
   NETWORKS,
-  NETWORK_ORDER,
   shortAddress,
   validateBlockchainAddress,
+  detectAddressKind,
+  compatibleNetworksFor,
+  defaultNetworksFor,
+  addressKindLabel,
+  networksShortLabel,
 } from '@/utils/blockchainWallets';
 import {
   BlockchainPnlSummary,
@@ -36,12 +43,17 @@ import {
 } from '@/utils/blockchainWalletApi';
 
 /**
- * BlockchainWalletsSection — v1.4.16
+ * BlockchainWalletsSection — v1.4.17
  *
  * The 4th top tab of the asset-management screen: «کیف پول بلاکچین».
  *
  * READ-ONLY blockchain wallets (Trust Wallet & any personal wallet):
- *   - The user enters ONLY a public address + network + display name.
+ *   - The user enters ONLY a public address + a display name + the NETWORKS
+ *     to read that address on. v1.4.17: one 0x address can be ticked on MANY
+ *     networks at once (Ethereum / BNB Chain / Polygon / Arbitrum / Base /
+ *     Filecoin-FEVM) — «این کیف پول شبکه‌های اتریوم و بایننس و آربیتروم و
+ *     فایل‌کوین را داشته باشد». Existing wallets can edit their networks
+ *     any time (ویرایش شبکه‌ها).
  *   - Balances/prices are read from public keyless APIs (blockchainWalletApi).
  *   - The add form carries the step-by-step READ-ONLY GUIDE (how to copy an
  *     address from Trust Wallet) + a red security warning (never enter the
@@ -69,7 +81,10 @@ export interface BlockchainWalletsSectionProps {
   vpnStatus: VpnStatus;
   vpnChecking: boolean;
   onRecheckVpn: () => void;
-  onAddWallet: (name: string, network: BlockchainNetwork, address: string) => Promise<boolean>;
+  /** v1.4.17 — multi-network add: networks[] for the pasted address. */
+  onAddWallet: (name: string, networks: BlockchainNetwork[], address: string) => Promise<boolean>;
+  /** v1.4.17 — change the networks an existing wallet is read on. */
+  onEditWalletNetworks: (id: string, networks: BlockchainNetwork[]) => void;
   onRemoveWallet: (id: string, name: string) => void;
   onRefreshAll: () => void;
   onRefreshWallet: (id: string) => void;
@@ -85,6 +100,7 @@ export default function BlockchainWalletsSection({
   vpnChecking,
   onRecheckVpn,
   onAddWallet,
+  onEditWalletNetworks,
   onRemoveWallet,
   onRefreshAll,
   onRefreshWallet,
@@ -156,7 +172,7 @@ export default function BlockchainWalletsSection({
           {wallets.map((w) => (
             <View key={w.id} style={styles.portfolioBreakdownRow}>
               <Text style={styles.portfolioBreakdownName}>
-                {w.name} ({NETWORKS[w.network].short})
+                {w.name} ({networksShortLabel(w.networks)})
               </Text>
               <Text style={styles.portfolioBreakdownValue}>
                 {balanceByWallet[w.id]?.data
@@ -212,8 +228,8 @@ export default function BlockchainWalletsSection({
       {showAddForm ? (
         <AddBlockchainWalletForm
           onCancel={() => setShowAddForm(false)}
-          onSubmit={async (name, network, address) => {
-            const ok = await onAddWallet(name, network, address);
+          onSubmit={async (name, networks, address) => {
+            const ok = await onAddWallet(name, networks, address);
             if (ok) setShowAddForm(false);
             return ok;
           }}
@@ -244,6 +260,7 @@ export default function BlockchainWalletsSection({
           }
           onRemove={() => onRemoveWallet(wallet.id, wallet.name)}
           onRefresh={() => onRefreshWallet(wallet.id)}
+          onEditNetworks={(networks) => onEditWalletNetworks(wallet.id, networks)}
         />
       ))}
 
@@ -254,7 +271,8 @@ export default function BlockchainWalletsSection({
           <Text style={styles.emptyTitle}>کیف پول بلاکچینی اضافه نشده</Text>
           <Text style={styles.emptySubtitle}>
             کیف پول خود را در حالت فقط‌خواندنی اضافه کنید (مثل تراست ولتم) — فقط با آدرس عمومی،
-            بدون کلید خصوصی؛ موجودی و سود/زیان آن همراه دارایی‌هایتان محاسبه می‌شود.
+            بدون کلید خصوصی. یک آدرس 0x را می‌توانید هم‌زمان روی چند شبکه (اتریوم، BNB چین،
+            آربیتروم، فایل‌کوین و…) خواند؛ موجودی و سود/زیان آن همراه دارایی‌هایتان محاسبه می‌شود.
           </Text>
         </View>
       )}
@@ -366,7 +384,54 @@ function BlockchainPnlCard({
 }
 
 // ---------------------------------------------------------------------------
-// Add-wallet form — name / network / address + READ-ONLY GUIDE + warning
+// Network picker — multi-select chips (v1.4.17)
+// ---------------------------------------------------------------------------
+
+function NetworkPicker({
+  options,
+  selected,
+  onToggle,
+  single,
+  testIDPrefix = 'net',
+}: {
+  options: BlockchainNetwork[];
+  selected: BlockchainNetwork[];
+  onToggle: (n: BlockchainNetwork) => void;
+  /** Only one compatible network — chip is informational, not toggleable. */
+  single?: boolean;
+  testIDPrefix?: string;
+}) {
+  return (
+    <View style={styles.networkGrid}>
+      {options.map((n) => {
+        const active = selected.includes(n);
+        const meta = NETWORKS[n];
+        return (
+          <Pressable
+            key={n}
+            style={[styles.networkChip, active && styles.networkChipActive]}
+            onPress={() => {
+              if (!single) onToggle(n);
+            }}
+            testID={`${testIDPrefix}-chip-${n}`}
+          >
+            <View style={styles.networkChipTop}>
+              <View style={[styles.netDot, { backgroundColor: meta.color }]} />
+              <Text style={[styles.networkChipLabel, active && styles.networkChipLabelActive]}>
+                {meta.label}
+              </Text>
+              {active && <Check size={12} color={colors.dark.blue} />}
+            </View>
+            <Text style={styles.networkChipHint}>{meta.addrHint}</Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Add-wallet form — name / address / MULTI-network picker + guide + warning
 // ---------------------------------------------------------------------------
 
 function AddBlockchainWalletForm({
@@ -374,29 +439,59 @@ function AddBlockchainWalletForm({
   onSubmit,
 }: {
   onCancel: () => void;
-  onSubmit: (name: string, network: BlockchainNetwork, address: string) => Promise<boolean>;
+  onSubmit: (name: string, networks: BlockchainNetwork[], address: string) => Promise<boolean>;
 }) {
   const [name, setName] = useState('');
-  const [network, setNetwork] = useState<BlockchainNetwork>('ethereum');
   const [address, setAddress] = useState('');
+  const [selected, setSelected] = useState<BlockchainNetwork[]>([]);
   const [busy, setBusy] = useState(false);
+  const [lastKind, setLastKind] = useState<string>('');
+
+  // auto-detect the address family as the user types/pastes
+  const kind = useMemo(() => detectAddressKind(address.trim()), [address]);
+  useEffect(() => {
+    const k = kind ?? '';
+    if (k !== lastKind) {
+      setLastKind(k);
+      setSelected(kind ? defaultNetworksFor(kind) : []);
+    }
+  }, [kind, lastKind]);
+
+  const options = kind ? compatibleNetworksFor(kind) : [];
+  const single = options.length === 1;
+  const multiHint =
+    kind === 'evm'
+      ? 'آدرس 0x در همه شبکه‌های اتریوم‌مانند یکسان است — چند شبکه را با هم تیک بزنید تا موجودی همه خوانده شود (پیش‌فرض: همه روشن).'
+      : null;
 
   const validation = useMemo(
-    () => (address.trim() ? validateBlockchainAddress(network, address.trim()) : null),
-    [network, address]
+    () =>
+      address.trim() && selected.length > 0
+        ? validateBlockchainAddress(selected[0], address.trim())
+        : null,
+    [address, selected]
   );
+
+  const toggle = (n: BlockchainNetwork) => {
+    setSelected((prev) => (prev.includes(n) ? prev.filter((x) => x !== n) : [...prev, n]));
+  };
 
   const submit = async () => {
     if (busy) return;
-    const finalName = name.trim() || `کیف پول ${NETWORKS[network].label}`;
-    const v = validateBlockchainAddress(network, address.trim());
+    if (!kind || selected.length === 0) {
+      Alert.alert('شبکه انتخاب نشده', 'ابتدا آدرس کیف پول را وارد کنید تا شبکه‌های سازگار نمایش داده شود');
+      return;
+    }
+    const finalName =
+      name.trim() || `کیف پول ${single ? NETWORKS[selected[0]]?.label ?? '' : 'بلاکچین'}`;
+    const v = validateBlockchainAddress(selected[0], address.trim());
     if (!v.ok) {
       Alert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
       return;
     }
     setBusy(true);
     try {
-      await onSubmit(finalName, network, address.trim());
+      await onSubmit(finalName, selected, address.trim());
     } finally {
       setBusy(false);
     }
@@ -422,44 +517,44 @@ function AddBlockchainWalletForm({
         maxLength={40}
       />
 
-      <Text style={styles.inputLabel}>شبکه بلاکچین</Text>
-      <View style={styles.networkGrid}>
-        {NETWORK_ORDER.map((n) => {
-          const meta = NETWORKS[n];
-          const active = network === n;
-          return (
-            <Pressable
-              key={n}
-              style={[styles.networkChip, active && styles.networkChipActive]}
-              onPress={() => setNetwork(n)}
-              testID={`network-chip-${n}`}
-            >
-              <Text style={[styles.networkChipLabel, active && styles.networkChipLabelActive]}>
-                {meta.label}
-              </Text>
-              <Text style={styles.networkChipHint}>{meta.addrHint}</Text>
-            </Pressable>
-          );
-        })}
-      </View>
-
       <Text style={styles.inputLabel}>آدرس عمومی کیف پول</Text>
       <TextInput
         style={[styles.input, validation?.ok && styles.inputValid]}
         value={address}
         onChangeText={(t) => setAddress(t.replace(/\s+/g, ''))}
-        placeholder={NETWORKS[network].addrHint}
+        placeholder="0x… / T… / bc1… / f1…"
         placeholderTextColor={colors.dark.textMuted}
         autoCapitalize="none"
         autoCorrect={false}
         keyboardType="default"
         testID="blockchain-address-input"
       />
-      {validation && (
-        <Text style={[styles.inputHint, validation.ok ? styles.inputHintOk : styles.inputHintErr]}>
-          {validation.ok ? '✓ آدرس معتبر است' : validation.message}
+      {kind && (
+        <Text style={[styles.inputHint, styles.inputHintOk]}>{addressKindLabel(kind)}</Text>
+      )}
+      {validation && !kind && (
+        <Text style={[styles.inputHint, styles.inputHintErr]}>
+          قالب آدرس شناخته نشد — آدرس را کامل کپی کنید
         </Text>
       )}
+
+      <Text style={styles.inputLabel}>
+        {single ? 'شبکه این آدرس' : 'شبکه‌های این آدرس (چند انتخابی)'}
+      </Text>
+      {options.length > 0 ? (
+        <NetworkPicker
+          options={options}
+          selected={selected}
+          onToggle={toggle}
+          single={single}
+          testIDPrefix="form-net"
+        />
+      ) : (
+        <Text style={styles.networkPendingHint}>
+          آدرس را وارد کنید تا شبکه‌های سازگار با آن نمایش داده شود
+        </Text>
+      )}
+      {multiHint && selected.length > 0 && <Text style={styles.multiHint}>{multiHint}</Text>}
 
       {/* ── راهنمای فقط‌خواندنی (خواستهٔ کاربر: زیر فرم) ── */}
       <View style={styles.guideBox}>
@@ -501,8 +596,10 @@ function AddBlockchainWalletForm({
             <Text style={styles.guideStepNumText}>۴</Text>
           </View>
           <Text style={styles.guideStepText}>
-            آدرس را در کادر بالا <Text style={styles.guideBold}>Paste</Text> کنید. برای کیف‌های
-            دیگر دوباره «افزودن کیف پول» را بزنید — هر کیف، آدرس و شبکه خودش را دارد.
+            آدرس را در کادر بالا <Text style={styles.guideBold}>Paste</Text> کنید. آدرس 0x در همه
+            شبکه‌های اتریوم‌مانند (اتریوم، BNB چین، پالیگان، آربیتروم، بیس، فایل‌کوین){' '}
+            <Text style={styles.guideBold}>یکسان</Text> است — چند شبکه را با هم تیک بزنید تا
+            همه ارزهای همان آدرس خوانده شود. برای کیف‌های دیگر دوباره «افزودن کیف پول» را بزنید.
           </Text>
         </View>
       </View>
@@ -545,7 +642,8 @@ function AddBlockchainWalletForm({
 }
 
 // ---------------------------------------------------------------------------
-// Per-wallet card (collapsible) — token rows + read-only footer
+// Per-wallet card (collapsible) — network chips, per-token network badges,
+// inline network editor (v1.4.17), token rows + read-only footer
 // ---------------------------------------------------------------------------
 
 function BlockchainWalletCard({
@@ -558,6 +656,7 @@ function BlockchainWalletCard({
   onToggle,
   onRemove,
   onRefresh,
+  onEditNetworks,
 }: {
   wallet: BlockchainWallet;
   isExpanded: boolean;
@@ -568,19 +667,40 @@ function BlockchainWalletCard({
   onToggle: () => void;
   onRemove: () => void;
   onRefresh: () => void;
+  onEditNetworks: (networks: BlockchainNetwork[]) => void;
 }) {
-  const meta = NETWORKS[wallet.network];
+  const primary = NETWORKS[wallet.networks[0]] ?? NETWORKS.ethereum;
+  const multi = wallet.networks.length > 1;
+  const avatarText = `${primary.short}${multi ? '+' : ''}`;
   const tomanValue = data && usdtToToman > 0 ? data.totalUsd * usdtToToman : 0;
+
+  // v1.4.17 — inline network editor for 0x wallets (multi-compatible address)
+  const editableOptions = useMemo(
+    () => compatibleNetworksFor(detectAddressKind(wallet.address)),
+    [wallet.address]
+  );
+  const canEditNetworks = editableOptions.length > 1;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<BlockchainNetwork[]>(wallet.networks);
+  useEffect(() => {
+    setDraft(wallet.networks);
+  }, [wallet.networks]);
+
+  const toggleDraft = (n: BlockchainNetwork) => {
+    setDraft((prev) => (prev.includes(n) ? prev.filter((x) => x !== n) : [...prev, n]));
+  };
 
   return (
     <View style={styles.walletCard}>
       <Pressable style={styles.walletHeader} onPress={onToggle}>
-        <View style={[styles.walletAvatar, { backgroundColor: meta.color + '33' }]}>
-          <Text style={[styles.walletAvatarText, { color: meta.color }]}>{meta.short}</Text>
+        <View style={[styles.walletAvatar, { backgroundColor: primary.color + '33' }]}>
+          <Text style={[styles.walletAvatarText, { color: primary.color }]}>{avatarText}</Text>
         </View>
         <View style={styles.walletNameCol}>
           <Text style={styles.walletName}>{wallet.name}</Text>
-          <Text style={styles.walletAddress}>{shortAddress(wallet.address)}</Text>
+          <Text style={styles.walletAddress}>
+            {shortAddress(wallet.address)} • {networksShortLabel(wallet.networks)}
+          </Text>
         </View>
         <View style={styles.walletTotalCol}>
           {isFetching && !data ? (
@@ -614,68 +734,140 @@ function BlockchainWalletCard({
       {isExpanded && (
         <View style={styles.walletBody}>
           <View style={styles.networkBadgeRow}>
-            <Text style={styles.networkBadge}>{meta.label} • {meta.native}</Text>
+            <View style={styles.netChipsWrap}>
+              {wallet.networks.map((n) => (
+                <View
+                  key={n}
+                  style={[styles.netChip, { borderColor: NETWORKS[n].color + '55' }]}
+                >
+                  <View style={[styles.netDot, { backgroundColor: NETWORKS[n].color }]} />
+                  <Text style={[styles.netChipText, { color: NETWORKS[n].color }]}>
+                    {NETWORKS[n].label}
+                  </Text>
+                </View>
+              ))}
+            </View>
             <Text style={styles.networkBadgeReadonly}>
               <Lock size={9} color={colors.dark.green} /> فقط‌خواندنی
             </Text>
           </View>
+
+          {/* ── ویرایش شبکه‌های این کیف (فقط آدرس‌های 0x) ── */}
+          {canEditNetworks && !editing && (
+            <Pressable
+              style={styles.editNetworksBtn}
+              onPress={() => {
+                setDraft(wallet.networks);
+                setEditing(true);
+              }}
+              testID={`edit-networks-${wallet.id}`}
+            >
+              <Pencil size={12} color={colors.dark.blue} />
+              <Text style={styles.editNetworksBtnText}>ویرایش شبکه‌های این کیف</Text>
+            </Pressable>
+          )}
+          {editing && (
+            <View style={styles.editNetworksBox}>
+              <Text style={styles.editNetworksTitle}>شبکه‌های خوانده‌شده از این آدرس:</Text>
+              <NetworkPicker
+                options={editableOptions}
+                selected={draft}
+                onToggle={toggleDraft}
+                testIDPrefix={`edit-net-${wallet.id}`}
+              />
+              <View style={styles.editNetworksActions}>
+                <Pressable
+                  style={[styles.editNetworksActionBtn, styles.editNetworksSaveBtn]}
+                  disabled={draft.length === 0}
+                  onPress={() => {
+                    onEditNetworks(draft);
+                    setEditing(false);
+                  }}
+                >
+                  <Check size={13} color={colors.dark.background} />
+                  <Text style={styles.editNetworksSaveText}>ذخیره شبکه‌ها</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.editNetworksActionBtn, styles.editNetworksCancelBtn]}
+                  onPress={() => setEditing(false)}
+                >
+                  <X size={13} color={colors.dark.textSecondary} />
+                  <Text style={styles.editNetworksCancelText}>انصراف</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
 
           {!data && !!error && (
             <Text style={styles.walletError}>
               دریافت موجودی ناموفق بود — دوباره تلاش کنید (آدرس/شبکه را بررسی کنید)
             </Text>
           )}
+          {data?.notice && <Text style={styles.walletNotice}>{data.notice}</Text>}
           {data && data.tokens.length === 0 && (
             <Text style={styles.walletEmptyText}>
-              این آدرس موجودی مثبتی ندارد یا هنوز تراکنشی انجام نداده است
+              این آدرس در شبکه‌های انتخاب‌شده موجودی مثبتی ندارد یا هنوز تراکنشی انجام نداده است
             </Text>
           )}
 
-          {data?.tokens.map((t) => (
-            <View key={`${t.symbol}-${t.name}`} style={styles.tokenRow}>
-              <View style={[styles.tokenIcon, { backgroundColor: meta.color + '26' }]}>
-                <Text style={[styles.tokenIconText, { color: meta.color }]}>
-                  {t.symbol.slice(0, 1)}
-                </Text>
-              </View>
-              <View style={styles.tokenMain}>
-                <Text style={styles.tokenSymbol}>{t.symbol}</Text>
-                <Text style={styles.tokenName} numberOfLines={1}>
-                  {t.name}
-                </Text>
-              </View>
-              <Text style={styles.tokenQty}>
-                {t.qty.toLocaleString('en-US', {
-                  maximumFractionDigits: t.qty < 1 ? 8 : 4,
-                })}
-              </Text>
-              <View style={styles.tokenValueCol}>
-                <Text style={styles.tokenValue}>
-                  {t.priceUsd > 0
-                    ? `$${t.valueUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}`
-                    : 'قیمت نامشخص'}
-                </Text>
-                {t.change24hPct !== null && t.change24hPct !== undefined && (
-                  <Text
-                    style={[
-                      styles.tokenChange,
-                      { color: (t.change24hPct ?? 0) >= 0 ? colors.dark.green : colors.dark.red },
-                    ]}
-                  >
-                    {(t.change24hPct ?? 0) >= 0 ? '▲' : '▼'}{' '}
-                    {Math.abs(t.change24hPct ?? 0).toLocaleString('fa-IR', {
-                      maximumFractionDigits: 2,
-                    })}٪
+          {data?.tokens.map((t) => {
+            const tokenNet = t.network ? NETWORKS[t.network] : primary;
+            return (
+              <View key={`${t.symbol}-${t.network}-${t.name}`} style={styles.tokenRow}>
+                <View style={[styles.tokenIcon, { backgroundColor: tokenNet.color + '26' }]}>
+                  <Text style={[styles.tokenIconText, { color: tokenNet.color }]}>
+                    {t.symbol.slice(0, 1)}
                   </Text>
-                )}
+                </View>
+                <View style={styles.tokenMain}>
+                  <View style={styles.tokenSymbolRow}>
+                    <Text style={styles.tokenSymbol}>{t.symbol}</Text>
+                    {multi && t.network && (
+                      <View style={[styles.tokenNetBadge, { backgroundColor: tokenNet.color + '1A' }]}>
+                        <Text style={[styles.tokenNetBadgeText, { color: tokenNet.color }]}>
+                          {tokenNet.short}
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+                  <Text style={styles.tokenName} numberOfLines={1}>
+                    {t.name}
+                  </Text>
+                </View>
+                <Text style={styles.tokenQty}>
+                  {t.qty.toLocaleString('en-US', {
+                    maximumFractionDigits: t.qty < 1 ? 8 : 4,
+                  })}
+                </Text>
+                <View style={styles.tokenValueCol}>
+                  <Text style={styles.tokenValue}>
+                    {t.priceUsd > 0
+                      ? `$${t.valueUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}`
+                      : 'قیمت نامشخص'}
+                  </Text>
+                  {t.change24hPct !== null && t.change24hPct !== undefined && (
+                    <Text
+                      style={[
+                        styles.tokenChange,
+                        { color: (t.change24hPct ?? 0) >= 0 ? colors.dark.green : colors.dark.red },
+                      ]}
+                    >
+                      {(t.change24hPct ?? 0) >= 0 ? '▲' : '▼'}{' '}
+                      {Math.abs(t.change24hPct ?? 0).toLocaleString('fa-IR', {
+                        maximumFractionDigits: 2,
+                      })}٪
+                    </Text>
+                  )}
+                </View>
               </View>
-            </View>
-          ))}
+            );
+          })}
 
           {data && (
             <Text style={styles.walletFetchedAt}>
               آخرین دریافت: {new Date(data.fetchedAt).toLocaleTimeString('fa-IR')} •{' '}
-              {data.tokens.length.toLocaleString('fa-IR')} دارایی
+              {data.tokens.length.toLocaleString('fa-IR')} دارایی •{' '}
+              {wallet.networks.length.toLocaleString('fa-IR')} شبکه
             </Text>
           )}
 
@@ -894,6 +1086,19 @@ const styles = createThemedStyles(() =>
     inputHintErr: {
       color: colors.dark.red,
     },
+    networkPendingHint: {
+      fontSize: 9.5,
+      color: colors.dark.textMuted,
+      textAlign: 'right',
+      paddingVertical: 8,
+    },
+    multiHint: {
+      fontSize: 9,
+      lineHeight: 15,
+      color: colors.dark.textMuted,
+      textAlign: 'right',
+      marginTop: 7,
+    },
     networkGrid: {
       flexDirection: 'row',
       flexWrap: 'wrap',
@@ -915,6 +1120,11 @@ const styles = createThemedStyles(() =>
       backgroundColor: colors.dark.blueDim,
       borderColor: colors.dark.blue + '77',
     },
+    networkChipTop: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
+    },
     networkChipLabel: {
       fontSize: 10.5,
       fontWeight: '700' as const,
@@ -927,6 +1137,11 @@ const styles = createThemedStyles(() =>
       fontSize: 8,
       color: colors.dark.textMuted,
       marginTop: 1,
+    },
+    netDot: {
+      width: 7,
+      height: 7,
+      borderRadius: 4,
     },
 
     // ── guide box (blue) ──
@@ -1138,17 +1353,28 @@ const styles = createThemedStyles(() =>
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'space-between',
+      gap: 8,
       marginBottom: 8,
     },
-    networkBadge: {
-      fontSize: 10,
-      fontWeight: '700' as const,
-      color: colors.dark.textSecondary,
+    netChipsWrap: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 5,
+      flex: 1,
+    },
+    netChip: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
       backgroundColor: colors.dark.card,
+      borderWidth: 1,
       borderRadius: 8,
-      paddingHorizontal: 9,
-      paddingVertical: 4,
-      overflow: 'hidden',
+      paddingHorizontal: 7,
+      paddingVertical: 3,
+    },
+    netChipText: {
+      fontSize: 9.5,
+      fontWeight: '700' as const,
     },
     networkBadgeReadonly: {
       fontSize: 9.5,
@@ -1160,12 +1386,85 @@ const styles = createThemedStyles(() =>
       paddingVertical: 4,
       overflow: 'hidden',
     },
+    editNetworksBtn: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 6,
+      backgroundColor: colors.dark.blueDim,
+      borderWidth: 1,
+      borderColor: colors.dark.blue + '44',
+      borderRadius: 10,
+      paddingVertical: 8,
+      marginBottom: 10,
+    },
+    editNetworksBtnText: {
+      fontSize: 11,
+      fontWeight: '700' as const,
+      color: colors.dark.blue,
+    },
+    editNetworksBox: {
+      backgroundColor: colors.dark.card,
+      borderWidth: 1,
+      borderColor: colors.dark.blue + '33',
+      borderRadius: 12,
+      padding: 12,
+      marginBottom: 10,
+    },
+    editNetworksTitle: {
+      fontSize: 10.5,
+      fontWeight: '700' as const,
+      color: colors.dark.text,
+      textAlign: 'right',
+      marginBottom: 8,
+    },
+    editNetworksActions: {
+      flexDirection: 'row',
+      gap: 8,
+      marginTop: 10,
+    },
+    editNetworksActionBtn: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 6,
+      borderRadius: 9,
+      paddingVertical: 8,
+      paddingHorizontal: 10,
+    },
+    editNetworksSaveBtn: {
+      flex: 1.4,
+      backgroundColor: colors.dark.blue,
+    },
+    editNetworksSaveText: {
+      fontSize: 11,
+      fontWeight: '800' as const,
+      color: colors.dark.background,
+    },
+    editNetworksCancelBtn: {
+      flex: 1,
+      backgroundColor: colors.dark.surfaceLight,
+      borderWidth: 1,
+      borderColor: colors.dark.border,
+    },
+    editNetworksCancelText: {
+      fontSize: 11,
+      fontWeight: '700' as const,
+      color: colors.dark.textSecondary,
+    },
     walletError: {
       fontSize: 10,
       color: colors.dark.red,
       textAlign: 'right',
       marginBottom: 8,
       lineHeight: 16,
+    },
+    walletNotice: {
+      fontSize: 9.5,
+      color: colors.dark.accent,
+      textAlign: 'right',
+      marginBottom: 8,
+      lineHeight: 15,
     },
     walletEmptyText: {
       fontSize: 10.5,
@@ -1198,10 +1497,24 @@ const styles = createThemedStyles(() =>
       gap: 1,
       overflow: 'hidden',
     },
+    tokenSymbolRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 5,
+    },
     tokenSymbol: {
       fontSize: 11.5,
       fontWeight: '700' as const,
       color: colors.dark.text,
+    },
+    tokenNetBadge: {
+      borderRadius: 6,
+      paddingHorizontal: 5,
+      paddingVertical: 1,
+    },
+    tokenNetBadgeText: {
+      fontSize: 8,
+      fontWeight: '800' as const,
     },
     tokenName: {
       fontSize: 9,

@@ -289,7 +289,66 @@ async function getUsdPriceMap(): Promise<Record<string, number>> {
   } catch (e) {
     console.log('[Wallet] Price map fetch error:', e);
   }
+  // v1.4.17 — coins that ONLY trade as USDT-M perpetuals (POPCAT, …) have no
+  // spot ticker on Binance; their exchange rows stayed unpriced and the dust
+  // filter removed them («صرافی همه دارایی‌هایم را نشان نمی‌دهد» — the POPCAT
+  // bug). Merge the FUTURES price map in for symbols spot doesn't have.
+  try {
+    const futRes = await fetch('https://fapi.binance.com/fapi/v1/ticker/price');
+    if (futRes.ok) {
+      const fut = await futRes.json();
+      if (Array.isArray(fut)) {
+        for (const p of fut) {
+          if (map[p.symbol] === undefined) map[p.symbol] = parseFloat(p.price);
+        }
+      }
+    }
+  } catch {}
   usdPriceMapCache = { at: Date.now(), map };
+  return map;
+}
+
+/**
+ * v1.4.17 — BitPerp's OWN public market prices (keyless — from the live web
+ * app bundle: GET /api/market-prices, auth:false). The exchange trades coins
+ * Binance spot doesn't list, so its own prices are tried FIRST; the Binance
+ * spot+futures map fills the rest. Tolerant parse, 60s cache, silent failure.
+ */
+let bitperpOwnPricesCache: { at: number; map: Record<string, number> } | null = null;
+
+async function fetchBitperpOwnPrices(): Promise<Record<string, number>> {
+  if (bitperpOwnPricesCache && Date.now() - bitperpOwnPricesCache.at < 60_000) {
+    return bitperpOwnPricesCache.map;
+  }
+  const map: Record<string, number> = {};
+  try {
+    const res = await fetch('https://bitperp.com/api/market-prices', {
+      headers: { Accept: 'application/json', 'ngrok-skip-browser-warning': 'true' },
+    });
+    if (res.ok) {
+      const data: unknown = await res.json();
+      const rows: unknown[] = Array.isArray(data)
+        ? data
+        : data && typeof data === 'object'
+          ? (['data', 'prices', 'list', 'rows'] as const)
+              .map((k) => (data as Record<string, unknown>)[k])
+              .find((v): v is unknown[] => Array.isArray(v)) ?? []
+          : [];
+      for (const r of rows) {
+        if (!r || typeof r !== 'object') continue;
+        const rec = r as Record<string, unknown>;
+        const sym = String(rec.symbol ?? rec.contract ?? rec.pair ?? rec.s ?? '').toUpperCase();
+        const price = parseFloat(
+          String(rec.price ?? rec.lastPrice ?? rec.markPrice ?? rec.last ?? rec.p ?? '')
+        );
+        if (sym && Number.isFinite(price) && price > 0) {
+          map[sym] = price;
+          if (!sym.endsWith('USDT') && !sym.endsWith('USDC')) map[`${sym}USDT`] = price;
+        }
+      }
+    }
+  } catch {}
+  bitperpOwnPricesCache = { at: Date.now(), map };
   return map;
 }
 
@@ -1669,16 +1728,27 @@ async function fetchBitperpBalance(wallet: ExchangeWallet): Promise<WalletBalanc
       });
     }
 
-    // USD valuation for items without an API-provided value.
+    // USD valuation for items without an API-provided value — v1.4.17:
+    // BitPerp's own public market prices first (coins Binance spot doesn't
+    // list, e.g. POPCAT), then the Binance spot+futures map.
     try {
-      const priceMap = await getUsdPriceMap();
+      const [ownMap, priceMap] = await Promise.all([
+        fetchBitperpOwnPrices().catch(() => ({}) as Record<string, number>),
+        getUsdPriceMap().catch(() => ({}) as Record<string, number>),
+      ]);
+      const priceOf = (asset: string): number | undefined => {
+        const own = ownMap[asset] ?? ownMap[`${asset}USDT`] ?? ownMap[`${asset}USDC`];
+        if (own !== undefined && own > 0) return own;
+        return priceMap[`${asset}USDT`];
+      };
       for (const bal of balances) {
         if (bal.valueUsd > 0) continue;
         const stable = stableCoinValueUsd(bal.asset, bal.total);
         if (stable !== null) {
           bal.valueUsd = stable;
-        } else if (priceMap[`${bal.asset}USDT`]) {
-          bal.valueUsd = bal.total * priceMap[`${bal.asset}USDT`];
+        } else {
+          const p = priceOf(bal.asset);
+          if (p) bal.valueUsd = bal.total * p;
         }
       }
     } catch {}
@@ -1739,16 +1809,26 @@ async function fetchBitperpBalance(wallet: ExchangeWallet): Promise<WalletBalanc
     }
   }
 
-  // USD valuation for perp assets without a value.
+  // USD valuation for perp assets without a value — v1.4.17: BitPerp's own
+  // public prices first (POPCAT-like coins), then Binance spot+futures.
   try {
-    const priceMap = await getUsdPriceMap();
+    const [ownMap, priceMap] = await Promise.all([
+      fetchBitperpOwnPrices().catch(() => ({}) as Record<string, number>),
+      getUsdPriceMap().catch(() => ({}) as Record<string, number>),
+    ]);
+    const priceOf = (asset: string): number | undefined => {
+      const own = ownMap[asset] ?? ownMap[`${asset}USDT`] ?? ownMap[`${asset}USDC`];
+      if (own !== undefined && own > 0) return own;
+      return priceMap[`${asset}USDT`];
+    };
     for (const bal of balances) {
       if (bal.valueUsd > 0) continue;
       const stable = stableCoinValueUsd(bal.asset, bal.total);
       if (stable !== null) {
         bal.valueUsd = stable;
-      } else if (priceMap[`${bal.asset}USDT`]) {
-        bal.valueUsd = bal.total * priceMap[`${bal.asset}USDT`];
+      } else {
+        const p = priceOf(bal.asset);
+        if (p) bal.valueUsd = bal.total * p;
       }
     }
   } catch {}
@@ -2234,7 +2314,7 @@ export default function WalletScreen() {
   const bcBalanceQueries = useQueries({
     queries: bcCachesLoaded
       ? bcWallets.map((w, idx) => ({
-          queryKey: ['blockchain-balance', w.id],
+          queryKey: ['blockchain-balance', w.id, w.networks.join('+')],
           queryFn: async (): Promise<BlockchainWalletData> => {
             // same stagger as exchange balances — smooths the cold-start burst
             if (idx > 0) {
@@ -2351,8 +2431,12 @@ export default function WalletScreen() {
   });
 
   const handleAddBlockchainWallet = useCallback(
-    async (name: string, network: BlockchainNetwork, address: string): Promise<boolean> => {
-      const v = validateBlockchainAddress(network, address);
+    async (name: string, networks: BlockchainNetwork[], address: string): Promise<boolean> => {
+      if (networks.length === 0) {
+        Alert.alert('شبکه انتخاب نشده', 'حداقل یک شبکه برای این آدرس انتخاب کنید');
+        return false;
+      }
+      const v = validateBlockchainAddress(networks[0], address);
       if (!v.ok) {
         Alert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
         return false;
@@ -2360,12 +2444,31 @@ export default function WalletScreen() {
       const wallet: BlockchainWallet = {
         id: `bc-${Date.now()}`,
         name,
-        network,
+        networks,
         address,
         addedAt: Date.now(),
       };
       bcSaveMutation.mutate([...bcWallets, wallet]);
       return true;
+    },
+    [bcWallets, bcSaveMutation]
+  );
+
+  /** v1.4.17 — change which networks an existing wallet address is read on. */
+  const handleUpdateBlockchainWalletNetworks = useCallback(
+    (id: string, networks: BlockchainNetwork[]) => {
+      const wallet = bcWallets.find((w) => w.id === id);
+      if (!wallet || networks.length === 0) return;
+      const v = validateBlockchainAddress(networks[0], wallet.address);
+      if (!v.ok) {
+        Alert.alert('آدرس نامعتبر برای این شبکه', v.message ?? 'آدرس را بررسی کنید');
+        return;
+      }
+      bcSaveMutation.mutate(
+        bcWallets.map((w) => (w.id === id ? { ...w, networks } : w))
+      );
+      // drop cached query data for the OLD network mix — the new query key refetches
+      queryClient.removeQueries({ queryKey: ['blockchain-balance', id] });
     },
     [bcWallets, bcSaveMutation]
   );
@@ -2906,6 +3009,7 @@ export default function WalletScreen() {
           vpnChecking={vpnChecking}
           onRecheckVpn={() => void recheckVpn(true)}
           onAddWallet={handleAddBlockchainWallet}
+          onEditWalletNetworks={handleUpdateBlockchainWalletNetworks}
           onRemoveWallet={handleRemoveBlockchainWallet}
           onRefreshAll={handleRefreshBlockchainAll}
           onRefreshWallet={handleRefreshBlockchainWallet}
@@ -3047,17 +3151,24 @@ function WalletItem({
         map.set(bal.asset, { ...bal, sections: [section] });
       }
     }
+    // v1.4.17 — BitPerp rows that still hold qty>0 but got NO price from any
+    // source must stay visible («قیمت نامشخص») instead of being dropped as
+    // $0 dust — the old filter is what hid POPCAT.
+    const keepUnpriced = wallet.exchangeId === 'bitperp';
     return [...map.values()]
-      .filter((b) => b.valueUsd >= dustFilterUsd)
+      .filter((b) => b.valueUsd >= dustFilterUsd || (keepUnpriced && b.total > 0.000001))
       .sort((a, b) => b.valueUsd - a.valueUsd);
-  }, [data, dustFilterUsd]);
+  }, [data, dustFilterUsd, wallet.exchangeId]);
 
   const sectionRows = useMemo(() => {
     if (!data || activeSection === 'all') return [] as WalletBalance[];
+    const keepUnpriced = wallet.exchangeId === 'bitperp';
     return data.balances.filter(
-      (b) => (b.section ?? 'spot') === activeSection && b.valueUsd >= dustFilterUsd
+      (b) =>
+        (b.section ?? 'spot') === activeSection &&
+        (b.valueUsd >= dustFilterUsd || (keepUnpriced && b.total > 0.000001))
     );
-  }, [data, activeSection, dustFilterUsd]);
+  }, [data, activeSection, dustFilterUsd, wallet.exchangeId]);
 
   const futuresPositions = useMemo(
     () => (data?.futuresPositions ?? []).filter((pos) => pos.notionalUsd >= dustFilterUsd),
@@ -3392,9 +3503,15 @@ function BalanceRow({ bal, usdtToToman }: { bal: WalletBalance; usdtToToman: num
         </View>
       </View>
       <View style={styles.balanceRight}>
-        <Text style={styles.balanceValue}>
-          ≈ ${bal.valueUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}
-        </Text>
+        {bal.valueUsd > 0 ? (
+          <Text style={styles.balanceValue}>
+            ≈ ${bal.valueUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}
+          </Text>
+        ) : (
+          <Text style={[styles.balanceValue, { color: colors.dark.textMuted }]}>
+            قیمت نامشخص
+          </Text>
+        )}
         {bal.pnlUsd !== undefined && bal.pnlUsd !== 0 && (
           <Text
             style={[
@@ -3444,9 +3561,15 @@ function AggregatedRow({ bal, usdtToToman }: { bal: AggregatedBalance; usdtToTom
         </View>
       </View>
       <View style={styles.balanceRight}>
-        <Text style={styles.balanceValue}>
-          ≈ ${bal.valueUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}
-        </Text>
+        {bal.valueUsd > 0 ? (
+          <Text style={styles.balanceValue}>
+            ≈ ${bal.valueUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}
+          </Text>
+        ) : (
+          <Text style={[styles.balanceValue, { color: colors.dark.textMuted }]}>
+            قیمت نامشخص
+          </Text>
+        )}
         {bal.pnlUsd !== undefined && bal.pnlUsd !== 0 && (
           <Text
             style={[
