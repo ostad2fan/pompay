@@ -14,6 +14,8 @@ import {
   RefreshCw,
   ChevronDown,
   ChevronUp,
+  Link as LinkIcon,
+  Lock,
 } from 'lucide-react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import colors from '@/constants/colors';
@@ -34,25 +36,27 @@ import {
 } from '@/utils/tgjuHistoryApi';
 
 /**
- * LocalAssetsSection — v1.4.15
+ * LocalAssetsSection — v1.4.16
  *
  * «دارایی ریالی و فلزات» tab of the wallet:
  *  - Live Iranian prices (Toman): gold 18/24 per gram, silver 999/925 per
  *    gram, Emami/Bahar/half/quarter coins, the free-market USD rate and the
  *    tether price (passed in from the portfolio card — same source).
+ *  - v1.4.16 NEW ORDER (user-requested): قیمت‌های لحظه‌ای → مجموع کل →
+ *    کارت سود/زیان → «دارایی‌های من» (collapsible with its own arrow).
+ *    The grand total is ALWAYS visible at the top (right under the prices)
+ *    and now includes the read-only blockchain wallets (4th tab) — as does
+ *    the PnL card (dedicated «کیف پول بلاکچین» row).
  *  - User inputs: Rial cash, paper-USD cash (v1.4.15), gold grams (+karat),
  *    silver grams (+type), coin counts — persisted in AsyncStorage.
  *  - EVERY asset row shows its own Toman value next to it.
  *  - Grand total = Rial + USD cash + gold + silver + coins + crypto (crypto
  *    USD value comes from the wallet's first header, converted at the live
- *    tether rate).
+ *    tether rate) + blockchain wallets (toman, v1.4.16).
  *  - v1.4.14 — PnL card with ۷/۳۰/۹۰/۱۸۰-day timeframes: the daily-close
  *    history of every HELD asset is fetched from TGJU's public history API
  *    and compared against the live price (realized market PnL of the metal
  *    holdings — independent of when the user actually bought them).
- *  - v1.4.15 — PnL card moved to the TOP (right under the live price grid,
- *    always visible) + paper-USD row with the free-market dollar rate
- *    (falls back to the tether rate when TGJU's dollar quote is missing).
  */
 
 const ASSETS_KEY = '@local_assets_v1';
@@ -103,10 +107,25 @@ interface Props {
   usdtToToman: number;
   /** Dollar value of ALL crypto assets — read from the wallet's first header. */
   totalPortfolioUsd: number;
+  /** v1.4.16 — TOMAN value of the read-only blockchain wallets (4th tab). */
+  blockchainToman?: number;
+  /** v1.4.16 — any read-only blockchain wallet connected? */
+  hasBlockchainWallet?: boolean;
+  /** v1.4.16 — per-period TOMAN PnL (+basis) of the blockchain holdings. */
+  blockchainPnlTomanByPeriod?: Record<number, { pnlToman: number; basisToman: number } | null>;
 }
 
-export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: Props) {
+const EXPANDED_KEY = '@local_assets_expanded_v1';
+
+export default function LocalAssetsSection({
+  usdtToToman,
+  totalPortfolioUsd,
+  blockchainToman = 0,
+  hasBlockchainWallet = false,
+  blockchainPnlTomanByPeriod,
+}: Props) {
   const [assets, setAssets] = useState<LocalAssets>(EMPTY_ASSETS);
+  // v1.4.16 — «دارایی‌های من» collapsible with its own arrow; persisted.
   const [expanded, setExpanded] = useState(true);
   const queryClient = useQueryClient();
 
@@ -115,9 +134,20 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
     loadAssets().then((a) => {
       if (mounted) setAssets(a);
     });
+    AsyncStorage.getItem(EXPANDED_KEY).then((v) => {
+      if (mounted && v === '0') setExpanded(false);
+    }).catch(() => {});
     return () => {
       mounted = false;
     };
+  }, []);
+
+  const toggleExpanded = useCallback(() => {
+    setExpanded((v) => {
+      const next = !v;
+      AsyncStorage.setItem(EXPANDED_KEY, next ? '1' : '0').catch(() => {});
+      return next;
+    });
   }, []);
 
   const pricesQuery = useQuery({
@@ -161,9 +191,18 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
   const coinsValue =
     coinValues.emami + coinValues.bahar + coinValues.nim + coinValues.rob;
   const cryptoToman = usdtToToman > 0 ? totalPortfolioUsd * usdtToToman : 0;
-  const grandTotal = rialValue + usdValue + goldValue + silverValue + coinsValue + cryptoToman;
+  // v1.4.16 — read-only blockchain wallets count toward the grand total.
+  const blockchainValue = hasBlockchainWallet ? blockchainToman : 0;
+  const grandTotal =
+    rialValue + usdValue + goldValue + silverValue + coinsValue + cryptoToman + blockchainValue;
   const hasAnyInput =
-    rialValue > 0 || usdValue > 0 || goldValue > 0 || silverValue > 0 || coinsValue > 0 || totalPortfolioUsd > 0;
+    rialValue > 0 ||
+    usdValue > 0 ||
+    goldValue > 0 ||
+    silverValue > 0 ||
+    coinsValue > 0 ||
+    totalPortfolioUsd > 0 ||
+    (hasBlockchainWallet && blockchainToman > 0);
 
   const minutesOld = p ? Math.max(1, Math.round((Date.now() - p.updatedAt) / 60000)) : 0;
 
@@ -180,7 +219,7 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
             <RefreshCw size={14} color={colors.dark.accent} />
           )}
         </Pressable>
-        <Pressable style={styles.chevronBtn} onPress={() => setExpanded((v) => !v)}>
+        <Pressable style={styles.chevronBtn} onPress={toggleExpanded}>
           {expanded ? (
             <ChevronUp size={14} color={colors.dark.textSecondary} />
           ) : (
@@ -215,16 +254,55 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
         )}
       </View>
 
-      {/* ── v1.4.15: PnL moved to the TOP — right under the live prices ── */}
+      {/* ── v1.4.16: مجموع کل — بالا، درست زیر قیمت‌های لحظه‌ای (همیشه نمایان) ── */}
+      <View style={styles.totalBox}>
+        <View style={styles.totalRow}>
+          <TrendingUp size={16} color={colors.dark.green} />
+          <Text style={styles.totalLabel}>
+            مجموع کل دارایی (ریال + دلار + طلا + نقره + سکه + ارز
+            {hasBlockchainWallet ? ' + کیف بلاکچین' : ''})
+          </Text>
+        </View>
+        <Text style={styles.totalAmount}>
+          {hasAnyInput ? `${formatToman(grandTotal)} تومان` : '—'}
+        </Text>
+        {hasAnyInput && grandTotal >= 1000 && (
+          <Text style={styles.totalExact}>{formatFullToman(Math.round(grandTotal))} تومان</Text>
+        )}
+        <View style={styles.totalBreakdown}>
+          <Text style={styles.breakdownText}>
+            ریال {formatToman(rialValue)} • دلار {formatToman(usdValue)} • طلا{' '}
+            {formatToman(goldValue)} • نقره {formatToman(silverValue)} • سکه{' '}
+            {formatToman(coinsValue)} • ارز {formatToman(cryptoToman)}
+            {hasBlockchainWallet ? ` • کیف بلاکچین ${formatToman(blockchainValue)}` : ''}
+          </Text>
+        </View>
+      </View>
+
+      {/* ── v1.4.14: کارت سود/زیان (زیر مجموع کل) ── */}
       <View style={{ height: 12 }} />
-      <LocalAssetsPnl assets={assets} prices={p ?? undefined} />
+      <LocalAssetsPnl
+        assets={assets}
+        prices={p ?? undefined}
+        blockchainPnlTomanByPeriod={blockchainPnlTomanByPeriod}
+        hasBlockchainWallet={hasBlockchainWallet}
+      />
+
+      {/* ── v1.4.16: «دارایی‌های من» — با فلش باز/بسته می‌شود ── */}
+      <Pressable style={styles.myAssetsHeader} onPress={toggleExpanded}>
+        <Text style={styles.blockLabel}>دارایی‌های من</Text>
+        <View style={styles.chevronBtn}>
+          {expanded ? (
+            <ChevronUp size={14} color={colors.dark.textSecondary} />
+          ) : (
+            <ChevronDown size={14} color={colors.dark.textSecondary} />
+          )}
+        </View>
+      </Pressable>
 
       {expanded && (
         <>
           <View style={styles.divider} />
-
-          {/* ── my assets (inputs + per-asset Toman value) ── */}
-          <Text style={styles.blockLabel}>دارایی‌های من</Text>
 
           <AssetRow
             icon={<Banknote size={14} color={colors.dark.green} />}
@@ -378,24 +456,26 @@ export default function LocalAssetsSection({ usdtToToman, totalPortfolioUsd }: P
             </View>
           </View>
 
-          {/* ── grand total ── */}
-          <View style={styles.totalBox}>
-            <View style={styles.totalRow}>
-              <TrendingUp size={16} color={colors.dark.green} />
-              <Text style={styles.totalLabel}>مجموع کل دارایی (ریال + دلار + طلا + نقره + سکه + ارز)</Text>
+          {/* ── v1.4.16 — blockchain wallet row (read-only, from the 4th tab) ── */}
+          {hasBlockchainWallet && (
+            <View style={styles.assetRow}>
+              <LinkIcon size={14} color={colors.dark.accent} />
+              <View style={styles.assetMain}>
+                <Text style={styles.assetLabel}>کیف پول بلاکچین (فقط خواندنی)</Text>
+                <Text style={styles.assetHint}>
+                  مدیریت از تب «کیف پول بلاکچین» — فقط با آدرس عمومی، بدون کلید خصوصی
+                </Text>
+              </View>
+              <View style={styles.assetValueCol}>
+                <Text style={[styles.assetValue, { color: colors.dark.accent }]}>
+                  {blockchainToman > 0 ? `${formatFullToman(Math.round(blockchainToman))} ت` : '—'}
+                </Text>
+                {usdtToToman > 0 && (
+                  <Text style={styles.assetRate}>تتر: {formatFullToman(usdtToToman)}</Text>
+                )}
+              </View>
             </View>
-            <Text style={styles.totalAmount}>
-              {hasAnyInput ? `${formatToman(grandTotal)} تومان` : '—'}
-            </Text>
-            {hasAnyInput && grandTotal >= 1000 && (
-              <Text style={styles.totalExact}>{formatFullToman(Math.round(grandTotal))} تومان</Text>
-            )}
-            <View style={styles.totalBreakdown}>
-              <Text style={styles.breakdownText}>
-                ریال {formatToman(rialValue)} • دلار {formatToman(usdValue)} • طلا {formatToman(goldValue)} • نقره {formatToman(silverValue)} • سکه {formatToman(coinsValue)} • ارز {formatToman(cryptoToman)}
-              </Text>
-            </View>
-          </View>
+          )}
         </>
       )}
     </View>
@@ -424,7 +504,21 @@ interface HeldAssetSpec {
   liveUnit: number;
 }
 
-function LocalAssetsPnl({ assets, prices }: { assets: LocalAssets; prices?: IranMarketPrices }) {
+function LocalAssetsPnl({
+  assets,
+  prices,
+  blockchainPnlTomanByPeriod,
+  hasBlockchainWallet,
+}: {
+  assets: LocalAssets;
+  prices?: IranMarketPrices;
+  /** v1.4.16 — per-period TOMAN PnL of the read-only blockchain wallets. */
+  blockchainPnlTomanByPeriod?: Record<
+    number,
+    { pnlToman: number; basisToman: number } | null
+  >;
+  hasBlockchainWallet?: boolean;
+}) {
   const [period, setPeriod] = useState<LocalPnlPeriod>(180);
 
   const goldQty = parseTomanInput(assets.goldGrams) || 0;
@@ -521,11 +615,16 @@ function LocalAssetsPnl({ assets, prices }: { assets: LocalAssets; prices?: Iran
 
   const totalPnl = rows.reduce((s, r) => s + r.pnl, 0);
   const totalBasis = rows.reduce((s, r) => s + r.basis, 0);
-  const totalPct = totalBasis > 0 ? (totalPnl / totalBasis) * 100 : 0;
+  // v1.4.16 — the blockchain wallet row joins the card's total (USD price
+  // change × FX change, basis = usdThen × dollar-then).
+  const bcEntry = blockchainPnlTomanByPeriod?.[period] ?? null;
+  const grandPnl = totalPnl + (bcEntry?.pnlToman ?? 0);
+  const grandBasis = totalBasis + (bcEntry?.basisToman ?? 0);
+  const totalPct = grandBasis > 0 ? (grandPnl / grandBasis) * 100 : 0;
 
-  if (held.length === 0) return null;
+  if (held.length === 0 && !hasBlockchainWallet) return null;
 
-  const positive = totalPnl >= 0;
+  const positive = grandPnl >= 0;
 
   return (
     <View style={styles.pnlBox}>
@@ -553,19 +652,19 @@ function LocalAssetsPnl({ assets, prices }: { assets: LocalAssets; prices?: Iran
         ))}
       </View>
 
-      {historyQuery.isLoading ? (
+      {historyQuery.isLoading && held.length > 0 ? (
         <View style={styles.pnlLoading}>
           <ActivityIndicator size="small" color={colors.dark.accent} />
           <Text style={styles.pnlLoadingText}>دریافت تاریخچه قیمت‌ها…</Text>
         </View>
-      ) : historyQuery.isError || rows.length === 0 ? (
+      ) : (historyQuery.isError || rows.length === 0) && !bcEntry ? (
         <Text style={styles.pnlEmpty}>
           تاریخچه قیمت برای این بازه در دسترس نیست — بعداً دوباره تلاش کنید
         </Text>
       ) : (
         <>
           <Text style={[styles.pnlTotal, { color: positive ? colors.dark.green : colors.dark.red }]}>
-            {positive ? '+' : '−'} {formatFullToman(Math.abs(Math.round(totalPnl)))} تومان
+            {positive ? '+' : '−'} {formatFullToman(Math.abs(Math.round(grandPnl)))} تومان
           </Text>
           <View style={styles.pnlPctRow}>
             <View
@@ -596,9 +695,36 @@ function LocalAssetsPnl({ assets, prices }: { assets: LocalAssets; prices?: Iran
             </View>
           ))}
 
+          {/* ── v1.4.16 — ردیف کیف پول بلاکچین (فقط خواندنی) ── */}
+          {hasBlockchainWallet && (
+            <View style={[styles.pnlRow, styles.pnlRowBc]}>
+              <Text style={styles.pnlRowLabel}>
+                <Lock size={10} color={colors.dark.accent} /> کیف پول بلاکچین
+              </Text>
+              <Text
+                style={[
+                  styles.pnlRowValue,
+                  {
+                    color: !bcEntry
+                      ? colors.dark.textSecondary
+                      : bcEntry.pnlToman >= 0
+                        ? colors.dark.green
+                        : colors.dark.red,
+                  },
+                ]}
+              >
+                {!bcEntry
+                  ? 'در حال محاسبه…'
+                  : `${bcEntry.pnlToman >= 0 ? '+' : '−'} ${formatFullToman(
+                      Math.abs(Math.round(bcEntry.pnlToman))
+                    )} ت`}
+              </Text>
+            </View>
+          )}
+
           <Text style={styles.pnlNote}>
-            مبنا: قیمت پایان روزِ {PNL_PERIOD_LABEL[period]} پیش تا امروز (منبع: TGJU).
-            تغییر ارزش بر اساس نوسان بازار است، نه زمان خرید واقعی شما.
+            مبنا: قیمت پایان روزِ {PNL_PERIOD_LABEL[period]} پیش تا امروز (منبع: TGJU؛ کیف بلاکچین:
+            قیمت بایننس × نرخ تتر). تغییر ارزش بر اساس نوسان بازار است، نه زمان خرید واقعی شما.
           </Text>
         </>
       )}
@@ -745,6 +871,13 @@ const styles = createThemedStyles(() =>
     chevronBtn: {
       padding: 6,
       borderRadius: 8,
+    },
+    // v1.4.16 — «دارایی‌های من» header row with its own collapse arrow
+    myAssetsHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginTop: 12,
     },
     blockLabel: {
       fontSize: 11,
@@ -1027,6 +1160,15 @@ const styles = createThemedStyles(() =>
       paddingVertical: 5,
       borderTopWidth: 1,
       borderTopColor: colors.dark.border + '33',
+    },
+    // v1.4.16 — highlighted blockchain row inside the PnL card
+    pnlRowBc: {
+      backgroundColor: colors.dark.accentDim,
+      borderRadius: 8,
+      paddingHorizontal: 8,
+      marginTop: 4,
+      paddingVertical: 7,
+      borderTopWidth: 0,
     },
     pnlRowLabel: {
       fontSize: 11,
