@@ -65,6 +65,7 @@ import {
 import type { RealPosition, BinanceAccountInfo } from '@/utils/binanceFuturesTrading';
 import DropdownPicker from '@/components/DropdownPicker';
 import { sendTelegramTradeNotification, sendTelegramAISignal } from '@/utils/telegramService';
+import AutoTradingBotSection from '@/components/AutoTradingBotSection';
 
 const SIGNALS_HISTORY_KEY = '@trade_ai_signals';
 const PREV_SIGNALS_KEY = '@trade_ai_prev_signal_states';
@@ -773,6 +774,8 @@ export default function RealTradeScreen() {
   if (exchangeConfigs.length === 0) {
     return (
       <ScrollView style={styles.container} contentContainerStyle={styles.centerContent}>
+        {/* v1.4.19 — معامله‌گر خودکار در حالت دمو حتی بدون صرافی کار می‌کند */}
+        <AutoTradingBotSection />
         <View style={styles.noApiCard}>
           <Lock size={48} color={colors.dark.accent} />
           <Text style={styles.noApiTitle}>صرافی وارد نشده</Text>
@@ -987,6 +990,15 @@ export default function RealTradeScreen() {
           <Text style={[styles.modeBtnText, tradeMode === 'auto' && styles.modeBtnTextActive]}>اتوماتیک (ربات)</Text>
         </Pressable>
       </View>
+
+      {/* v1.4.19 — معامله‌گر خودکار جدید: کپی نهنگ + سیگنال اندیکاتور، دمو/واقعی */}
+      <AutoTradingBotSection
+        realKeys={
+          activeExchange && activeExchange.enabled && activeExchange.exchangeId === 'binance'
+            ? { apiKey: activeExchange.apiKey, apiSecret: activeExchange.apiSecret }
+            : undefined
+        }
+      />
 
       {account && (
         <View style={styles.accountCard}>
