@@ -2453,9 +2453,59 @@ export default function WalletScreen() {
     },
   });
 
+  // v1.4.19 — refresh DOES A REAL FETCH, bypassing every react-query gate
+  // (staleTime / refetchOnMount / the iran-VPN poll gate) AND the 60s price
+  // cache. The v1.4.17 refetchQueries fix still hit three invisible walls:
+  //  1) vpnStatus === 'iran' disables refetchOnMount/refetchInterval → the
+  //     refetch was silently dropped exactly for the users who press it most.
+  //  2) even when it ran, the 60s ticker cache returned IDENTICAL prices →
+  //     «هیچ اتفاقی نمی‌افتد».
+  //  3) no visible feedback (a <2s fetch with no spinner/toast looks dead).
+  // Now: direct fetch → setQueryData → toast with the result. Manual action
+  // = user intent → always attempt, even from an Iranian IP (per-network
+  // failures surface in the card's notice line).
+  const [bcManualRefresh, setBcManualRefresh] = useState<Record<string, boolean>>({});
+  const [bcRefreshToast, setBcRefreshToast] = useState<string | null>(null);
+  const bcRefreshToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bcWalletsRef = useRef<BlockchainWallet[]>(bcWallets);
+  bcWalletsRef.current = bcWallets;
+
+  const runBlockchainManualFetch = useCallback(
+    async (id: string, force: boolean): Promise<void> => {
+      const w = bcWalletsRef.current.find((x) => x.id === id);
+      if (!w) return;
+      setBcManualRefresh((m) => ({ ...m, [id]: true }));
+      try {
+        const data = await fetchBlockchainWalletData(w, { force });
+        queryClient.setQueryData(['blockchain-balance', id], data);
+        const n = data.tokens.length;
+        const usd = data.totalUsd;
+        setBcRefreshToast(
+          data.notice
+            ? `به‌روز شد (${n} دارایی) — بعضی شبکه‌ها پاسخ ندادند`
+            : `به‌روز شد — ${n} دارایی • $${usd < 1000 ? usd.toFixed(2) : usd.toLocaleString('en-US', { maximumFractionDigits: 0 })}`
+        );
+      } catch (e) {
+        setBcRefreshToast(`به‌روزرسانی ناموفق — ${e instanceof Error ? e.message.slice(0, 50) : 'خطای شبکه'}`);
+      } finally {
+        setBcManualRefresh((m) => ({ ...m, [id]: false }));
+        queryClient.invalidateQueries({ queryKey: ['blockchain-pnl'] });
+        queryClient.invalidateQueries({ queryKey: ['usdt-toman-price'] });
+        if (bcRefreshToastTimer.current) clearTimeout(bcRefreshToastTimer.current);
+        bcRefreshToastTimer.current = setTimeout(() => setBcRefreshToast(null), 4000);
+      }
+    },
+    [queryClient]
+  );
+
   const handleAddBlockchainWallet = useCallback(
-    async (name: string, networks: BlockchainNetwork[], address: string): Promise<boolean> => {
-      const v = validateAddressForNetworks(networks, address);
+    async (
+      name: string,
+      networks: BlockchainNetwork[],
+      address: string,
+      networkAddresses?: Partial<Record<BlockchainNetwork, string>>
+    ): Promise<boolean> => {
+      const v = validateAddressForNetworks(networks, address, networkAddresses);
       if (!v.ok) {
         Alert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
         return false;
@@ -2465,37 +2515,68 @@ export default function WalletScreen() {
         name,
         networks,
         address,
+        ...(networkAddresses && Object.keys(networkAddresses).length > 0 ? { networkAddresses } : {}),
         addedAt: Date.now(),
       };
-      bcSaveMutation.mutate([...bcWallets, wallet]);
+      bcSaveMutation.mutate([...bcWallets, wallet], {
+        onSuccess: () => {
+          // v1.4.19 — fetch the brand-new wallet IMMEDIATELY (the poll gate
+          // would otherwise leave the card on the empty snapshot).
+          setTimeout(() => void runBlockchainManualFetch(wallet.id, true), 600);
+        },
+      });
       return true;
     },
-    [bcWallets, bcSaveMutation]
+    [bcWallets, bcSaveMutation, runBlockchainManualFetch]
   );
 
-  // v1.4.17 — edit an existing wallet's name / network selection (the
-  // address itself can only be changed by removing and re-adding).
+  // v1.4.19 — edit an existing wallet's name / network selection AND the
+  // per-network addresses (e.g. keep the 0x base for Ethereum+BSC while
+  // adding the wallet's own Filecoin f1 address — the form asks for it in
+  // place: «در همون قسمت خودش آدرسشو بخواد»).
   const handleEditBlockchainWallet = useCallback(
-    async (id: string, name: string, networks: BlockchainNetwork[]): Promise<boolean> => {
+    async (
+      id: string,
+      name: string,
+      networks: BlockchainNetwork[],
+      networkAddresses?: Partial<Record<BlockchainNetwork, string>>
+    ): Promise<boolean> => {
       const target = bcWallets.find((w) => w.id === id);
       if (!target) return false;
-      const v = validateAddressForNetworks(networks, target.address);
+      const cleanPer: Partial<Record<BlockchainNetwork, string>> = {};
+      for (const [k, v] of Object.entries(networkAddresses ?? {})) {
+        if (typeof v === 'string' && v.trim().length > 0) {
+          cleanPer[k as BlockchainNetwork] = v.trim();
+        }
+      }
+      const v = validateAddressForNetworks(networks, target.address, cleanPer);
       if (!v.ok) {
         Alert.alert(
           'شبکه با آدرس نمی‌خواند',
-          `${v.message} — این آدرس با شبکه انتخاب‌شده سازگار نیست؛ شبکه را بردارید یا کیف را با آدرس جدید بسازید.`
+          `${v.message}`
         );
         return false;
       }
+      const updated: BlockchainWallet = {
+        ...target,
+        name,
+        networks,
+        ...(Object.keys(cleanPer).length > 0 ? { networkAddresses: cleanPer } : {}),
+      };
       bcSaveMutation.mutate(
-        bcWallets.map((w) => (w.id === id ? { ...w, name, networks } : w))
+        bcWallets.map((w) => (w.id === id ? updated : w))
       );
-      // network selection changed → refetch this wallet's balances + PnL
-      queryClient.removeQueries({ queryKey: ['blockchain-balance', id] });
+      // network selection / per-network addresses changed → REAL refetch of
+      // this wallet right away (v1.4.19: the old removeQueries + gate meant
+      // «اضاف کردم فایل‌کوین، ارزهاشو نمیاره» until the next poll).
+      setTimeout(() => {
+        bcWalletsRef.current = bcWalletsRef.current.map((w) => (w.id === id ? updated : w));
+        void runBlockchainManualFetch(id, true);
+      }, 600);
       queryClient.invalidateQueries({ queryKey: ['blockchain-pnl'] });
       return true;
     },
-    [bcWallets, bcSaveMutation, queryClient]
+    [bcWallets, bcSaveMutation, runBlockchainManualFetch]
   );
 
   const handleRemoveBlockchainWallet = useCallback(
@@ -2518,19 +2599,18 @@ export default function WalletScreen() {
 
   const handleRefreshBlockchainAll = useCallback(() => {
     bcWallets.forEach((w) => {
-      void queryClient.refetchQueries({ queryKey: ['blockchain-balance', w.id], type: 'all' });
+      void runBlockchainManualFetch(w.id, true);
     });
-    queryClient.invalidateQueries({ queryKey: ['blockchain-pnl'] });
-    queryClient.invalidateQueries({ queryKey: ['usdt-toman-price'] });
-  }, [bcWallets, queryClient]);
+  }, [bcWallets, runBlockchainManualFetch]);
 
-  // v1.4.17 — «دکمه رفرش کیف کار نمی‌کند» root fix: invalidate alone does
-  // nothing while the query is fresh (staleTime); refetchQueries({type:'all'})
-  // forces the network call for every active AND inactive matching query.
-  const handleRefreshBlockchainWallet = useCallback((id: string) => {
-    void queryClient.refetchQueries({ queryKey: ['blockchain-balance', id], type: 'all' });
-    queryClient.invalidateQueries({ queryKey: ['blockchain-pnl'] });
-  }, [queryClient]);
+  // v1.4.19 — «دکمه رفرش هر کیف کار نمیده» ROOT fix: direct fetch + forced
+  // fresh prices + visible toast/spinner (see runBlockchainManualFetch).
+  const handleRefreshBlockchainWallet = useCallback(
+    (id: string) => {
+      void runBlockchainManualFetch(id, true);
+    },
+    [runBlockchainManualFetch]
+  );
 
   const saveMutation = useMutation({
     mutationFn: async (newWallets: ExchangeWallet[]) => {
@@ -3045,6 +3125,8 @@ export default function WalletScreen() {
           onRemoveWallet={handleRemoveBlockchainWallet}
           onRefreshAll={handleRefreshBlockchainAll}
           onRefreshWallet={handleRefreshBlockchainWallet}
+          manualRefreshing={bcManualRefresh}
+          refreshToast={bcRefreshToast}
         />
       )}
 
