@@ -36,6 +36,7 @@
  */
 
 import {
+  addressForNetwork,
   BlockchainNetwork,
   BlockchainTokenBalance,
   BlockchainWallet,
@@ -50,6 +51,7 @@ import {
   zilliqaBase16,
   writeBlockchainBalanceCache,
 } from './blockchainWallets';
+import { STATIC_REGISTRY } from './tokenRegistry';
 
 const UA =
   'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36';
@@ -321,7 +323,21 @@ async function getTokenRegistry(network: BlockchainNetwork): Promise<RegistryTok
     if (!byContract.has(key)) byContract.set(key, t);
   };
 
-  // 1) Trust Wallet list first (trusted contracts, always probed)
+  // 0) v1.4.19 — STATIC baked registry FIRST (zero network! covers every
+  // Binance coin on every chain incl. the Binance-peg DOGE/ZIL/VET/SAND/
+  // PHA/FLOKI that neither TW lists nor a reachable-from-Iran CoinGecko
+  // download provides). Runtime sources below only ADD contracts.
+  for (const t of STATIC_REGISTRY[network] ?? []) {
+    add({
+      symbol: t.s.toUpperCase(),
+      name: t.n ?? t.s,
+      contract: t.c,
+      decimals: Number.isFinite(t.d) ? t.d : 18,
+      cgId: t.g,
+    });
+  }
+
+  // 1) Trust Wallet list (trusted contracts, always probed)
   if (tw) {
     for (const t of tw) {
       if (!t.address || !/^0x[0-9a-fA-F]{40}$/.test(t.address)) continue;
@@ -566,7 +582,14 @@ const FALLBACK_EVM_TOKENS: Partial<Record<BlockchainNetwork, { symbol: string; n
     { symbol: 'ETH', name: 'Ethereum (Pegged)', contract: '0x2170Ed0880ac9A755fd29B2688956BD959F933F8', decimals: 18 },
     { symbol: 'BTCB', name: 'Bitcoin (Pegged)', contract: '0x7130d2A12B9BCBFAe4f2634d864A1Ee1Ce3Ead9c', decimals: 18 },
     { symbol: 'SHIB', name: 'Shiba Inu (BSC)', contract: '0x2859E4544C4aBb03966803b044A93563Bd2D0DD4', decimals: 18 },
-    { symbol: 'FLOKI', name: 'Floki (BSC)', contract: '0xfb5B838b6cfEEdC787076ac3c5d0Ea1cB70a018c', decimals: 9 },
+    // v1.4.19 — FLOKI official BEP-20 (verified via PancakeSwap list +
+    // on-chain symbol(); the old address here was a lookalike typo).
+    { symbol: 'FLOKI', name: 'Floki (BSC)', contract: '0xfb5B838b6cfEEdC2873aB27866079AC55363D37E', decimals: 9 },
+    { symbol: 'DOGE', name: 'Dogecoin (Binance-peg)', contract: '0xba2aE424d960c26247Dd6c32edC70B295c744C43', decimals: 8 },
+    { symbol: 'ZIL', name: 'Zilliqa (Binance-peg)', contract: '0xb86AbCb37C3A4B64f74F59301AFF131a1BEcC787', decimals: 12 },
+    { symbol: 'VET', name: 'VeChain (Binance-peg)', contract: '0x6FDcdfef7c496407cCb0cEC90f9C5Aaa1Cc8D888', decimals: 18 },
+    { symbol: 'SAND', name: 'The Sandbox (Binance-peg)', contract: '0x67b725d7e342d7B611fa85e859Df9697D9378B2e', decimals: 18 },
+    { symbol: 'PHA', name: 'Phala (Binance-peg)', contract: '0x0112e557d400474717056C4e6D40eDD846F38351', decimals: 18 },
   ],
   polygon: [
     { symbol: 'USDC', name: 'USD Coin', contract: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', decimals: 6 },
@@ -1670,11 +1693,18 @@ const NETWORK_FETCH_CONCURRENCY = 4;
  * by symbol, keeps unknown-price rows VISIBLE (v1.4.17 — user demand), and
  * writes the balance snapshot cache.
  */
-export async function fetchBlockchainWalletData(wallet: BlockchainWallet): Promise<BlockchainWalletData> {
+export async function fetchBlockchainWalletData(
+  wallet: BlockchainWallet,
+  opts?: { force?: boolean }
+): Promise<BlockchainWalletData> {
   const networks = wallet.networks.length > 0 ? wallet.networks : (['ethereum'] as BlockchainNetwork[]);
   const address = wallet.address.trim();
   const notices: string[] = [];
   const collected: BlockchainTokenBalance[] = [];
+
+  // v1.4.19 — manual refresh forces FRESH prices (bypasses the 60s ticker
+  // cache so the numbers really move when the user presses «رفرش»).
+  if (opts?.force) allTickerCache = null;
 
   // small concurrency pool across networks (one EVM registry fetch is shared)
   let cursor = 0;
@@ -1683,7 +1713,10 @@ export async function fetchBlockchainWalletData(wallet: BlockchainWallet): Promi
       const idx = cursor++;
       const net = networks[idx];
       try {
-        const rows = await fetchNetworkBalances(net, address);
+        // v1.4.19 — per-network address override (base 0x for EVM chains +
+        // e.g. a Filecoin f1 / Solana / TON address for that network).
+        const addr = addressForNetwork(wallet, net) || address;
+        const rows = await fetchNetworkBalances(net, addr);
         collected.push(...rows);
       } catch (e) {
         notices.push(`${NETWORKS[net].label}: دریافت ناموفق (${e instanceof Error ? e.message.slice(0, 60) : 'خطا'})`);

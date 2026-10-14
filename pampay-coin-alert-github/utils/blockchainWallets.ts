@@ -88,6 +88,15 @@ export interface BlockchainWallet {
   networks: BlockchainNetwork[];
   /** PUBLIC address only — safe to store, impossible to withdraw from. */
   address: string;
+  /**
+   * v1.4.19 — per-network address overrides. The BASE `address` works for
+   * every EVM chain (same 0x) — but a wallet can ALSO carry a Filecoin f1
+   * address, a Solana address, a TON (Tonkeeper) address … each one is
+   * asked for in the SAME add/edit form the moment that network is ticked
+   * («در همون قسمت خودش آدرسشو بخواد») and used only for that network.
+   * PUBLIC addresses only — read-only, same as `address`.
+   */
+  networkAddresses?: Partial<Record<BlockchainNetwork, string>>;
   addedAt: number;
 }
 
@@ -899,13 +908,42 @@ export function validateBlockchainAddress(
  */
 export function validateAddressForNetworks(
   networks: BlockchainNetwork[],
-  address: string
+  address: string,
+  networkAddresses?: Partial<Record<BlockchainNetwork, string>>
 ): { ok: boolean; network?: BlockchainNetwork; message?: string } {
   for (const n of networks) {
+    // v1.4.19 — a per-network override replaces the base address for THAT
+    // network only (e.g. base 0x for Ethereum+BSC + f1 for Filecoin).
+    const perNet = networkAddresses?.[n]?.trim();
+    if (perNet) {
+      const vPer = validateBlockchainAddress(n, perNet);
+      if (!vPer.ok) return { ok: false, network: n, message: `${NETWORKS[n].label} (آدرس اختصاصی): ${vPer.message}` };
+      continue;
+    }
     const v = validateBlockchainAddress(n, address);
-    if (!v.ok) return { ok: false, network: n, message: `${NETWORKS[n].label}: ${v.message}` };
+    if (!v.ok) {
+      // v1.4.19 — if the BASE address doesn't fit this network, the fix is
+      // entering that network's own address (the form shows the input).
+      return {
+        ok: false,
+        network: n,
+        message: `${NETWORKS[n].label}: آدرس این شبکه را در کادر اختصاصی همان شبکه وارد کنید (${v.message})`,
+      };
+    }
   }
   return { ok: true };
+}
+
+/**
+ * v1.4.19 — the address actually used to read a network. Per-network
+ * override wins; otherwise the wallet's base address (EVM 0x shared).
+ */
+export function addressForNetwork(
+  wallet: Pick<BlockchainWallet, 'address' | 'networkAddresses'>,
+  network: BlockchainNetwork
+): string {
+  const per = wallet.networkAddresses?.[network]?.trim();
+  return per && per.length > 0 ? per : wallet.address.trim();
 }
 
 /** Tron hex form (21 bytes, no checksum) for TronGrid calls — null if invalid. */

@@ -314,3 +314,83 @@ export async function fetchFullWalletData(address: string) {
     spotMeta,
   };
 }
+
+// ---------------------------------------------------------------------------
+// v1.4.19 — Whale PnL per timeframe (7/30/90/180 days)
+// «برا نهنگها هم اضاف میکنم pnl در تایمهای مختلف اضاف کن بدون کاراییشون
+//  چی بوده» — realized PnL from closed fills in the window + current
+// unrealized PnL of open positions. One fills call + one accountState call.
+// ---------------------------------------------------------------------------
+
+export interface WhalePnlByPeriod {
+  /** realized (closed) PnL of fills within the window, USD */
+  realized: number;
+  /** number of closed trades in the window */
+  trades: number;
+}
+
+export interface WhalePnl {
+  d7: WhalePnlByPeriod;
+  d30: WhalePnlByPeriod;
+  d90: WhalePnlByPeriod;
+  d180: WhalePnlByPeriod;
+  /** current unrealized PnL of open positions (USD) */
+  unrealized: number;
+  /** open position count */
+  openPositions: number;
+  /** account value (USD) */
+  accountValue: number;
+  fetchedAt: number;
+}
+
+const DAY_MS = 86_400_000;
+
+export async function fetchWhalePnl(address: string): Promise<WhalePnl> {
+  const [fills, accountState] = await Promise.all([
+    fetchUserFills(address).catch(() => [] as HyperliquidFill[]),
+    fetchAccountState(address).catch(() => null as HyperliquidAccountState | null),
+  ]);
+
+  const now = Date.now();
+  const acc: Record<number, { realized: number; trades: number }> = {
+    7: { realized: 0, trades: 0 },
+    30: { realized: 0, trades: 0 },
+    90: { realized: 0, trades: 0 },
+    180: { realized: 0, trades: 0 },
+  };
+  for (const f of fills) {
+    const pnl = parseFloat(f.closedPnl ?? '0');
+    if (!Number.isFinite(pnl) || pnl === 0) continue;
+    const ageDays = (now - f.time) / DAY_MS;
+    for (const d of [7, 30, 90, 180] as const) {
+      if (ageDays <= d) {
+        acc[d].realized += pnl;
+        acc[d].trades += 1;
+      }
+    }
+  }
+
+  const unrealized = accountState
+    ? accountState.assetPositions.reduce((s, ap) => {
+        const p = parseFloat(ap.position.unrealizedPnl ?? '0');
+        return s + (Number.isFinite(p) ? p : 0);
+      }, 0)
+    : 0;
+  const openPositions = accountState
+    ? accountState.assetPositions.filter((ap) => Math.abs(parseFloat(ap.position.szi)) > 1e-7).length
+    : 0;
+  const accountValue = accountState
+    ? parseFloat(accountState.marginSummary.accountValue ?? '0')
+    : 0;
+
+  return {
+    d7: acc[7],
+    d30: acc[30],
+    d90: acc[90],
+    d180: acc[180],
+    unrealized,
+    openPositions,
+    accountValue,
+    fetchedAt: Date.now(),
+  };
+}
