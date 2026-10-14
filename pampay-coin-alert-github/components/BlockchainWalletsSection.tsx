@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { View, Text, StyleSheet, Pressable, TextInput, ActivityIndicator, Alert, ScrollView } from 'react-native';
 import {
   Link as LinkIcon,
@@ -386,10 +386,23 @@ function BlockchainPnlCard({
             </Text>
           )}
           {/* v1.4.19 — PER-WALLET one-line PnL rows (token detail lives in
-              each wallet's own card, behind its expand arrow). */}
+              each wallet's own card, behind its expand arrow). v1.5.0:
+              «همه کیف‌ها» همیشه ردیف خودش را دارند — کیف‌های بدون داده
+              قیمتِ این بازه هم با «—» نمایش داده می‌شوند، نه حذف. */}
           {wallets.map((w) => {
             const wp = pnlSummary?.perWallet?.[w.id]?.[period];
-            if (!wp || wp.usdThen <= 0) return null;
+            if (!wp || wp.usdThen <= 0) {
+              return (
+                <View key={w.id} style={styles.pnlRow}>
+                  <Text style={styles.pnlRowLabel} numberOfLines={1}>
+                    {w.name}
+                  </Text>
+                  <Text style={[styles.pnlRowValue, { color: colors.dark.textMuted }]}>
+                    — بدون داده قیمت این بازه
+                  </Text>
+                </View>
+              );
+            }
             const wUsd = wp.usdNow - wp.usdThen;
             const wPct = (wUsd / wp.usdThen) * 100;
             return (
@@ -422,14 +435,22 @@ function BlockchainPnlCard({
 
 // ---------------------------------------------------------------------------
 // Network multi-select DROPDOWN («منوی کشویی شبکه‌ها»)
+// v1.5.0 — SPLIT into TWO dropdowns (user demand: «منوی کشویی شبکه‌های
+// مستقل را از قسمت انتخاب شبکه جدا کن»): one for the EVM networks (shared
+// 0x address) and a SEPARATE one for the standalone networks, each of which
+// gets its own dedicated-address input right below it.
 // ---------------------------------------------------------------------------
 
 function NetworkDropdown({
   selected,
   onChange,
+  group,
 }: {
+  /** ONLY the networks of this group (caller filters). */
   selected: BlockchainNetwork[];
+  /** next selection OF THIS GROUP (caller merges with the other group). */
   onChange: (next: BlockchainNetwork[]) => void;
+  group: 'evm' | 'independent';
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -463,7 +484,7 @@ function NetworkDropdown({
       <Pressable
         style={styles.dropdownBtn}
         onPress={() => setOpen((v) => !v)}
-        testID="network-dropdown-button"
+        testID={group === 'evm' ? 'network-dropdown-evm' : 'network-dropdown-standalone'}
       >
         <View style={styles.dropdownBtnLeft}>
           {selected.slice(0, 4).map((n) => (
@@ -474,8 +495,12 @@ function NetworkDropdown({
           ))}
           <Text style={styles.dropdownBtnText}>
             {selected.length === 0
-              ? 'انتخاب شبکه‌ها (منوی کشویی)'
-              : `${selected.length.toLocaleString('fa-IR')} شبکه انتخاب شد`}
+              ? group === 'evm'
+                ? 'انتخاب شبکه‌های اتریومی (منوی کشویی)'
+                : 'انتخاب شبکه‌های مستقل — آدرس اختصاصی'
+              : `${selected.length.toLocaleString('fa-IR')} شبکه ${
+                  group === 'evm' ? 'اتریومی' : 'مستقل'
+                } انتخاب شد`}
           </Text>
         </View>
         {open ? (
@@ -494,14 +519,14 @@ function NetworkDropdown({
             placeholder="جستجوی شبکه (مثلاً بیس یا SOL)…"
             placeholderTextColor={colors.dark.textMuted}
           />
-          {NETWORK_GROUPS.map((group) => {
-            const list = filter(group.networks);
+          {NETWORK_GROUPS.filter((g) => g.id === group).map((grp) => {
+            const list = filter(grp.networks);
             if (list.length === 0) return null;
             return (
-              <View key={group.id} style={styles.dropdownGroup}>
+              <View key={grp.id} style={styles.dropdownGroup}>
                 <View style={styles.dropdownGroupHead}>
-                  <Text style={styles.dropdownGroupTitle}>{group.label}</Text>
-                  {group.id === 'evm' && (
+                  <Text style={styles.dropdownGroupTitle}>{grp.label}</Text>
+                  {grp.id === 'evm' && (
                     <Pressable style={styles.dropdownGroupAction} onPress={toggleAllEvm}>
                       <Text style={styles.dropdownGroupActionText}>
                         {allEvmSelected ? 'حذف همه' : 'انتخاب همه'}
@@ -509,7 +534,7 @@ function NetworkDropdown({
                     </Pressable>
                   )}
                 </View>
-                <Text style={styles.dropdownGroupNote}>{group.note}</Text>
+                <Text style={styles.dropdownGroupNote}>{grp.note}</Text>
                 <ScrollView
                   nestedScrollEnabled
                   style={styles.dropdownScroll}
@@ -586,12 +611,23 @@ function AddBlockchainWalletForm({
   );
   const [busy, setBusy] = useState(false);
 
+  // v1.5.0 — SPLIT network selection (user demand: «منوی کشویی شبکه‌های
+  // مستقل را از قسمت انتخاب شبکه جدا کن و برای آدرس اختصاصی بیار»):
+  //  • EVM dropdown  → one shared 0x address (base field)
+  //  • standalone dropdown → a DEDICATED address input per selected network,
+  //    right below the same dropdown.
+  const evmSelected = useMemo(() => networks.filter((n) => isEvmNetwork(n)), [networks]);
+  const standaloneSelected = useMemo(() => networks.filter((n) => !isEvmNetwork(n)), [networks]);
+  const changeEvm = useCallback((nextEvm: BlockchainNetwork[]) => {
+    setNetworks((prev) => [...nextEvm, ...prev.filter((n) => !isEvmNetwork(n))]);
+  }, []);
+  const changeStandalone = useCallback((nextStandalone: BlockchainNetwork[]) => {
+    setNetworks((prev) => [...prev.filter((n) => isEvmNetwork(n)), ...nextStandalone]);
+  }, []);
+
   // networks that need their own address input: every selected NON-EVM
   // network (Filecoin too — its native f1 differs from the FEVM 0x).
-  const perNetNetworks = useMemo(
-    () => networks.filter((n) => !isEvmNetwork(n)),
-    [networks]
-  );
+  const perNetNetworks = standaloneSelected;
 
   const validation = useMemo(
     () =>
@@ -649,24 +685,21 @@ function AddBlockchainWalletForm({
         maxLength={40}
       />
 
+      {/* ── v1.5.0 — dropdown ۱: شبکه‌های اتریومی (آدرس مشترک 0x) ── */}
       <Text style={styles.inputLabel}>
-        شبکه‌ها (منوی کشویی — چند انتخاب با تیک){' '}
+        شبکه‌های اتریومی (EVM) — همه با یک آدرس 0x{' '}
         {editWallet ? '— با ویرایش شبکه‌ها، موجودی دوباره خوانده می‌شود' : ''}
       </Text>
-      <NetworkDropdown selected={networks} onChange={setNetworks} />
+      <NetworkDropdown selected={evmSelected} onChange={changeEvm} group="evm" />
 
-      {!editWallet && (
+      {!editWallet && evmSelected.length > 0 && (
         <>
-          <Text style={styles.inputLabel}>آدرس عمومی کیف پول</Text>
+          <Text style={styles.inputLabel}>آدرس عمومی کیف پول (شبکه‌های اتریومی)</Text>
           <TextInput
             style={[styles.input, validation?.ok && styles.inputValid]}
             value={address}
             onChangeText={(t) => setAddress(t.replace(/\s+/g, ''))}
-            placeholder={
-              networks.length > 0
-                ? NETWORKS[networks[0] ?? 'ethereum'].addrHint
-                : 'اول شبکه را انتخاب کنید'
-            }
+            placeholder={NETWORKS[networks[0] ?? 'ethereum'].addrHint}
             placeholderTextColor={colors.dark.textMuted}
             autoCapitalize="none"
             autoCorrect={false}
@@ -681,11 +714,19 @@ function AddBlockchainWalletForm({
         </>
       )}
 
-      {/* ── v1.4.19 — آدرس اختصاصی هر شبکه غیر اتریومی (در همین فرم) ── */}
+      {/* ── v1.5.0 — dropdown ۲: شبکه‌های مستقل (آدرس اختصاصی جدا) — «منوی
+          کشویی شبکه‌های مستقل را از قسمت انتخاب شبکه جدا کن» ── */}
+      <View style={{ height: 12 }} />
+      <Text style={styles.inputLabel}>
+        شبکه‌های مستقل — هر شبکه آدرس اختصاصی خودش (برای آدرس اختصاصی)
+      </Text>
+      <NetworkDropdown selected={standaloneSelected} onChange={changeStandalone} group="independent" />
+
+      {/* ── v1.5.0 — آدرس اختصاصی هر شبکه مستقل: همین‌جا زیر منوی خودش ── */}
       {perNetNetworks.length > 0 && (
         <View style={styles.perNetBox}>
           <Text style={styles.perNetTitle}>
-            آدرس اختصاصی شبکه‌های غیر اتریومی (در همین بخش)
+            آدرس اختصاصی شبکه‌های مستقل انتخاب‌شده
           </Text>
           <Text style={styles.perNetHint}>
             شبکه‌های اتریومی همه با همان آدرس 0x بالا خوانده می‌شوند؛ برای هر شبکه زیر آدرس{' '}

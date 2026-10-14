@@ -60,6 +60,7 @@ import {
 import { fetchFuturesTickers } from '@/utils/binanceApi';
 import { sendTelegramAISignal, sendTelegramTradeNotification } from '@/utils/telegramService';
 import DropdownPicker from '@/components/DropdownPicker';
+import TradeAiSegmentHeader from '@/components/TradeAiSegmentHeader';
 
 const DEMO_KEY = '@trade_ai_demo';
 const SIGNALS_HISTORY_KEY = '@trade_ai_signals';
@@ -418,6 +419,9 @@ export default function TradeAiScreen() {
       contentContainerStyle={styles.content}
       showsVerticalScrollIndicator={false}
     >
+      {/* v1.5.0 — سه سربخش: تحلیل AI / ترید واقعی / معامله خودکار */}
+      <TradeAiSegmentHeader active="ai" />
+
       <View style={styles.refreshTimerBar}>
         <View style={styles.refreshTimerLeft}>
           <Activity size={12} color={colors.dark.green} />

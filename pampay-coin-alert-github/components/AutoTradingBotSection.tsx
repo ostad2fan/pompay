@@ -1,65 +1,128 @@
 /**
- * AutoTradingBotSection.tsx — v1.4.19
+ * AutoTradingBotSection.tsx — v1.5.0
  *
- * «معامله‌گر خودکار» UI — کافی‌پوزیشن‌های نهنگ + سیگنال اندیکاتورها را
+ * «معامله‌گر خودکار» UI — کپی پوزیشن‌های نهنگ + سیگنال اندیکاتورها را
  * اتوماتیک (دمو یا واقعی) معامله می‌کند با تنظیمات کاربر: لوریج، حجم،
  * حداکثر ضرر (→ استاپ‌لاس اتوماتیک) و ریوارد R:R (→ تیک‌پرافیت اتوماتیک).
- * موتور: utils/autoTradingEngine.ts (runAutoCycle هر ۶۰ ثانیه).
+ *
+ * v1.5.0:
+ *  • منبع اندیکاتور: کشویی از اندیکاتورهای آماده (هوک ریورسال + GainzAlgo
+ *    Pro) + اندیکاتورهای دستی خود کاربر؛ برای هر اندیکاتور ۱ یا ۲
+ *    تایم‌فریم انتخاب می‌شود (خالی = همه).
+ *  • تریلینگ استاپ و مدیریت سرمایه هوشمند همیشه‌فعال (سیستم خودش).
+ *  • موتور GLOBAL در کل برنامه می‌چرخد (utils/autoTradingEngine)؛ روشن بودن
+ *    ربات ذخیره می‌شود و با بستن برنامه خاموش نمی‌شود.
+ *  • PnL در تایم‌فریم‌های مختلف + خروجی عکس (ذخیره در گالری / اشتراک‌گذاری).
+ *  • رفرش پوزیشن‌های ربات = اجرای کامل یک چرخه (قیمت تازه + SL/TP + تریل).
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { View, Text, StyleSheet, Pressable, TextInput, Switch, ActivityIndicator, ScrollView, Alert } from 'react-native';
-import { Bot, Waves, Gauge, Play, Square, X, RefreshCw, TrendingUp, TrendingDown, Wallet2, Zap } from 'lucide-react-native';
-import colors from '@/constants/colors';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
+  View,
+  Text,
+  StyleSheet,
+  Pressable,
+  TextInput,
+  Switch,
+  ActivityIndicator,
+  ScrollView,
+  Alert,
+  Platform,
+} from 'react-native';
+import {
+  Bot,
+  Waves,
+  Gauge,
+  Play,
+  Square,
+  X,
+  RefreshCw,
+  TrendingUp,
+  TrendingDown,
+  Wallet2,
+  Zap,
+  ChevronDown,
+  ChevronUp,
+  Camera,
+  Share2,
+  Save,
+  ShieldCheck,
+} from 'lucide-react-native';
+import { captureRef } from 'react-native-view-shot';
+import * as Sharing from 'expo-sharing';
+import * as MediaLibrary from 'expo-media-library';
+import colors from '@/constants/colors';
+import {
+  AutoPnlPeriod,
+  AutoTf,
   AutoTradeSettings,
   DEFAULT_AUTO_SETTINGS,
   DemoAutoPosition,
-  loadAutoSettings,
-  saveAutoSettings,
-  loadDemoPositions,
-  listTrackedWhales,
-  listUserIndicators,
-  runAutoCycle,
-  getAutoLogs,
-  manualClosePosition,
+  IndicatorOption,
+  IndicatorSelection,
+  RealAutoPosition,
   RealKeys,
+  AUTO_PNL_PERIODS,
+  AUTO_PNL_PERIOD_LABEL,
+  AUTO_TF_LABEL,
+  computeAutoPnlStats,
+  getAutoLogs,
+  getLastGlobalCycleAt,
+  listIndicatorOptions,
+  listTrackedWhales,
+  loadAutoSettings,
+  loadDemoPositions,
+  loadRealKeys,
+  loadRealPositions,
+  manualClosePosition,
+  runGlobalCycleNow,
+  saveAutoSettings,
 } from '@/utils/autoTradingEngine';
 
-const CYCLE_MS = 60_000;
+const UI_REFRESH_MS = 5_000;
 
-export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKeys }) {
+export default function AutoTradingBotSection({ realKeys: realKeysProp }: { realKeys?: RealKeys }) {
   const [settings, setSettings] = useState<AutoTradeSettings>(DEFAULT_AUTO_SETTINGS);
   const [whales, setWhales] = useState<{ address: string; label: string }[]>([]);
-  const [indicators, setIndicators] = useState<{ id: string; name: string }[]>([]);
+  const [indicatorOptions, setIndicatorOptions] = useState<IndicatorOption[]>([]);
   const [positions, setPositions] = useState<DemoAutoPosition[]>([]);
+  const [realPositions, setRealPositions] = useState<RealAutoPosition[]>([]);
   const [logs, setLogs] = useState<{ id: string; at: number; kind: string; message: string }[]>([]);
   const [cycleBusy, setCycleBusy] = useState(false);
   const [lastCycleAt, setLastCycleAt] = useState<number | null>(null);
   const [showDetail, setShowDetail] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [realKeys, setRealKeys] = useState<RealKeys | undefined>(realKeysProp);
+  const [indDropdownOpen, setIndDropdownOpen] = useState(false);
+  const [pnlPeriod, setPnlPeriod] = useState<AutoPnlPeriod>('all');
+  const [captureBusy, setCaptureBusy] = useState(false);
+  const pnlCardRef = useRef<View>(null);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
 
   // load everything on mount
   useEffect(() => {
     (async () => {
-      const [s, w, i, p, l] = await Promise.all([
+      const [s, w, opts, p, rp, l, keys] = await Promise.all([
         loadAutoSettings(),
         listTrackedWhales(),
-        listUserIndicators(),
+        listIndicatorOptions(),
         loadDemoPositions(),
+        loadRealPositions(),
         getAutoLogs(),
+        realKeysProp ? Promise.resolve(realKeysProp) : loadRealKeys(),
       ]);
       setSettings(s);
       setWhales(w);
-      setIndicators(i);
+      setIndicatorOptions(opts);
       setPositions(p);
-      setLogs(l);
+      setRealPositions(rp);
+      setLogs(l.slice(0, 30));
+      setRealKeys(keys);
+      setLastCycleAt(getLastGlobalCycleAt());
       setLoaded(true);
     })().catch(() => setLoaded(true));
-  }, []);
+  }, [realKeysProp]);
 
   const persist = useCallback(async (next: AutoTradeSettings) => {
     setSettings(next);
@@ -68,45 +131,80 @@ export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKey
 
   const refreshPositions = useCallback(async () => {
     setPositions(await loadDemoPositions());
+    setRealPositions(await loadRealPositions());
     setLogs((await getAutoLogs()).slice(0, 30));
+    setLastCycleAt(getLastGlobalCycleAt());
   }, []);
 
-  // the bot loop — only while enabled + screen mounted
+  // light UI refresh loop — reads storage only (the ENGINE loop lives globally)
   useEffect(() => {
-    if (!settings.enabled) return;
-    let alive = true;
-    const tick = async () => {
-      if (!alive || cycleBusy) return;
-      setCycleBusy(true);
-      try {
-        await runAutoCycle({ settings: settingsRef.current, realKeys });
-        setLastCycleAt(Date.now());
-        await refreshPositions();
-      } catch {}
-      setCycleBusy(false);
-    };
-    void tick();
-    const t = setInterval(tick, CYCLE_MS);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, [settings.enabled, realKeys, refreshPositions]);
+    if (!loaded) return;
+    const t = setInterval(() => {
+      void refreshPositions();
+    }, UI_REFRESH_MS);
+    return () => clearInterval(t);
+  }, [loaded, refreshPositions]);
+
+  // v1.5.0 — «رفرش پوزیشن‌های ربات» = run a FULL engine cycle (fresh prices,
+  // SL/TP checks, trailing, whale/indicator sweep) then reload the view.
+  const runCycleAndRefresh = useCallback(async () => {
+    if (cycleBusy) return;
+    setCycleBusy(true);
+    try {
+      await runGlobalCycleNow();
+      await refreshPositions();
+    } catch {}
+    setCycleBusy(false);
+  }, [cycleBusy, refreshPositions]);
 
   const openPositions = useMemo(() => positions.filter((p) => p.status === 'open'), [positions]);
-  const closedPositions = useMemo(() => positions.filter((p) => p.status === 'closed').slice(0, 10), [positions]);
+  const closedPositions = useMemo(() => positions.filter((p) => p.status === 'closed').slice(0, 12), [positions]);
+  const realOpen = useMemo(() => realPositions.filter((p) => p.status === 'open'), [realPositions]);
+  const realClosed = useMemo(() => realPositions.filter((p) => p.status === 'closed').slice(0, 12), [realPositions]);
 
   const totalPnl = openPositions.reduce((s, p) => {
     const dir = p.side === 'long' ? 1 : -1;
     return s + (p.lastPrice - p.entryPrice) * dir * p.qty;
   }, 0);
+  const realTotalPnl = realOpen.reduce((s, p) => {
+    const dir = p.side === 'long' ? 1 : -1;
+    return s + (p.lastPrice - p.entryPrice) * dir * p.qty;
+  }, 0);
 
-  const whaleOptions = whales;
+  // ── PnL stats per period (demo + real) ──
+  const demoStats = useMemo(
+    () => computeAutoPnlStats(pnlPeriod, positions.filter((p) => p.status === 'closed'), totalPnl),
+    [pnlPeriod, positions, totalPnl]
+  );
+  const realStats = useMemo(
+    () => computeAutoPnlStats(pnlPeriod, realPositions.filter((p) => p.status === 'closed'), realTotalPnl),
+    [pnlPeriod, realPositions, realTotalPnl]
+  );
+
+  // ── indicator selection helpers ──
+  const selectionOf = (id: string) => settings.indicators.selections.find((s) => s.id === id);
 
   const toggleIndicator = (id: string) => {
-    const cur = settings.indicators.indicatorIds;
-    const next = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
-    void persist({ ...settings, indicators: { ...settings.indicators, indicatorIds: next } });
+    const cur = settings.indicators.selections;
+    const next: IndicatorSelection[] = cur.some((s) => s.id === id)
+      ? cur.filter((s) => s.id !== id)
+      : [...cur, { id, timeframes: [] }];
+    void persist({ ...settings, indicators: { ...settings.indicators, selections: next } });
+  };
+
+  const toggleIndicatorTf = (id: string, tf: AutoTf) => {
+    const sel = selectionOf(id);
+    if (!sel) return;
+    const has = sel.timeframes.includes(tf);
+    // «یک یا دو تایم‌فریم»: max 2 — adding a third replaces the oldest.
+    let tfs: AutoTf[];
+    if (has) {
+      tfs = sel.timeframes.filter((x) => x !== tf);
+    } else {
+      tfs = [...sel.timeframes, tf].slice(-2);
+    }
+    const next = settings.indicators.selections.map((s) => (s.id === id ? { ...s, timeframes: tfs } : s));
+    void persist({ ...settings, indicators: { ...settings.indicators, selections: next } });
   };
 
   if (!loaded) {
@@ -126,25 +224,101 @@ export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKey
       Alert.alert('نهنگ انتخاب نشده', 'از لیست، نهنگ موردنظر برای کپی معاملات را انتخاب کنید.');
       return;
     }
-    if (settings.indicators.enabled && settings.indicators.indicatorIds.length === 0) {
-      Alert.alert('اندیکاتور انتخاب نشده', 'حداقل یک اندیکاتور از لیست انتخاب کنید.');
+    if (settings.indicators.enabled && settings.indicators.selections.length === 0) {
+      Alert.alert('اندیکاتور انتخاب نشده', 'از منوی کشویی، حداقل یک اندیکاتور انتخاب کنید.');
       return;
     }
     if (settings.mode === 'real' && !realKeys) {
-      Alert.alert('کلید API نیست', 'برای معامله واقعی، ابتدا کلید API فیوچرز بایننس را در همین صفحه اضافه کنید.');
+      Alert.alert('کلید API نیست', 'برای معامله واقعی، ابتدا کلید API فیوچرز بایننس را در تب «ترید واقعی» اضافه کنید.');
       return;
     }
     Alert.alert(
       settings.mode === 'demo' ? 'شروع دمو' : 'شروع واقعی',
       settings.mode === 'demo'
-        ? 'ربات در حالت دمو شروع می‌شود — پوزیشن‌های شبیه‌سازی‌شده با تنظیمات شما باز/بسته می‌شوند.'
-        : 'ربات با پول واقعی شروع می‌شود! هر سیگنال = سفارش مارکت + استاپ + تیک‌پرافیت روی فیوچرز بایننس. مطمئنید؟',
+        ? 'ربات در حالت دمو شروع می‌شود — پوزیشن‌های شبیه‌سازی‌شده با تنظیمات شما باز/بسته می‌شوند. ربات روشن می‌ماند و با بستن برنامه خاموش نمی‌شود.'
+        : 'ربات با پول واقعی شروع می‌شود! هر سیگنال = سفارش مارکت + استاپ + تیک‌پرافیت روی فیوچرز بایننس. استاپ و تیک‌پرافیت روی خود صرافی live می‌مانند و حتی با بسته بودن برنامه محافظت می‌کنند. مطمئنید؟',
       [
         { text: 'لغو', style: 'cancel' },
-        { text: 'شروع', style: settings.mode === 'real' ? 'destructive' : 'default', onPress: () => void persist({ ...settings, enabled: true }) },
+        {
+          text: 'شروع',
+          style: settings.mode === 'real' ? 'destructive' : 'default',
+          onPress: () => {
+            void persist({ ...settings, enabled: true }).then(() => {
+              void runCycleAndRefresh();
+            });
+          },
+        },
       ]
     );
   };
+
+  // ── v1.5.0 — PnL share image (save to gallery / share to other apps) ──
+  const capturePnl = async (): Promise<string | null> => {
+    try {
+      if (!pnlCardRef.current) return null;
+      const uri = await captureRef(pnlCardRef, { format: 'png', quality: 1, result: 'tmpfile' });
+      return uri;
+    } catch {
+      return null;
+    }
+  };
+
+  const handleSharePnl = async () => {
+    if (captureBusy) return;
+    setCaptureBusy(true);
+    try {
+      const uri = await capturePnl();
+      if (!uri) {
+        Alert.alert('خطا', 'ساخت عکس PnL ممکن نشد.');
+        return;
+      }
+      if (Platform.OS === 'web') {
+        Alert.alert('وب', 'خروجی عکس فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
+        return;
+      }
+      const available = await Sharing.isAvailableAsync().catch(() => false);
+      if (!available) {
+        Alert.alert('غيرممکن', 'اشتراک‌گذاری روی این دستگاه در دسترس نیست.');
+        return;
+      }
+      await Sharing.shareAsync(uri, {
+        mimeType: 'image/png',
+        dialogTitle: 'اشتراک‌گذاری PnL معامله‌گر خودکار',
+      });
+    } finally {
+      setCaptureBusy(false);
+    }
+  };
+
+  const handleSavePnl = async () => {
+    if (captureBusy) return;
+    setCaptureBusy(true);
+    try {
+      const uri = await capturePnl();
+      if (!uri) {
+        Alert.alert('خطا', 'ساخت عکس PnL ممکن نشد.');
+        return;
+      }
+      if (Platform.OS === 'web') {
+        Alert.alert('وب', 'ذخیره در گالری فقط روی گوشی پشتیبانی می‌شود.');
+        return;
+      }
+      const perm = await MediaLibrary.requestPermissionsAsync().catch(() => ({ granted: false }) as { granted: boolean });
+      if (!perm.granted) {
+        Alert.alert('دسترسی داده نشد', 'برای ذخیره عکس در گالری، دسترسی رسانه را تأیید کنید.');
+        return;
+      }
+      await MediaLibrary.saveToLibraryAsync(uri);
+      Alert.alert('ذخیره شد ✅', 'عکس PnL ربات در گالری گوشی ذخیره شد.');
+    } catch {
+      Alert.alert('خطا', 'ذخیره عکس انجام نشد.');
+    } finally {
+      setCaptureBusy(false);
+    }
+  };
+
+  const hasAnyPosition = openPositions.length > 0 || realOpen.length > 0 ||
+    positions.some((p) => p.status === 'closed') || realPositions.some((p) => p.status === 'closed');
 
   return (
     <View style={styles.card}>
@@ -157,7 +331,7 @@ export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKey
             <Text style={styles.title}>معامله‌گر خودکار</Text>
             <Text style={styles.subtitle}>
               {settings.enabled
-                ? `${settings.mode === 'demo' ? 'دمو' : 'واقعی'} فعال • ${settings.mode === 'demo' ? `${openPositions.length} پوزیشن دمو` : 'سفارش‌های زنده'}`
+                ? `${settings.mode === 'demo' ? 'دمو' : 'واقعی'} فعال • ${settings.mode === 'demo' ? `${openPositions.length} پوزیشن دمو` : `${realOpen.length} پوزیشن واقعی`} • همیشه روشن`
                 : 'کپی نهنگ‌ها + سیگنال اندیکاتورها — دمو یا واقعی'}
             </Text>
           </View>
@@ -202,13 +376,22 @@ export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKey
             )}
           </View>
           {settings.mode === 'real' && !realKeys && (
-            <Text style={styles.warn}>کلید API فیوچرز بایننس اضافه نشده — برای حالت واقعی لازم است.</Text>
+            <Text style={styles.warn}>کلید API فیوچرز بایننس اضافه نشده — از تب «ترید واقعی» بگذارید (برای دمو لازم نیست).</Text>
           )}
           {settings.mode === 'real' && realKeys && (
-            <Text style={styles.warnReal}>⚠ حالت واقعی: هر سیگنال با پول واقعی معامله می‌شود.</Text>
+            <Text style={styles.warnReal}>⚠ حالت واقعی: هر سیگنال با پول واقعی معامله می‌شود — استاپ/تیپی روی صرافی live می‌ماند.</Text>
+          )}
+          {settings.enabled && (
+            <View style={styles.engineBadge}>
+              <ShieldCheck size={11} color={colors.dark.green} />
+              <Text style={styles.engineBadgeText}>
+                موتور همیشه‌فعال: هر ۶۰ ثانیه + هنگام باز شدن برنامه چرخه می‌زند — با بستن برنامه خاموش نمی‌شود.
+                {lastCycleAt ? ` آخرین چرخه: ${Math.max(0, Math.round((Date.now() - lastCycleAt) / 1000))} ثانیه پیش.` : ''}
+              </Text>
+            </View>
           )}
 
-          {/* whale source */}
+          {/* whale source — on/off like whale-tracking toggles */}
           <View style={styles.sourceBox}>
             <View style={styles.sourceHead}>
               <Waves size={13} color={colors.dark.blue} />
@@ -223,11 +406,11 @@ export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKey
             </View>
             {settings.whale.enabled && (
               <>
-                {whaleOptions.length === 0 ? (
+                {whales.length === 0 ? (
                   <Text style={styles.sourceHint}>هنوز نهنگی ردیابی نکرده‌اید — از تب «ردیابی نهنگ‌ها» اضافه کنید.</Text>
                 ) : (
                   <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipsRow}>
-                    {whaleOptions.map((w) => (
+                    {whales.map((w) => (
                       <Pressable
                         key={w.address}
                         style={[styles.chip, settings.whale.address === w.address && styles.chipActive]}
@@ -250,7 +433,8 @@ export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKey
             )}
           </View>
 
-          {/* indicator source */}
+          {/* indicator source — dropdown of ready + custom indicators,
+              per-indicator 1-2 timeframe selection */}
           <View style={styles.sourceBox}>
             <View style={styles.sourceHead}>
               <Gauge size={13} color={colors.dark.blue} />
@@ -265,22 +449,80 @@ export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKey
             </View>
             {settings.indicators.enabled && (
               <>
-                {indicators.length === 0 ? (
-                  <Text style={styles.sourceHint}>اندیکاتور دستی ندارید — از تب «اندیکاتورها» بسازید (اندیکاتورهای آماده هم پشتیبانی می‌شوند).</Text>
-                ) : (
-                  <View style={styles.chipWrap}>
-                    {indicators.map((ind) => {
-                      const on = settings.indicators.indicatorIds.includes(ind.id);
+                <Pressable style={styles.indDropdownBtn} onPress={() => setIndDropdownOpen((v) => !v)}>
+                  <Text style={styles.indDropdownText}>
+                    انتخاب اندیکاتور (کشویی) — {settings.indicators.selections.length.toLocaleString('fa-IR')} انتخاب‌شده
+                  </Text>
+                  {indDropdownOpen ? (
+                    <ChevronUp size={14} color={colors.dark.accent} />
+                  ) : (
+                    <ChevronDown size={14} color={colors.dark.accent} />
+                  )}
+                </Pressable>
+                {indDropdownOpen && (
+                  <View style={styles.indDropdownPanel}>
+                    {indicatorOptions.length === 0 && (
+                      <Text style={styles.sourceHint}>اندیکاتوری موجود نیست — از تب «اندیکاتورها» اضافه کنید.</Text>
+                    )}
+                    {indicatorOptions.map((opt) => {
+                      const sel = selectionOf(opt.id);
+                      const on = !!sel;
                       return (
                         <Pressable
-                          key={ind.id}
-                          style={[styles.chip, on && styles.chipActive]}
-                          onPress={() => toggleIndicator(ind.id)}
+                          key={opt.id}
+                          style={[styles.indRow, on && styles.indRowActive]}
+                          onPress={() => toggleIndicator(opt.id)}
                         >
-                          <Text style={[styles.chipText, on && styles.chipTextActive]} numberOfLines={1}>
-                            {on ? '✓ ' : ''}{ind.name}
-                          </Text>
+                          <View style={styles.indRowTexts}>
+                            <Text style={styles.indRowLabel}>
+                              {opt.kind === 'hook' ? '🪝 ' : opt.kind === 'gainz' ? '📊 ' : '🧩 '}
+                              {opt.name}
+                            </Text>
+                            <Text style={styles.indRowHint}>
+                              تایم‌فریم‌ها: {opt.timeframes.map((t) => AUTO_TF_LABEL[t]).join(' / ')}
+                            </Text>
+                          </View>
+                          <View style={[styles.checkbox, on && { backgroundColor: colors.dark.accent, borderColor: colors.dark.accent }]}>
+                            {on && <Text style={styles.checkboxTick}>✓</Text>}
+                          </View>
                         </Pressable>
+                      );
+                    })}
+                  </View>
+                )}
+                {settings.indicators.selections.length > 0 && (
+                  <View style={styles.selList}>
+                    {settings.indicators.selections.map((sel) => {
+                      const opt = indicatorOptions.find((o) => o.id === sel.id);
+                      if (!opt) return null;
+                      return (
+                        <View key={sel.id} style={styles.selRow}>
+                          <View style={styles.selRowHead}>
+                            <Text style={styles.selRowName} numberOfLines={1}>{opt.name}</Text>
+                            <Pressable hitSlop={8} onPress={() => toggleIndicator(opt.id)}>
+                              <X size={12} color={colors.dark.red} />
+                            </Pressable>
+                          </View>
+                          <Text style={styles.selTfLabel}>
+                            معامله سیگنال کدام تایم‌فریم: (خالی = همه • حداکثر ۲)
+                          </Text>
+                          <View style={styles.tfChipsRow}>
+                            {opt.timeframes.map((tf) => {
+                              const on = sel.timeframes.includes(tf);
+                              return (
+                                <Pressable
+                                  key={tf}
+                                  style={[styles.tfChip, on && styles.tfChipActive]}
+                                  onPress={() => toggleIndicatorTf(opt.id, tf)}
+                                >
+                                  <Text style={[styles.tfChipText, on && styles.tfChipTextActive]}>
+                                    {AUTO_TF_LABEL[tf]}
+                                  </Text>
+                                </Pressable>
+                              );
+                            })}
+                          </View>
+                        </View>
                       );
                     })}
                   </View>
@@ -353,14 +595,140 @@ export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKey
             </Text>
           </View>
 
+          {/* v1.5.0 — smart risk management (trailing + AI capital) */}
+          <View style={styles.sourceBox}>
+            <View style={styles.sourceHead}>
+              <ShieldCheck size={13} color={colors.dark.blue} />
+              <Text style={styles.sourceTitle}>مدیریت ریسک هوشمند (سیستم خودش)</Text>
+            </View>
+            <View style={styles.switchRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.switchRowTitle}>تریلینگ استاپ همه معاملات</Text>
+                <Text style={styles.switchRowHint}>
+                  وقتی معامله در سود برود، استاپ تا سربه‌سر + کارمزد صرافی بالا کشیده می‌شود — هیچ معامله سودده‌ای با ضرر بسته نمی‌شود؛ ریسک‌فری = حداقل کارمزد در می‌آید.
+                </Text>
+              </View>
+              <Switch
+                value={settings.trailing.enabled}
+                onValueChange={(v) => void persist({ ...settings, trailing: { ...settings.trailing, enabled: v } })}
+                trackColor={{ true: colors.dark.green + '88', false: colors.dark.card }}
+                thumbColor={settings.trailing.enabled ? colors.dark.green : colors.dark.textMuted}
+                style={{ transform: [{ scale: 0.7 }] }}
+              />
+            </View>
+            <View style={styles.switchRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.switchRowTitle}>مدیریت سرمایه با هوش مصنوعی</Text>
+                <Text style={styles.switchRowHint}>
+                  بعد از ضررهای پیاپی حجم پله‌ای کم می‌شود و بعد از سود برمی‌گردد؛ با پر شدن سقف ضرر روزانه، پوزیشن جدید باز نمی‌شود.
+                </Text>
+              </View>
+              <Switch
+                value={settings.aiCapital.enabled}
+                onValueChange={(v) => void persist({ ...settings, aiCapital: { ...settings.aiCapital, enabled: v } })}
+                trackColor={{ true: colors.dark.green + '88', false: colors.dark.card }}
+                thumbColor={settings.aiCapital.enabled ? colors.dark.green : colors.dark.textMuted}
+                style={{ transform: [{ scale: 0.7 }] }}
+              />
+            </View>
+            {settings.aiCapital.enabled && (
+              <View style={styles.settingCellInline}>
+                <Text style={styles.settingLabel}>سقف ضرر روزانه (٪ سرمایه معاملاتی)</Text>
+                <TextInput
+                  style={styles.settingInputInline}
+                  value={String(settings.aiCapital.dailyLossLimitPercent)}
+                  onChangeText={(t) =>
+                    setSettings((s) => ({
+                      ...s,
+                      aiCapital: { ...s.aiCapital, dailyLossLimitPercent: Math.max(0.5, Math.min(50, parseFloat(t.replace(/[^\d.]/g, '') || '3') || 3)) },
+                    }))
+                  }
+                  onEndEditing={() => void persist(settings)}
+                  keyboardType="decimal-pad"
+                />
+              </View>
+            )}
+          </View>
+
+          {/* v1.5.0 — PnL card (capturable as image) */}
+          {hasAnyPosition && (
+            <View style={styles.sourceBox}>
+              <View style={styles.sourceHead}>
+                <TrendingUp size={13} color={(demoStats.realized + demoStats.open + realStats.realized + realStats.open) >= 0 ? colors.dark.green : colors.dark.red} />
+                <Text style={styles.sourceTitle}>PnL ربات در تایم‌فریم‌های مختلف</Text>
+              </View>
+              <View ref={pnlCardRef} collapsable={false} style={styles.pnlShareCard}>
+                <Text style={styles.pnlShareTitle}>🤖 معامله‌گر خودکار — PnL</Text>
+                <View style={styles.pnlPeriodRow}>
+                  {AUTO_PNL_PERIODS.map((p) => (
+                    <Pressable
+                      key={p}
+                      style={[styles.pnlPeriodChip, pnlPeriod === p && styles.pnlPeriodChipActive]}
+                      onPress={() => setPnlPeriod(p)}
+                    >
+                      <Text style={[styles.pnlPeriodText, pnlPeriod === p && styles.pnlPeriodTextActive]}>
+                        {AUTO_PNL_PERIOD_LABEL[p]}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+                {settings.mode === 'demo' || positions.length > 0 ? (
+                  <View style={styles.pnlModeBlock}>
+                    <Text style={styles.pnlModeLabel}>دمو</Text>
+                    <PnlRow label="سود/زیان بسته‌شده" value={demoStats.realized} />
+                    <PnlRow label="سود/زیان باز (لحظه‌ای)" value={demoStats.open} />
+                    <PnlRow label="مجموع" value={demoStats.realized + demoStats.open} bold />
+                    <Text style={styles.pnlMetaText}>
+                      {demoStats.trades.toLocaleString('fa-IR')} معامله • نرخ برد{' '}
+                      {demoStats.trades > 0
+                        ? Math.round((demoStats.wins / demoStats.trades) * 100).toLocaleString('fa-IR')
+                        : '۰'}
+                      ٪
+                    </Text>
+                  </View>
+                ) : null}
+                {(settings.mode === 'real' || realPositions.length > 0) && (
+                  <View style={[styles.pnlModeBlock, styles.pnlModeBlockReal]}>
+                    <Text style={styles.pnlModeLabel}>واقعی</Text>
+                    <PnlRow label="سود/زیان بسته‌شده" value={realStats.realized} />
+                    <PnlRow label="سود/زیان باز (لحظه‌ای)" value={realStats.open} />
+                    <PnlRow label="مجموع" value={realStats.realized + realStats.open} bold />
+                    <Text style={styles.pnlMetaText}>
+                      {realStats.trades.toLocaleString('fa-IR')} معامله • نرخ برد{' '}
+                      {realStats.trades > 0
+                        ? Math.round((realStats.wins / realStats.trades) * 100).toLocaleString('fa-IR')
+                        : '۰'}
+                      ٪
+                    </Text>
+                  </View>
+                )}
+                <Text style={styles.pnlShareFooter}>PampDumpCoins • {AUTO_PNL_PERIOD_LABEL[pnlPeriod]}</Text>
+              </View>
+              <View style={styles.shareBtnRow}>
+                <Pressable style={[styles.shareBtn, styles.saveBtn]} onPress={() => void handleSavePnl()} disabled={captureBusy}>
+                  {captureBusy ? <ActivityIndicator size="small" color={colors.dark.background} /> : <Save size={13} color={colors.dark.background} />}
+                  <Text style={styles.shareBtnText}>ذخیره عکس</Text>
+                </Pressable>
+                <Pressable style={styles.shareBtn} onPress={() => void handleSharePnl()} disabled={captureBusy}>
+                  <Share2 size={13} color={colors.dark.background} />
+                  <Text style={styles.shareBtnText}>اشتراک‌گذاری عکس</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
+
           {/* demo positions */}
           {(settings.mode === 'demo' || openPositions.length > 0) && (
             <View style={styles.sourceBox}>
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={totalPnl >= 0 ? colors.dark.green : colors.dark.red} />
                 <Text style={styles.sourceTitle}>پوزیشن‌های ربات (دمو)</Text>
-                <Pressable onPress={() => void refreshPositions()} hitSlop={8}>
-                  <RefreshCw size={12} color={colors.dark.accent} />
+                <Pressable onPress={() => void runCycleAndRefresh()} hitSlop={8}>
+                  {cycleBusy ? (
+                    <ActivityIndicator size="small" color={colors.dark.accent} />
+                  ) : (
+                    <RefreshCw size={12} color={colors.dark.accent} />
+                  )}
                 </Pressable>
               </View>
               {openPositions.length === 0 && (
@@ -374,6 +742,7 @@ export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKey
                     <View style={styles.posMain}>
                       <Text style={styles.posSymbol}>
                         {p.side === 'long' ? '🟢' : '🔴'} {p.symbol} ×{p.leverage}
+                        {p.trailArmed ? ' 🛡' : ''}
                       </Text>
                       <Text style={styles.posSource} numberOfLines={1}>
                         {p.source === 'whale' ? '🐋 ' : '📈 '}{p.sourceLabel}
@@ -411,23 +780,107 @@ export default function AutoTradingBotSection({ realKeys }: { realKeys?: RealKey
             </View>
           )}
 
+          {/* real positions (tracked by the engine) */}
+          {(settings.mode === 'real' || realOpen.length > 0) && realKeys && (
+            <View style={styles.sourceBox}>
+              <View style={styles.sourceHead}>
+                <TrendingUp size={13} color={realTotalPnl >= 0 ? colors.dark.green : colors.dark.red} />
+                <Text style={styles.sourceTitle}>پوزیشن‌های ربات (واقعی)</Text>
+                <Pressable onPress={() => void runCycleAndRefresh()} hitSlop={8}>
+                  {cycleBusy ? (
+                    <ActivityIndicator size="small" color={colors.dark.accent} />
+                  ) : (
+                    <RefreshCw size={12} color={colors.dark.accent} />
+                  )}
+                </Pressable>
+              </View>
+              {realOpen.length === 0 && (
+                <Text style={styles.sourceHint}>پوزیشن واقعی بازی نیست — با اولین سیگنال باز می‌شود.</Text>
+              )}
+              {realOpen.map((p) => {
+                const dir = p.side === 'long' ? 1 : -1;
+                const pnl = (p.lastPrice - p.entryPrice) * dir * p.qty;
+                return (
+                  <View key={p.id} style={styles.posRow}>
+                    <View style={styles.posMain}>
+                      <Text style={styles.posSymbol}>
+                        {p.side === 'long' ? '🟢' : '🔴'} {p.symbol} ×{p.leverage}
+                        {p.trailArmed ? ' 🛡' : ''}
+                      </Text>
+                      <Text style={styles.posSource} numberOfLines={1}>
+                        {p.source === 'whale' ? '🐋 ' : '📈 '}{p.sourceLabel}
+                      </Text>
+                      <Text style={styles.posPrices}>
+                        ورود {p.entryPrice.toFixed(4)} → {p.lastPrice.toFixed(4)} • SL {p.stopPrice.toFixed(3)} / TP {p.takePrice.toFixed(3)}
+                      </Text>
+                    </View>
+                    <View style={styles.posSide}>
+                      <Text style={[styles.posPnl, { color: pnl >= 0 ? colors.dark.green : colors.dark.red }]}>
+                        {pnl >= 0 ? '+' : '−'}${Math.abs(pnl).toFixed(2)}
+                      </Text>
+                      <Pressable
+                        style={styles.posCloseBtn}
+                        onPress={() =>
+                          void manualClosePosition(settings, realKeys, {
+                            id: p.id,
+                            symbol: p.symbol,
+                            side: p.side,
+                            lastPrice: p.lastPrice,
+                          }).then(refreshPositions)
+                        }
+                      >
+                        <X size={11} color={colors.dark.red} />
+                      </Pressable>
+                    </View>
+                  </View>
+                );
+              })}
+              {realClosed.length > 0 && (
+                <View style={styles.closedBox}>
+                  <Text style={styles.closedTitle}>بسته‌شده‌های واقعی:</Text>
+                  {realClosed.map((p) => (
+                    <View key={p.id} style={styles.closedRow}>
+                      <Text style={styles.closedText} numberOfLines={1}>
+                        {p.symbol} ({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'روی صرافی' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : 'دستی'})
+                      </Text>
+                      <Text style={[styles.posPnl, { color: (p.realizedPnl ?? 0) >= 0 ? colors.dark.green : colors.dark.red }]}>
+                        {(p.realizedPnl ?? 0) >= 0 ? '+' : '−'}${Math.abs(p.realizedPnl ?? 0).toFixed(2)}
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </View>
+          )}
+
           {/* engine log */}
           {logs.length > 0 && (
             <View style={styles.logBox}>
-              {logs.slice(0, 6).map((l) => (
+              {logs.slice(0, 8).map((l) => (
                 <Text key={l.id} style={styles.logLine} numberOfLines={2}>
                   {l.kind === 'error' ? '✖' : l.kind === 'open' ? '▲' : l.kind === 'close' ? '▼' : '•'} {l.message}
                 </Text>
               ))}
               {lastCycleAt && (
                 <Text style={styles.logTime}>
-                  آخرین چرخه: {Math.round((Date.now() - lastCycleAt) / 1000)} ثانیه پیش — هر ۶۰ ثانیه تکرار می‌شود (برنامه باز).
+                  آخرین چرخه: {Math.max(0, Math.round((Date.now() - lastCycleAt) / 1000))} ثانیه پیش — موتور هر ۶۰ ثانیه (و با باز شدن برنامه) می‌چرخد.
                 </Text>
               )}
             </View>
           )}
         </View>
       )}
+    </View>
+  );
+}
+
+function PnlRow({ label, value, bold }: { label: string; value: number; bold?: boolean }) {
+  return (
+    <View style={styles.pnlShareRow}>
+      <Text style={[styles.pnlShareRowLabel, bold && { fontWeight: '800' }]}>{label}</Text>
+      <Text style={[styles.pnlShareRowValue, { color: value >= 0 ? colors.dark.green : colors.dark.red }, bold && { fontWeight: '800' }]}>
+        {value >= 0 ? '+' : '−'} ${Math.abs(value).toFixed(2)}
+      </Text>
     </View>
   );
 }
@@ -518,9 +971,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 4,
     backgroundColor: colors.dark.green,
-    paddingHorizontal: 14,
-    paddingVertical: 7,
     borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
   },
   startBtnText: {
     fontSize: 11,
@@ -534,9 +987,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.dark.red + '22',
     borderWidth: 1,
     borderColor: colors.dark.red + '55',
-    paddingHorizontal: 14,
-    paddingVertical: 7,
     borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
   },
   stopBtnText: {
     fontSize: 11,
@@ -544,17 +997,31 @@ const styles = StyleSheet.create({
     color: colors.dark.red,
   },
   warn: {
-    fontSize: 9,
-    color: colors.dark.textMuted,
+    fontSize: 10,
+    color: colors.dark.accent,
     marginBottom: 6,
-    textAlign: 'right',
   },
   warnReal: {
-    fontSize: 9.5,
+    fontSize: 10,
     color: colors.dark.red,
     marginBottom: 6,
-    textAlign: 'right',
-    fontWeight: '700',
+  },
+  engineBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: colors.dark.green + '14',
+    borderWidth: 1,
+    borderColor: colors.dark.green + '33',
+    borderRadius: 8,
+    padding: 6,
+    marginBottom: 8,
+  },
+  engineBadgeText: {
+    flex: 1,
+    fontSize: 9,
+    color: colors.dark.green,
+    lineHeight: 13,
   },
   sourceBox: {
     backgroundColor: colors.dark.background,
@@ -568,89 +1035,231 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
+    marginBottom: 6,
   },
   sourceTitle: {
-    fontSize: 11.5,
-    fontWeight: '700',
-    color: colors.dark.text,
     flex: 1,
+    fontSize: 11.5,
+    fontWeight: '800',
+    color: colors.dark.text,
   },
   sourceHint: {
-    fontSize: 9,
-    color: colors.dark.textMuted,
-    marginTop: 6,
-    textAlign: 'right',
-    lineHeight: 13,
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+    lineHeight: 14,
+    marginTop: 2,
   },
   chipsRow: {
     gap: 6,
-    paddingRight: 4,
-    marginTop: 8,
-  },
-  chipWrap: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-    marginTop: 8,
+    paddingVertical: 4,
   },
   chip: {
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 7,
     backgroundColor: colors.dark.card,
     borderWidth: 1,
     borderColor: colors.dark.cardBorder,
-    maxWidth: 160,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    maxWidth: 150,
   },
   chipActive: {
-    backgroundColor: colors.dark.accent,
     borderColor: colors.dark.accent,
+    backgroundColor: colors.dark.accent + '1C',
   },
   chipText: {
     fontSize: 10,
     color: colors.dark.textSecondary,
   },
   chipTextActive: {
-    color: colors.dark.background,
+    color: colors.dark.accent,
     fontWeight: '700',
   },
   miniRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
-    marginTop: 8,
+    marginTop: 6,
+    padding: 4,
   },
   miniText: {
+    flex: 1,
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+  },
+  indDropdownBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  indDropdownText: {
+    fontSize: 10,
+    color: colors.dark.text,
+    fontWeight: '700',
+  },
+  indDropdownPanel: {
+    marginTop: 6,
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    borderRadius: 8,
+    overflow: 'hidden',
+  },
+  indRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.dark.cardBorder,
+    gap: 6,
+  },
+  indRowActive: {
+    backgroundColor: colors.dark.accent + '10',
+  },
+  indRowTexts: {
+    flex: 1,
+  },
+  indRowLabel: {
+    fontSize: 10.5,
+    color: colors.dark.text,
+    fontWeight: '700',
+  },
+  indRowHint: {
     fontSize: 9,
     color: colors.dark.textSecondary,
+    marginTop: 1,
+  },
+  checkbox: {
+    width: 20,
+    height: 20,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkboxTick: {
+    color: colors.dark.background,
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  selList: {
+    gap: 6,
+    marginTop: 6,
+  },
+  selRow: {
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.accent + '44',
+    borderRadius: 8,
+    padding: 8,
+  },
+  selRowHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 6,
+  },
+  selRowName: {
     flex: 1,
+    fontSize: 10.5,
+    fontWeight: '800',
+    color: colors.dark.accent,
+  },
+  selTfLabel: {
+    fontSize: 9,
+    color: colors.dark.textSecondary,
+    marginTop: 4,
+    marginBottom: 4,
+  },
+  tfChipsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 4,
+  },
+  tfChip: {
+    backgroundColor: colors.dark.background,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  tfChipActive: {
+    borderColor: colors.dark.accent,
+    backgroundColor: colors.dark.accent + '1C',
+  },
+  tfChipText: {
+    fontSize: 9,
+    color: colors.dark.textSecondary,
+  },
+  tfChipTextActive: {
+    color: colors.dark.accent,
+    fontWeight: '800',
   },
   settingsGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 6,
-    marginTop: 8,
   },
   settingCell: {
-    flexBasis: '30%',
+    flexBasis: '31%',
     flexGrow: 1,
-  },
-  settingLabel: {
-    fontSize: 9,
-    color: colors.dark.textMuted,
-    marginBottom: 3,
-    textAlign: 'right',
-  },
-  settingInput: {
     backgroundColor: colors.dark.card,
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: colors.dark.cardBorder,
-    borderRadius: 7,
-    paddingHorizontal: 8,
-    paddingVertical: 5,
-    fontSize: 11,
+    padding: 6,
+  },
+  settingLabel: {
+    fontSize: 8.5,
+    color: colors.dark.textSecondary,
+    marginBottom: 3,
+  },
+  settingInput: {
+    fontSize: 12,
     color: colors.dark.text,
-    textAlign: 'center',
+    fontWeight: '700',
+    paddingVertical: 2,
+    paddingHorizontal: 4,
+  },
+  settingCellInline: {
+    backgroundColor: colors.dark.card,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    padding: 8,
+    marginTop: 6,
+  },
+  settingInputInline: {
+    fontSize: 12,
+    color: colors.dark.text,
+    fontWeight: '700',
+    paddingVertical: 2,
+    paddingHorizontal: 4,
+    marginTop: 2,
+  },
+  switchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 8,
+  },
+  switchRowTitle: {
+    fontSize: 10.5,
+    fontWeight: '800',
+    color: colors.dark.text,
+  },
+  switchRowHint: {
+    fontSize: 9,
+    color: colors.dark.textSecondary,
+    lineHeight: 13,
+    marginTop: 2,
   },
   posRow: {
     flexDirection: 'row',
@@ -660,7 +1269,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.dark.cardBorder,
     padding: 8,
-    marginTop: 6,
+    marginBottom: 6,
+    gap: 6,
   },
   posMain: {
     flex: 1,
@@ -671,14 +1281,16 @@ const styles = StyleSheet.create({
     color: colors.dark.text,
   },
   posSource: {
-    fontSize: 8.5,
-    color: colors.dark.textMuted,
+    fontSize: 9,
+    color: colors.dark.textSecondary,
     marginTop: 1,
   },
   posPrices: {
     fontSize: 8.5,
     color: colors.dark.textSecondary,
     marginTop: 2,
+    direction: 'ltr',
+    textAlign: 'left',
   },
   posSide: {
     alignItems: 'flex-end',
@@ -687,45 +1299,163 @@ const styles = StyleSheet.create({
   posPnl: {
     fontSize: 11,
     fontWeight: '800',
+    direction: 'ltr',
   },
   posCloseBtn: {
-    padding: 4,
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    backgroundColor: colors.dark.red + '1C',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   closedBox: {
-    marginTop: 8,
-    paddingTop: 6,
-    borderTopWidth: 1,
-    borderTopColor: colors.dark.cardBorder,
+    marginTop: 4,
+    backgroundColor: colors.dark.card,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    padding: 8,
   },
   closedTitle: {
-    fontSize: 9,
-    color: colors.dark.textMuted,
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
     marginBottom: 4,
   },
   closedRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
+    justifyContent: 'space-between',
     paddingVertical: 2,
   },
   closedText: {
-    fontSize: 9.5,
-    color: colors.dark.textSecondary,
     flex: 1,
+    fontSize: 9.5,
+    color: colors.dark.text,
   },
   logBox: {
-    marginTop: 4,
+    backgroundColor: colors.dark.background,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    padding: 8,
   },
   logLine: {
     fontSize: 8.5,
-    color: colors.dark.textMuted,
+    color: colors.dark.textSecondary,
     lineHeight: 13,
-    textAlign: 'right',
+    marginBottom: 2,
   },
   logTime: {
+    fontSize: 8.5,
+    color: colors.dark.accent,
+    marginTop: 4,
+  },
+  // ── PnL share card ──
+  pnlShareCard: {
+    backgroundColor: colors.dark.card,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.dark.accent + '44',
+    padding: 10,
+  },
+  pnlShareTitle: {
+    fontSize: 12,
+    fontWeight: '900',
+    color: colors.dark.text,
+    marginBottom: 6,
+    textAlign: 'center',
+  },
+  pnlPeriodRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 4,
+    marginBottom: 8,
+  },
+  pnlPeriodChip: {
+    backgroundColor: colors.dark.background,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  pnlPeriodChipActive: {
+    borderColor: colors.dark.accent,
+    backgroundColor: colors.dark.accent + '1C',
+  },
+  pnlPeriodText: {
+    fontSize: 9,
+    color: colors.dark.textSecondary,
+  },
+  pnlPeriodTextActive: {
+    color: colors.dark.accent,
+    fontWeight: '800',
+  },
+  pnlModeBlock: {
+    backgroundColor: colors.dark.background,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.dark.green + '33',
+    padding: 8,
+    marginBottom: 6,
+  },
+  pnlModeBlockReal: {
+    borderColor: colors.dark.red + '44',
+  },
+  pnlModeLabel: {
+    fontSize: 10,
+    fontWeight: '900',
+    color: colors.dark.text,
+    marginBottom: 4,
+  },
+  pnlShareRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 1.5,
+  },
+  pnlShareRowLabel: {
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+  },
+  pnlShareRowValue: {
+    fontSize: 10,
+    fontWeight: '700',
+    direction: 'ltr',
+  },
+  pnlMetaText: {
+    fontSize: 9,
+    color: colors.dark.textSecondary,
+    marginTop: 4,
+  },
+  pnlShareFooter: {
     fontSize: 8,
     color: colors.dark.textMuted,
-    marginTop: 4,
-    textAlign: 'right',
+    textAlign: 'center',
+    marginTop: 6,
+  },
+  shareBtnRow: {
+    flexDirection: 'row',
+    gap: 6,
+    marginTop: 8,
+  },
+  shareBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    backgroundColor: colors.dark.accent,
+    borderRadius: 8,
+    paddingVertical: 8,
+  },
+  saveBtn: {
+    backgroundColor: colors.dark.blue,
+  },
+  shareBtnText: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: colors.dark.background,
   },
 });

@@ -2349,34 +2349,6 @@ export default function WalletScreen() {
   );
   const blockchainToman = usdtToToman > 0 ? blockchainTotalUsd * usdtToToman : 0;
 
-  // v1.4.17 — «بخش دارایی ریالی و فلزات: نمایش ارزش دلاری همه کیف‌ها +
-  // ارزش تتر و تومانی کل»: total USDT held across exchange wallets and
-  // blockchain wallets (shown in the rial tab like the gold/paper-USD rows).
-  const exchangeUsdtQty = useMemo(
-    () =>
-      wallets.reduce(
-        (sum, w) =>
-          sum +
-          (balanceByWalletId[w.id]?.balances ?? [])
-            .filter((b) => b.asset === 'USDT')
-            .reduce((s, b) => s + (b.total ?? 0), 0),
-        0
-      ),
-    [wallets, balanceByWalletId]
-  );
-  const blockchainUsdtQty = useMemo(
-    () =>
-      bcWallets.reduce(
-        (sum, w) =>
-          sum +
-          (bcBalanceByWallet[w.id]?.data?.tokens ?? [])
-            .filter((t) => t.symbol === 'USDT')
-            .reduce((s, t) => s + t.qty, 0),
-        0
-      ),
-    [bcWallets, bcBalanceByWallet]
-  );
-
   // PnL over all four periods at once — keyed by the aggregated holdings so
   // it recomputes whenever balances change (qty/asset shifts).
   const bcTokensKey = useMemo(
@@ -3095,9 +3067,6 @@ export default function WalletScreen() {
             blockchainToman={blockchainToman}
             hasBlockchainWallet={hasBlockchainWallet}
             blockchainPnlTomanByPeriod={blockchainPnlTomanByPeriod}
-            blockchainUsd={blockchainTotalUsd}
-            exchangeUsdtQty={exchangeUsdtQty}
-            blockchainUsdtQty={blockchainUsdtQty}
           />
         </>
       )}

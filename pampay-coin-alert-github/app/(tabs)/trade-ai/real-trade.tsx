@@ -65,7 +65,7 @@ import {
 import type { RealPosition, BinanceAccountInfo } from '@/utils/binanceFuturesTrading';
 import DropdownPicker from '@/components/DropdownPicker';
 import { sendTelegramTradeNotification, sendTelegramAISignal } from '@/utils/telegramService';
-import AutoTradingBotSection from '@/components/AutoTradingBotSection';
+import TradeAiSegmentHeader from '@/components/TradeAiSegmentHeader';
 
 const SIGNALS_HISTORY_KEY = '@trade_ai_signals';
 const PREV_SIGNALS_KEY = '@trade_ai_prev_signal_states';
@@ -765,17 +765,10 @@ export default function RealTradeScreen() {
     }
   }, [hasApiKeys, autoConfig, saveAutoConfig]);
 
-  const sourceOptions = useMemo(() => [
-    { key: 'ai', label: 'تحلیل هوش مصنوعی' },
-    { key: 'scanner', label: 'اسکنر سیگنال' },
-    { key: 'both', label: 'هر دو (AI + اسکنر)' },
-  ], []);
-
   if (exchangeConfigs.length === 0) {
     return (
       <ScrollView style={styles.container} contentContainerStyle={styles.centerContent}>
-        {/* v1.4.19 — معامله‌گر خودکار در حالت دمو حتی بدون صرافی کار می‌کند */}
-        <AutoTradingBotSection />
+        <TradeAiSegmentHeader active="real" />
         <View style={styles.noApiCard}>
           <Lock size={48} color={colors.dark.accent} />
           <Text style={styles.noApiTitle}>صرافی وارد نشده</Text>
@@ -841,14 +834,9 @@ export default function RealTradeScreen() {
           autoCapitalize="none"
           autoCorrect={false}
         />
-        <Text style={styles.inputLabel}>منبع سیگنال</Text>
-        <DropdownPicker
-          label="منبع"
-          value={newTradeSource}
-          options={sourceOptions}
-          onSelect={(key) => setNewTradeSource(key as TradeSource)}
-          testID="new-source-dropdown"
-        />
+        {/* v1.5.0 — «منبع سیگنال‌ها» از فرم افزودن صرافی حذف شد؛ منبع‌ها
+            (نهنگ/اندیکاتور) به‌صورت گزینه‌های روشن/خاموش در تب «معامله خودکار»
+            هستند — انتخاب بهتر برای کاربر. */}
         <View style={styles.spacer} />
         <View style={styles.switchRow}>
           <Switch
@@ -922,6 +910,8 @@ export default function RealTradeScreen() {
       contentContainerStyle={styles.content}
       showsVerticalScrollIndicator={false}
     >
+      <TradeAiSegmentHeader active="real" />
+
       <View style={styles.refreshTimerBar}>
         <View style={styles.refreshTimerLeft}>
           <Animated.View style={[styles.liveDot, { opacity: liveIndicator }]} />
@@ -990,15 +980,6 @@ export default function RealTradeScreen() {
           <Text style={[styles.modeBtnText, tradeMode === 'auto' && styles.modeBtnTextActive]}>اتوماتیک (ربات)</Text>
         </Pressable>
       </View>
-
-      {/* v1.4.19 — معامله‌گر خودکار جدید: کپی نهنگ + سیگنال اندیکاتور، دمو/واقعی */}
-      <AutoTradingBotSection
-        realKeys={
-          activeExchange && activeExchange.enabled && activeExchange.exchangeId === 'binance'
-            ? { apiKey: activeExchange.apiKey, apiSecret: activeExchange.apiSecret }
-            : undefined
-        }
-      />
 
       {account && (
         <View style={styles.accountCard}>
@@ -1167,19 +1148,8 @@ export default function RealTradeScreen() {
 
               {activeExchange && (
                 <>
-                  <Text style={styles.inputLabel}>منبع سیگنال این صرافی</Text>
-                  <DropdownPicker
-                    label="منبع سیگنال"
-                    value={activeExchange.tradeSource}
-                    options={sourceOptions}
-                    onSelect={(key) => {
-                      const updated = exchangeConfigs.map((ex, i) =>
-                        i === activeExchangeIdx ? { ...ex, tradeSource: key as TradeSource } : ex
-                      );
-                      saveExchangeConfigs(updated);
-                    }}
-                    testID="exchange-source-dropdown"
-                  />
+                  {/* v1.5.0 — «منبع سیگنال این صرافی» حذف شد؛ منبع‌ها در تب
+                      «معامله خودکار» به‌صورت روشن/خاموش انتخاب می‌شوند. */}
                   <View style={styles.spacer} />
                   <View style={styles.switchRow}>
                     <Switch

@@ -10,6 +10,7 @@ import { VpnGateProvider } from "@/contexts/VpnGateContext";
 import colors from "@/constants/colors";
 import UpdateBanner from "@/components/UpdateBanner";
 import StartupIpGate from "@/components/StartupIpGate";
+import { startGlobalAutoEngine } from "@/utils/autoTradingEngine";
 
 SplashScreen.preventAutoHideAsync();
 
@@ -51,6 +52,11 @@ function ThemedAppRoot() {
 export default function RootLayout() {
   useEffect(() => {
     SplashScreen.hideAsync();
+    // v1.5.0 — معامله‌گر خودکار: موتور GLOBAL — روشن بودن ربات ذخیره می‌شود
+    // («با بستن برنامه خاموش نشه»)، هر ۶۰ ثانیه در کل برنامه چرخه می‌زند و
+    // با باز شدن دوباره برنامه فوراً اجرا می‌شود؛ تنظیم enabled هر چرخه از
+    // حافظه تازه خوانده می‌شود.
+    startGlobalAutoEngine();
   }, []);
 
   return (

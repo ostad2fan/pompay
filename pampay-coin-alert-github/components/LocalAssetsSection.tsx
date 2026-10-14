@@ -8,13 +8,11 @@ import {
   Gem,
   Medal,
   Coins,
-  Wallet,
   TrendingUp,
   TrendingDown,
   RefreshCw,
   ChevronDown,
   ChevronUp,
-  Link as LinkIcon,
   Lock,
 } from 'lucide-react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -65,6 +63,10 @@ interface LocalAssets {
   rialCash: string;
   /** v1.4.15 — paper (physical) USD the user holds, in dollars. */
   usdCash: string;
+  /** v1.5.0 — manual tether balance (like paper dollar): counted SEPARATELY
+   *  from exchange/blockchain USDT — for tether the user holds outside the
+   *  connected wallets (P2P / cash / other). */
+  usdtQty: string;
   goldGrams: string;
   goldKarat: '18' | '24';
   silverGrams: string;
@@ -78,6 +80,7 @@ interface LocalAssets {
 const EMPTY_ASSETS: LocalAssets = {
   rialCash: '',
   usdCash: '',
+  usdtQty: '',
   goldGrams: '',
   goldKarat: '18',
   silverGrams: '',
@@ -113,12 +116,6 @@ interface Props {
   hasBlockchainWallet?: boolean;
   /** v1.4.16 — per-period TOMAN PnL (+basis) of the blockchain holdings. */
   blockchainPnlTomanByPeriod?: Record<number, { pnlToman: number; basisToman: number } | null>;
-  /** v1.4.17 — USD value of blockchain wallets (rial-tab summary rows). */
-  blockchainUsd?: number;
-  /** v1.4.17 — total USDT qty across exchange wallets (rial-tab row). */
-  exchangeUsdtQty?: number;
-  /** v1.4.17 — total USDT qty across blockchain wallets (rial-tab row). */
-  blockchainUsdtQty?: number;
 }
 
 const EXPANDED_KEY = '@local_assets_expanded_v1';
@@ -129,9 +126,6 @@ export default function LocalAssetsSection({
   blockchainToman = 0,
   hasBlockchainWallet = false,
   blockchainPnlTomanByPeriod,
-  blockchainUsd = 0,
-  exchangeUsdtQty = 0,
-  blockchainUsdtQty = 0,
 }: Props) {
   const [assets, setAssets] = useState<LocalAssets>(EMPTY_ASSETS);
   // v1.4.16 — «دارایی‌های من» collapsible with its own arrow; persisted.
@@ -200,16 +194,19 @@ export default function LocalAssetsSection({
   const coinsValue =
     coinValues.emami + coinValues.bahar + coinValues.nim + coinValues.rob;
   const cryptoToman = usdtToToman > 0 ? totalPortfolioUsd * usdtToToman : 0;
+  // v1.5.0 — MANUAL tether (like paper dollar): valued at the live tether rate,
+  // separate from exchange/blockchain balances.
+  const usdtQtyVal = parseTomanInput(assets.usdtQty) || 0;
+  const usdtManualToman = usdtQtyVal > 0 && usdtToToman > 0 ? usdtQtyVal * usdtToToman : 0;
   // v1.4.16 — read-only blockchain wallets count toward the grand total.
   const blockchainValue = hasBlockchainWallet ? blockchainToman : 0;
   // v1.4.17 — summary values for the crypto rows («همان الگوی طلا/دلار کاغذی»)
-  const totalUsdtQty = exchangeUsdtQty + blockchainUsdtQty;
-  const totalUsdtToman = usdtToToman > 0 ? totalUsdtQty * usdtToToman : 0;
   const grandTotal =
-    rialValue + usdValue + goldValue + silverValue + coinsValue + cryptoToman + blockchainValue;
+    rialValue + usdValue + usdtManualToman + goldValue + silverValue + coinsValue + cryptoToman + blockchainValue;
   const hasAnyInput =
     rialValue > 0 ||
     usdValue > 0 ||
+    usdtManualToman > 0 ||
     goldValue > 0 ||
     silverValue > 0 ||
     coinsValue > 0 ||
@@ -271,7 +268,7 @@ export default function LocalAssetsSection({
         <View style={styles.totalRow}>
           <TrendingUp size={16} color={colors.dark.green} />
           <Text style={styles.totalLabel}>
-            مجموع کل دارایی (ریال + دلار + طلا + نقره + سکه + ارز
+            مجموع کل دارایی (ریال + دلار + تتر + طلا + نقره + سکه + ارز
             {hasBlockchainWallet ? ' + کیف بلاکچین' : ''})
           </Text>
         </View>
@@ -283,9 +280,9 @@ export default function LocalAssetsSection({
         )}
         <View style={styles.totalBreakdown}>
           <Text style={styles.breakdownText}>
-            ریال {formatToman(rialValue)} • دلار {formatToman(usdValue)} • طلا{' '}
-            {formatToman(goldValue)} • نقره {formatToman(silverValue)} • سکه{' '}
-            {formatToman(coinsValue)} • ارز {formatToman(cryptoToman)}
+            ریال {formatToman(rialValue)} • دلار {formatToman(usdValue)} • تتر{' '}
+            {formatToman(usdtManualToman)} • طلا {formatToman(goldValue)} • نقره{' '}
+            {formatToman(silverValue)} • سکه {formatToman(coinsValue)} • ارز {formatToman(cryptoToman)}
             {hasBlockchainWallet ? ` • کیف بلاکچین ${formatToman(blockchainValue)}` : ''}
           </Text>
         </View>
@@ -296,6 +293,7 @@ export default function LocalAssetsSection({
       <LocalAssetsPnl
         assets={assets}
         prices={p ?? undefined}
+        usdtToToman={usdtToToman}
         blockchainPnlTomanByPeriod={blockchainPnlTomanByPeriod}
         hasBlockchainWallet={hasBlockchainWallet}
       />
@@ -347,34 +345,21 @@ export default function LocalAssetsSection({
             }
           />
 
-          {/* ── v1.4.17 — crypto summary rows (الگوی طلا/دلار کاغذی):
-              ارزش دلاری همه کیف‌ها + تتر کل + معادل تومانی، فقط خواندنی ── */}
-          <CryptoSummaryRow
-            icon={<Coins size={14} color={'#F0B90B'} />}
-            label="ارز دیجیتال — کیف‌های صرافی"
-            qtyLabel={`$${totalPortfolioUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}`}
-            tomanValue={cryptoToman}
-            hint="مجموع موجودی همه صرافی‌های متصل (اسپات/ارن/فاندینگ/فیوچرز) — از تب «ارز دیجیتال»"
-          />
-          <CryptoSummaryRow
-            icon={<Lock size={14} color={colors.dark.green} />}
-            label="کیف پول بلاکچین (فقط خواندنی)"
-            qtyLabel={`$${blockchainUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}`}
-            tomanValue={blockchainValue}
-            hint={
-              hasBlockchainWallet
-                ? 'مجموع کیف‌های بلاکچین از تب «کیف پول بلاکچین»'
-                : 'هنوز کیف بلاکچینی اضافه نشده — از تب «کیف پول بلاکچین»'
-            }
-          />
-          <CryptoSummaryRow
-            icon={<Banknote size={14} color={colors.dark.accent} />}
-            label="تتر کل (USDT)"
-            qtyLabel={`${totalUsdtQty.toLocaleString('en-US', { maximumFractionDigits: 4 })} USDT`}
-            tomanValue={totalUsdtToman}
-            hint={
+          {/* ── v1.5.0 — MANUAL tether row (like paper dollar): «بجای تتر که از
+              قسمت‌های دیگه نشون میده، موجودی تتر دستی وارد کنم مثل دلار کاغذی».
+              The old auto «تتر کل» row (exchange + blockchain USDT) removed. ── */}
+          <AssetRow
+            icon={<Coins size={14} color={'#26A17B'} />}
+            label="تتر (USDT)"
+            value={assets.usdtQty}
+            onChangeText={(t) => update({ usdtQty: t })}
+            placeholder="مثلاً 1000"
+            keyboardType="decimal-pad"
+            unitLabel="تتر"
+            tomanValue={usdtManualToman}
+            valueHint={
               usdtToToman > 0
-                ? `قیمت هر تتر: ${formatFullToman(usdtToToman)} تومان • صرافی ${exchangeUsdtQty.toFixed(2)} + کیف بلاکچین ${blockchainUsdtQty.toFixed(2)}`
+                ? `قیمت هر تتر: ${formatFullToman(usdtToToman)} تومان — جدا از تتر صرافی/کیف بلاکچین`
                 : 'قیمت تتر در حال دریافت'
             }
           />
@@ -513,11 +498,14 @@ interface HeldAssetSpec {
 function LocalAssetsPnl({
   assets,
   prices,
+  usdtToToman,
   blockchainPnlTomanByPeriod,
   hasBlockchainWallet,
 }: {
   assets: LocalAssets;
   prices?: IranMarketPrices;
+  /** v1.5.0 — live tether rate for the manual tether row. */
+  usdtToToman: number;
   /** v1.4.16 — per-period TOMAN PnL of the read-only blockchain wallets. */
   blockchainPnlTomanByPeriod?: Record<
     number,
@@ -530,6 +518,7 @@ function LocalAssetsPnl({
   const goldQty = parseTomanInput(assets.goldGrams) || 0;
   const silverQty = parseTomanInput(assets.silverGrams) || 0;
   const usdQty = parseTomanInput(assets.usdCash) || 0;
+  const usdtQty = parseTomanInput(assets.usdtQty) || 0;
 
   const held: HeldAssetSpec[] = useMemo(() => {
     const list: HeldAssetSpec[] = [];
@@ -542,6 +531,18 @@ function LocalAssetsPnl({
         qty: usdQty,
         symbol: TgjuHistorySymbol.dollar,
         liveUnit: prices?.dollar ?? 0,
+      });
+    }
+    // v1.5.0 — manual tether: valued at the live TETHER rate; TGJU has no
+    // tether history, so the free-market dollar series is the FX basis
+    // (same approximation the blockchain toman PnL uses).
+    if (usdtQty > 0) {
+      list.push({
+        key: 'usdt',
+        label: 'تتر (دستی)',
+        qty: usdtQty,
+        symbol: TgjuHistorySymbol.dollar,
+        liveUnit: usdtToToman,
       });
     }
     if (goldQty > 0) {
@@ -580,7 +581,7 @@ function LocalAssetsPnl({
       if (qty > 0) list.push({ key, label, qty, symbol, liveUnit: coinLive[key] ?? 0 });
     }
     return list;
-  }, [goldQty, silverQty, usdQty, assets, prices]);
+  }, [goldQty, silverQty, usdQty, usdtQty, usdtToToman, assets, prices]);
 
   const symbols = useMemo(() => [...new Set(held.map((h) => h.symbol))], [held]);
 
@@ -803,42 +804,6 @@ function AssetRow({
         </View>
         <Text style={styles.assetHint}>{valueHint}</Text>
         {children}
-      </View>
-      <View style={styles.assetValueCol}>
-        <Text style={[styles.assetValue, !(tomanValue > 0) && styles.assetValueEmpty]}>
-          {tomanValue > 0 ? `${formatFullToman(Math.round(tomanValue))} ت` : '—'}
-        </Text>
-      </View>
-    </View>
-  );
-}
-
-// v1.4.17 — read-only crypto summary row (الگوی طلا/دلار کاغذی): shows the
-// USD amount / USDT qty + its TOMAN value; data comes from the wallet tabs.
-function CryptoSummaryRow({
-  icon,
-  label,
-  qtyLabel,
-  tomanValue,
-  hint,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  qtyLabel: string;
-  tomanValue: number;
-  hint: string;
-}) {
-  return (
-    <View style={styles.assetRow}>
-      {icon}
-      <View style={styles.assetMain}>
-        <Text style={styles.assetLabel}>{label}</Text>
-        <View style={styles.assetInputRow}>
-          <View style={styles.summaryQtyBox}>
-            <Text style={styles.summaryQtyText}>{qtyLabel}</Text>
-          </View>
-        </View>
-        <Text style={styles.assetHint}>{hint}</Text>
       </View>
       <View style={styles.assetValueCol}>
         <Text style={[styles.assetValue, !(tomanValue > 0) && styles.assetValueEmpty]}>
