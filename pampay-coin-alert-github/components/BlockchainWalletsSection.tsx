@@ -31,6 +31,8 @@ import {
   EVM_NETWORKS,
   shortAddress,
   validateAddressForNetworks,
+  validateBlockchainAddress,
+  isEvmNetwork,
 } from '@/utils/blockchainWallets';
 import {
   BlockchainPnlSummary,
@@ -76,16 +78,22 @@ export interface BlockchainWalletsSectionProps {
   onAddWallet: (
     name: string,
     networks: BlockchainNetwork[],
-    address: string
+    address: string,
+    networkAddresses?: Partial<Record<BlockchainNetwork, string>>
   ) => Promise<boolean>;
   onEditWallet: (
     id: string,
     name: string,
-    networks: BlockchainNetwork[]
+    networks: BlockchainNetwork[],
+    networkAddresses?: Partial<Record<BlockchainNetwork, string>>
   ) => Promise<boolean>;
   onRemoveWallet: (id: string, name: string) => void;
   onRefreshAll: () => void;
   onRefreshWallet: (id: string) => void;
+  /** v1.4.19 — per-wallet manual-refresh spinner state (id → busy). */
+  manualRefreshing?: Record<string, boolean>;
+  /** v1.4.19 — transient refresh result message («به‌روز شد — …»). */
+  refreshToast?: string | null;
 }
 
 export default function BlockchainWalletsSection({
@@ -102,6 +110,8 @@ export default function BlockchainWalletsSection({
   onRemoveWallet,
   onRefreshAll,
   onRefreshWallet,
+  manualRefreshing,
+  refreshToast,
 }: BlockchainWalletsSectionProps) {
   const [expandedWallet, setExpandedWallet] = useState<string | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
@@ -166,6 +176,7 @@ export default function BlockchainWalletsSection({
         {wallets.length > 0 && (
           <BlockchainPnlCard
             pnlSummary={pnlSummary}
+            wallets={wallets}
             pnlLoading={pnlLoading}
             period={pnlPeriod}
             onPeriod={setPnlPeriod}
@@ -207,8 +218,8 @@ export default function BlockchainWalletsSection({
       {showAddForm ? (
         <AddBlockchainWalletForm
           onCancel={() => setShowAddForm(false)}
-          onSubmit={async (name, networks, address) => {
-            const ok = await onAddWallet(name, networks, address ?? '');
+          onSubmit={async (name, networks, address, networkAddresses) => {
+            const ok = await onAddWallet(name, networks, address ?? '', networkAddresses);
             if (ok) setShowAddForm(false);
             return ok;
           }}
@@ -232,6 +243,7 @@ export default function BlockchainWalletsSection({
           isExpanded={expandedWallet === wallet.id}
           data={balanceByWallet[wallet.id]?.data}
           isFetching={balanceByWallet[wallet.id]?.isFetching ?? false}
+          manualRefreshing={manualRefreshing?.[wallet.id] ?? false}
           error={balanceByWallet[wallet.id]?.error}
           usdtToToman={usdtToToman}
           pnlPeriod={pnlPeriod}
@@ -257,14 +269,23 @@ export default function BlockchainWalletsSection({
             <AddBlockchainWalletForm
               editWallet={wallet}
               onCancel={() => setEditingWalletId(null)}
-              onSubmit={async (name, networks) => {
-                const ok = await onEditWallet(wallet.id, name, networks);
+              onSubmit={async (name, networks, _address, networkAddresses) => {
+                const ok = await onEditWallet(wallet.id, name, networks, networkAddresses);
                 if (ok) setEditingWalletId(null);
                 return ok;
               }}
             />
           );
         })()}
+
+      {/* ── v1.4.19 — toast نتیجه رفرش («به‌روز شد — …») ── */}
+      {refreshToast ? (
+        <View style={styles.refreshToast}>
+          <Text style={styles.refreshToastText} numberOfLines={1}>
+            {refreshToast}
+          </Text>
+        </View>
+      ) : null}
 
       {/* ── حالت خالی ── */}
       {wallets.length === 0 && !showAddForm && (
@@ -288,12 +309,16 @@ export default function BlockchainWalletsSection({
 
 function BlockchainPnlCard({
   pnlSummary,
+  wallets,
   pnlLoading,
   period,
   onPeriod,
   usdtToToman,
 }: {
   pnlSummary?: BlockchainPnlSummary;
+  /** v1.4.19 — per-wallet lines instead of per-token rows (user demand:
+   *  «در PnL کل، همه کیف‌ها را یک خطی نشون بده و ارزها را نه»). */
+  wallets: BlockchainWallet[];
   pnlLoading: boolean;
   period: PnlPeriod;
   onPeriod: (p: PnlPeriod) => void;
@@ -360,24 +385,34 @@ function BlockchainPnlCard({
               معادل تومانی: {positive ? '+' : '−'} {formatFullToman(Math.abs(Math.round(tomanPnl)))} تومان
             </Text>
           )}
-          {pnl.tokens.slice(0, 12).map((t) => (
-            <View key={t.label} style={styles.pnlRow}>
-              <Text style={styles.pnlRowLabel}>{t.label}</Text>
-              <Text
-                style={[
-                  styles.pnlRowValue,
-                  { color: t.pnl >= 0 ? colors.dark.green : colors.dark.red },
-                ]}
-              >
-                {t.pnl >= 0 ? '+' : '−'} ${Math.abs(t.pnl).toLocaleString('en-US', {
-                  maximumFractionDigits: 2,
-                })}
-              </Text>
-            </View>
-          ))}
+          {/* v1.4.19 — PER-WALLET one-line PnL rows (token detail lives in
+              each wallet's own card, behind its expand arrow). */}
+          {wallets.map((w) => {
+            const wp = pnlSummary?.perWallet?.[w.id]?.[period];
+            if (!wp || wp.usdThen <= 0) return null;
+            const wUsd = wp.usdNow - wp.usdThen;
+            const wPct = (wUsd / wp.usdThen) * 100;
+            return (
+              <View key={w.id} style={styles.pnlRow}>
+                <Text style={styles.pnlRowLabel} numberOfLines={1}>
+                  {w.name}
+                </Text>
+                <Text
+                  style={[
+                    styles.pnlRowValue,
+                    { color: wUsd >= 0 ? colors.dark.green : colors.dark.red },
+                  ]}
+                >
+                  {wUsd >= 0 ? '+' : '−'} ${Math.abs(wUsd).toLocaleString('en-US', {
+                    maximumFractionDigits: 2,
+                  })} ({Math.abs(wPct).toLocaleString('fa-IR', { maximumFractionDigits: 1 })}٪)
+                </Text>
+              </View>
+            );
+          })}
           <Text style={styles.pnlNote}>
             مبنا: موجودی امروز × قیمت پایان روزِ {PNL_PERIOD_LABEL[period]} پیش (بایننس/CoinGecko).
-            تغییر ارزش بازار است، نه سود واقعی نسبت به قیمت خرید شما.
+            تغییر ارزش بازار است، نه سود واقعی نسبت به قیمت خرید شما. جزئیات هر ارز داخل کارت همان کیف.
           </Text>
         </>
       )}
@@ -533,7 +568,8 @@ function AddBlockchainWalletForm({
   onSubmit: (
     name: string,
     networks: BlockchainNetwork[],
-    address?: string
+    address?: string,
+    networkAddresses?: Partial<Record<BlockchainNetwork, string>>
   ) => Promise<boolean>;
 }) {
   const [name, setName] = useState(editWallet?.name ?? '');
@@ -541,14 +577,28 @@ function AddBlockchainWalletForm({
     editWallet?.networks ?? ['ethereum', 'bsc']
   );
   const [address, setAddress] = useState(editWallet?.address ?? '');
+  // v1.4.19 — per-network address overrides (base 0x covers every EVM
+  // chain; Filecoin f1 / Solana / TON / Tron / BTC get their OWN input in
+  // this same form the moment they're ticked: «در همون قسمت خودش آدرسشو
+  // بخواد»).
+  const [perNet, setPerNet] = useState<Partial<Record<BlockchainNetwork, string>>>(
+    editWallet?.networkAddresses ?? {}
+  );
   const [busy, setBusy] = useState(false);
+
+  // networks that need their own address input: every selected NON-EVM
+  // network (Filecoin too — its native f1 differs from the FEVM 0x).
+  const perNetNetworks = useMemo(
+    () => networks.filter((n) => !isEvmNetwork(n)),
+    [networks]
+  );
 
   const validation = useMemo(
     () =>
-      address.trim() && networks.length > 0
-        ? validateAddressForNetworks(networks, address.trim())
+      (address.trim() || Object.values(perNet).some((v) => v && v.trim().length > 0)) && networks.length > 0
+        ? validateAddressForNetworks(networks, (editWallet?.address ?? address).trim(), perNet)
         : null,
-    [networks, address]
+    [networks, address, perNet, editWallet]
   );
 
   const submit = async () => {
@@ -558,16 +608,20 @@ function AddBlockchainWalletForm({
       Alert.alert('شبکه انتخاب نشده', 'حداقل یک شبکه از منوی کشویی انتخاب کنید');
       return;
     }
-    if (!editWallet) {
-      const v = validateAddressForNetworks(networks, address.trim());
-      if (!v.ok) {
-        Alert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
-        return;
-      }
+    const baseForCheck = (editWallet?.address ?? address).trim();
+    const v = validateAddressForNetworks(networks, baseForCheck, perNet);
+    if (!v.ok) {
+      Alert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
+      return;
     }
     setBusy(true);
     try {
-      await onSubmit(finalName, networks, editWallet ? undefined : address.trim());
+      await onSubmit(
+        finalName,
+        networks,
+        editWallet ? undefined : address.trim(),
+        perNet
+      );
     } finally {
       setBusy(false);
     }
@@ -625,6 +679,52 @@ function AddBlockchainWalletForm({
             </Text>
           )}
         </>
+      )}
+
+      {/* ── v1.4.19 — آدرس اختصاصی هر شبکه غیر اتریومی (در همین فرم) ── */}
+      {perNetNetworks.length > 0 && (
+        <View style={styles.perNetBox}>
+          <Text style={styles.perNetTitle}>
+            آدرس اختصاصی شبکه‌های غیر اتریومی (در همین بخش)
+          </Text>
+          <Text style={styles.perNetHint}>
+            شبکه‌های اتریومی همه با همان آدرس 0x بالا خوانده می‌شوند؛ برای هر شبکه زیر آدرس{' '}
+            {editWallet ? 'مخصوص همان شبکه از کیف شما' : 'مخصوص همان شبکه'} را وارد کنید (آدرس
+            Receive همان شبکه در تراست ولتم/تون‌کیپر).
+          </Text>
+          {perNetNetworks.map((n) => {
+            const meta = NETWORKS[n];
+            const val = perNet[n] ?? '';
+            const okNet = val.trim() ? validateBlockchainAddress(n, val.trim()) : null;
+            return (
+              <View key={n} style={styles.perNetRow}>
+                <Text style={styles.perNetLabel}>
+                  {meta.label} <Text style={styles.perNetLabelHint}>{meta.addrHint}</Text>
+                </Text>
+                <TextInput
+                  style={[styles.input, okNet && (okNet.ok ? styles.inputValid : styles.inputInvalid)]}
+                  value={val}
+                  onChangeText={(t) =>
+                    setPerNet((p) => ({ ...p, [n]: t.replace(/\s+/g, '') }))
+                  }
+                  placeholder={meta.wallets ?? meta.label}
+                  placeholderTextColor={colors.dark.textMuted}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+                {okNet && !okNet.ok && (
+                  <Text style={styles.inputHintErr}>{okNet.message}</Text>
+                )}
+              </View>
+            );
+          })}
+          {editWallet && (
+            <Text style={styles.perNetHint}>
+              اگر کادر شبکه‌ای را خالی بگذارید و آدرس پایه کیف با آن شبکه سازگار نباشد، ذخیره
+              خطا می‌دهد — آدرس همان شبکه را وارد کنید یا آن شبکه را بردارید.
+            </Text>
+          )}
+        </View>
       )}
 
       {/* ── راهنمای فقط‌خواندنی ── */}
@@ -722,6 +822,7 @@ function BlockchainWalletCard({
   isExpanded,
   data,
   isFetching,
+  manualRefreshing,
   error,
   usdtToToman,
   pnlPeriod,
@@ -735,6 +836,8 @@ function BlockchainWalletCard({
   isExpanded: boolean;
   data?: BlockchainWalletData;
   isFetching: boolean;
+  /** v1.4.19 — true while the MANUAL per-wallet refresh is running. */
+  manualRefreshing: boolean;
   error?: unknown;
   usdtToToman: number;
   pnlPeriod: PnlPeriod;
@@ -816,11 +919,12 @@ function BlockchainWalletCard({
           <Pressable style={styles.walletIconBtn} onPress={onEdit} hitSlop={8}>
             <Pencil size={13} color={colors.dark.blue} />
           </Pressable>
-          <Pressable style={styles.walletIconBtn} onPress={onRefresh} hitSlop={8}>
-            <RefreshCw
-              size={13}
-              color={isFetching ? colors.dark.accent : data ? colors.dark.accent : colors.dark.textMuted}
-            />
+          <Pressable style={styles.walletIconBtn} onPress={onRefresh} hitSlop={8} disabled={manualRefreshing}>
+            {manualRefreshing || isFetching ? (
+              <ActivityIndicator size="small" color={colors.dark.accent} />
+            ) : (
+              <RefreshCw size={13} color={data ? colors.dark.accent : colors.dark.textMuted} />
+            )}
           </Pressable>
           {isExpanded ? (
             <ChevronUp size={15} color={colors.dark.textSecondary} />
@@ -1115,6 +1219,62 @@ const styles = createThemedStyles(() =>
     },
     inputValid: {
       borderColor: colors.dark.green + '66',
+    },
+    inputInvalid: {
+      borderColor: colors.dark.red + '66',
+    },
+    // ── v1.4.19 — per-network address inputs + refresh toast ──
+    perNetBox: {
+      marginTop: 8,
+      padding: 10,
+      borderRadius: 10,
+      backgroundColor: colors.dark.surface,
+      borderWidth: 1,
+      borderColor: colors.dark.border,
+    },
+    perNetTitle: {
+      fontSize: 11,
+      fontWeight: '700',
+      color: colors.dark.textSecondary,
+      textAlign: 'right',
+      marginBottom: 3,
+    },
+    perNetHint: {
+      fontSize: 9,
+      color: colors.dark.textMuted,
+      textAlign: 'right',
+      lineHeight: 14,
+      marginBottom: 4,
+    },
+    perNetRow: {
+      marginTop: 6,
+    },
+    perNetLabel: {
+      fontSize: 10,
+      fontWeight: '600',
+      color: colors.dark.textSecondary,
+      textAlign: 'right',
+      marginBottom: 3,
+    },
+    perNetLabelHint: {
+      fontSize: 8.5,
+      fontWeight: '400',
+      color: colors.dark.textMuted,
+    },
+    refreshToast: {
+      marginTop: 10,
+      paddingVertical: 8,
+      paddingHorizontal: 12,
+      borderRadius: 10,
+      backgroundColor: colors.dark.accent + '1C',
+      borderWidth: 1,
+      borderColor: colors.dark.accent + '55',
+      alignItems: 'center',
+    },
+    refreshToastText: {
+      fontSize: 10,
+      color: colors.dark.accent,
+      fontWeight: '600',
     },
     inputHint: {
       fontSize: 9.5,

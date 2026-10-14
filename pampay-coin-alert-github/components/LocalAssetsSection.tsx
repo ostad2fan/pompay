@@ -479,47 +479,9 @@ export default function LocalAssetsSection({
             valueHint={p?.coinRob ? `قیمت هر عدد: ${formatFullToman(p.coinRob)}` : 'قیمت در حال دریافت'}
           />
 
-          {/* ── crypto row (read from the wallet's first header) ── */}
-          <View style={styles.assetRow}>
-            <Wallet size={14} color={colors.dark.blue} />
-            <View style={styles.assetMain}>
-              <Text style={styles.assetLabel}>ارزهای دیجیتال (همه صرافی‌ها)</Text>
-              <Text style={styles.assetHint}>
-                {totalPortfolioUsd > 0
-                  ? `ارزش دلاری: $${totalPortfolioUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}`
-                  : 'صرافی متصل نیست یا موجودی صفر'}
-              </Text>
-            </View>
-            <View style={styles.assetValueCol}>
-              <Text style={[styles.assetValue, { color: colors.dark.blue }]}>
-                {cryptoToman > 0 ? `${formatFullToman(cryptoToman)} ت` : '—'}
-              </Text>
-              {usdtToToman > 0 && (
-                <Text style={styles.assetRate}>تتر: {formatFullToman(usdtToToman)}</Text>
-              )}
-            </View>
-          </View>
-
-          {/* ── v1.4.16 — blockchain wallet row (read-only, from the 4th tab) ── */}
-          {hasBlockchainWallet && (
-            <View style={styles.assetRow}>
-              <LinkIcon size={14} color={colors.dark.accent} />
-              <View style={styles.assetMain}>
-                <Text style={styles.assetLabel}>کیف پول بلاکچین (فقط خواندنی)</Text>
-                <Text style={styles.assetHint}>
-                  مدیریت از تب «کیف پول بلاکچین» — فقط با آدرس عمومی، بدون کلید خصوصی
-                </Text>
-              </View>
-              <View style={styles.assetValueCol}>
-                <Text style={[styles.assetValue, { color: colors.dark.accent }]}>
-                  {blockchainToman > 0 ? `${formatFullToman(Math.round(blockchainToman))} ت` : '—'}
-                </Text>
-                {usdtToToman > 0 && (
-                  <Text style={styles.assetRate}>تتر: {formatFullToman(usdtToToman)}</Text>
-                )}
-              </View>
-            </View>
-          )}
+          {/* ── v1.4.19 — حذف دو ردیف آخر (ارز دیجیتال + کیف بلاکچین):
+              این دو از بالا به‌صورت کادر خلاصه نمایش داده می‌شوند؛ تکرار
+              درون «دارایی‌های من» حذف شد (درخواست مستقیم کاربر). ── */}
         </>
       )}
     </View>
