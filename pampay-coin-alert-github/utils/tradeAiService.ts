@@ -11,12 +11,61 @@ import {
   ConfluenceBreakdown,
 } from '@/types/tradeAi';
 import { fetchKlines, fetchFundingRate } from '@/utils/binanceApi';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   fetchDerivativesData,
   fetchSentimentData,
   fetchOnChainData,
   symbolToCoinGeckoId,
 } from '@/utils/marketDataApi';
+
+/* ── v1.5.1 — استراتژی‌ها به‌صورت گزینه‌های روشن/خاموش (دمو + واقعی) ── */
+
+const ENABLED_STRATEGIES_KEY = '@trading_strategies_v1';
+
+export type EnabledStrategies = Record<TradingStrategy, boolean>;
+
+export const STRATEGY_ORDER: TradingStrategy[] = ['conservative', 'balanced', 'aggressive', 'scalper'];
+
+export const DEFAULT_ENABLED_STRATEGIES: EnabledStrategies = {
+  conservative: false,
+  balanced: true,
+  aggressive: false,
+  scalper: false,
+};
+
+export async function loadEnabledStrategies(): Promise<EnabledStrategies> {
+  try {
+    const raw = await AsyncStorage.getItem(ENABLED_STRATEGIES_KEY);
+    if (!raw) return { ...DEFAULT_ENABLED_STRATEGIES };
+    const parsed = JSON.parse(raw) as Partial<EnabledStrategies>;
+    return {
+      conservative: parsed.conservative ?? false,
+      balanced: parsed.balanced ?? true,
+      aggressive: parsed.aggressive ?? false,
+      scalper: parsed.scalper ?? false,
+    };
+  } catch {
+    return { ...DEFAULT_ENABLED_STRATEGIES };
+  }
+}
+
+export async function saveEnabledStrategies(map: EnabledStrategies): Promise<void> {
+  try {
+    await AsyncStorage.setItem(ENABLED_STRATEGIES_KEY, JSON.stringify(map));
+  } catch {}
+}
+
+/** استراتژی اصلی = اولین استراتژی روشن (اگر همه خاموش → متعادل). */
+export function primaryStrategy(map: EnabledStrategies): TradingStrategy {
+  const first = STRATEGY_ORDER.find((s) => map[s]);
+  return first ?? 'balanced';
+}
+
+export function enabledStrategyList(map: EnabledStrategies): TradingStrategy[] {
+  const list = STRATEGY_ORDER.filter((s) => map[s]);
+  return list.length > 0 ? list : ['balanced'];
+}
 
 function calculateEMA(closes: number[], period: number): number[] {
   const ema: number[] = [];
@@ -622,6 +671,7 @@ export async function getAITradeSignal(
   priceChange24h: number,
   volume24h: number,
   useVolumeOnly: boolean = false,
+  extraStrategies: TradingStrategy[] = [],
 ): Promise<AITradeSignal | null> {
   console.log(`[TradeAI] Getting AI signal for ${symbol} with ${strategy} strategy (volumeOnly=${useVolumeOnly})`);
 
@@ -630,6 +680,14 @@ export async function getAITradeSignal(
     if (indicators.length === 0) return null;
 
     const config = STRATEGY_CONFIGS[strategy];
+    // v1.5.1 — استراتژی‌های روشنِ دیگر هم در تحلیل لحاظ می‌شوند
+    const extraList = extraStrategies.filter((s) => s !== strategy);
+    const extraSummary =
+      extraList.length > 0
+        ? `\nAdditional ENABLED strategies (blend their risk profiles into the final decision): ${extraList
+            .map((s) => `${STRATEGY_CONFIGS[s].nameEn} (Max Leverage ${STRATEGY_CONFIGS[s].maxLeverage}x, SL ${STRATEGY_CONFIGS[s].stopLossPercent}%)`)
+            .join('; ')}`
+        : '';
     const bullishCount = indicators.filter((i) => i.signal === 'bullish').length;
     const bearishCount = indicators.filter((i) => i.signal === 'bearish').length;
 
@@ -673,7 +731,7 @@ Symbol: ${symbol}
 Current Price: $${currentPrice}
 24h Price Change: ${priceChange24h.toFixed(2)}%
 24h Volume: $${volume24h.toLocaleString()}
-Strategy: ${config.nameEn} (Max Leverage: ${config.maxLeverage}x, Stop Loss: ${config.stopLossPercent}%)
+Strategy: ${config.nameEn} (Max Leverage: ${config.maxLeverage}x, Stop Loss: ${config.stopLossPercent}%)${extraSummary}
 ATR Value: $${atrValue.toFixed(4)}
 
 Technical Indicators (${indicators.length} total):

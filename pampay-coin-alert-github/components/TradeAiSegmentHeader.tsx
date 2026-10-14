@@ -1,21 +1,20 @@
 /**
- * TradeAiSegmentHeader.tsx — v1.5.0
+ * TradeAiSegmentHeader.tsx — v1.5.1
  *
- * «ترید با AI» now has THREE sections (user demand):
- *   ۱) تحلیل هوش مصنوعی (همان بخش قبلی)
- *   ۲) ترید واقعی (به داخل همین بخش آمد)
- *   ۳) معامله خودکار (خودش دو حالت دمو/واقعی دارد)
+ * «ترید با AI» has exactly TWO main tabs (user demand):
+ *   ۱) دمو — تحلیل هوش مصنوعی (همان بخش قبلی) + معامله‌گر خودکار
+ *   ۲) واقعی — ترید واقعی (بخش کامل خودش)
  *
- * Shared segment switcher rendered at the top of all three screens.
+ * Shared tab switcher rendered at the top of both screens.
  */
 
 import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useRouter } from 'expo-router';
-import { Brain, Wallet2, Bot } from 'lucide-react-native';
+import { FlaskConical, Wallet2 } from 'lucide-react-native';
 import colors from '@/constants/colors';
 
-export type TradeAiSegment = 'ai' | 'real' | 'auto';
+export type TradeAiSegment = 'demo' | 'real';
 
 const SEGMENTS: {
   key: TradeAiSegment;
@@ -24,22 +23,16 @@ const SEGMENTS: {
   icon: (size: number, color: string) => React.ReactNode;
 }[] = [
   {
-    key: 'ai',
-    label: 'تحلیل هوش مصنوعی',
+    key: 'demo',
+    label: 'دمو (تحلیل AI + معامله خودکار)',
     route: '/trade-ai',
-    icon: (s, c) => <Brain size={s} color={c} />,
+    icon: (s, c) => <FlaskConical size={s} color={c} />,
   },
   {
     key: 'real',
-    label: 'ترید واقعی',
+    label: 'واقعی',
     route: '/trade-ai/real-trade',
     icon: (s, c) => <Wallet2 size={s} color={c} />,
-  },
-  {
-    key: 'auto',
-    label: 'معامله خودکار',
-    route: '/trade-ai/auto-trade',
-    icon: (s, c) => <Bot size={s} color={c} />,
   },
 ];
 
@@ -59,7 +52,7 @@ export default function TradeAiSegmentHeader({ active }: { active: TradeAiSegmen
             }}
             testID={`trade-ai-segment-${seg.key}`}
           >
-            {seg.icon(on ? 13 : 13, on ? colors.dark.background : colors.dark.textSecondary)}
+            {seg.icon(on ? 14 : 14, on ? colors.dark.background : colors.dark.textSecondary)}
             <Text style={[styles.btnText, on && styles.btnTextActive]} numberOfLines={1}>
               {seg.label}
             </Text>
@@ -88,7 +81,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 4,
     borderRadius: 9,
-    paddingVertical: 8,
+    paddingVertical: 9,
     paddingHorizontal: 2,
     backgroundColor: 'transparent',
   },

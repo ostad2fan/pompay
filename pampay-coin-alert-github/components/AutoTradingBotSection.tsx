@@ -1,5 +1,5 @@
 /**
- * AutoTradingBotSection.tsx — v1.5.0
+ * AutoTradingBotSection.tsx — v1.5.1
  *
  * «معامله‌گر خودکار» UI — کپی پوزیشن‌های نهنگ + سیگنال اندیکاتورها را
  * اتوماتیک (دمو یا واقعی) معامله می‌کند با تنظیمات کاربر: لوریج، حجم،
@@ -12,8 +12,15 @@
  *  • تریلینگ استاپ و مدیریت سرمایه هوشمند همیشه‌فعال (سیستم خودش).
  *  • موتور GLOBAL در کل برنامه می‌چرخد (utils/autoTradingEngine)؛ روشن بودن
  *    ربات ذخیره می‌شود و با بستن برنامه خاموش نمی‌شود.
- *  • PnL در تایم‌فریم‌های مختلف + خروجی عکس (ذخیره در گالری / اشتراک‌گذاری).
  *  • رفرش پوزیشن‌های ربات = اجرای کامل یک چرخه (قیمت تازه + SL/TP + تریل).
+ *
+ * v1.5.1:
+ *  • بخش داخل تب «دمو» ترید با AI (دو تب اصلی: دمو / واقعی).
+ *  • نمایش سخت‌گیرانه: در هر حالت فقط ریز معاملات همان حالت نشان داده
+ *    می‌شود (در واقعی، جزئیات دمو پنهان است) + بستن دستی پوزیشن باز.
+ *  • خروجی عکس PnL: اول عکس ساخته و «پیش‌نمایش» داده می‌شود؛ بعد از دیدن،
+ *    ذخیره در گالری یا اشتراک‌گذاری انتخاب می‌شود.
+ *  • تاریخچه معاملات با فیلتر روز (امروز/۷/۳۰/همه) + جمع PnL همان بازه.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -28,6 +35,8 @@ import {
   ScrollView,
   Alert,
   Platform,
+  Modal,
+  Image,
 } from 'react-native';
 import {
   Bot,
@@ -96,6 +105,10 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [indDropdownOpen, setIndDropdownOpen] = useState(false);
   const [pnlPeriod, setPnlPeriod] = useState<AutoPnlPeriod>('all');
   const [captureBusy, setCaptureBusy] = useState(false);
+  /** v1.5.1 — پیش‌نمایش عکس PnL: اول عکس ساخته و نشان داده می‌شود، بعد ذخیره/اشتراک. */
+  const [previewUri, setPreviewUri] = useState<string | null>(null);
+  /** v1.5.1 — فیلتر روزِ تاریخچه معاملات ربات. */
+  const [histPeriod, setHistPeriod] = useState<AutoPnlPeriod>('all');
   const pnlCardRef = useRef<View>(null);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -157,10 +170,33 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     setCycleBusy(false);
   }, [cycleBusy, refreshPositions]);
 
+  // v1.5.1 — فیلتر روز تاریخچه معاملات (امروز/۷/۳۰/همه)
+  const histWindowMs = useCallback(
+    (p: AutoPnlPeriod): number =>
+      p === 'today' ? 24 * 3600_000 : p === '7d' ? 7 * 24 * 3600_000 : p === '30d' ? 30 * 24 * 3600_000 : Infinity,
+    []
+  );
+
   const openPositions = useMemo(() => positions.filter((p) => p.status === 'open'), [positions]);
-  const closedPositions = useMemo(() => positions.filter((p) => p.status === 'closed').slice(0, 12), [positions]);
+  const closedPositions = useMemo(() => {
+    const win = histWindowMs(histPeriod);
+    const now = Date.now();
+    return positions
+      .filter((p) => p.status === 'closed' && (win === Infinity || (!!p.closedAt && now - p.closedAt <= win)))
+      .slice()
+      .reverse()
+      .slice(0, 30);
+  }, [positions, histPeriod, histWindowMs]);
   const realOpen = useMemo(() => realPositions.filter((p) => p.status === 'open'), [realPositions]);
-  const realClosed = useMemo(() => realPositions.filter((p) => p.status === 'closed').slice(0, 12), [realPositions]);
+  const realClosed = useMemo(() => {
+    const win = histWindowMs(histPeriod);
+    const now = Date.now();
+    return realPositions
+      .filter((p) => p.status === 'closed' && (win === Infinity || (!!p.closedAt && now - p.closedAt <= win)))
+      .slice()
+      .reverse()
+      .slice(0, 30);
+  }, [realPositions, histPeriod, histWindowMs]);
 
   const totalPnl = openPositions.reduce((s, p) => {
     const dir = p.side === 'long' ? 1 : -1;
@@ -263,25 +299,36 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     }
   };
 
-  const handleSharePnl = async () => {
+  // ── v1.5.1 — PnL image: FIRST capture + preview, THEN choose save/share ──
+  const handleMakePnlImage = async () => {
     if (captureBusy) return;
     setCaptureBusy(true);
     try {
+      if (Platform.OS === 'web') {
+        Alert.alert('وب', 'خروجی عکس فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
+        return;
+      }
       const uri = await capturePnl();
       if (!uri) {
         Alert.alert('خطا', 'ساخت عکس PnL ممکن نشد.');
         return;
       }
-      if (Platform.OS === 'web') {
-        Alert.alert('وب', 'خروجی عکس فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
-        return;
-      }
+      setPreviewUri(uri);
+    } finally {
+      setCaptureBusy(false);
+    }
+  };
+
+  const handleSharePreview = async () => {
+    if (!previewUri || captureBusy) return;
+    setCaptureBusy(true);
+    try {
       const available = await Sharing.isAvailableAsync().catch(() => false);
       if (!available) {
         Alert.alert('غيرممکن', 'اشتراک‌گذاری روی این دستگاه در دسترس نیست.');
         return;
       }
-      await Sharing.shareAsync(uri, {
+      await Sharing.shareAsync(previewUri, {
         mimeType: 'image/png',
         dialogTitle: 'اشتراک‌گذاری PnL معامله‌گر خودکار',
       });
@@ -290,25 +337,16 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     }
   };
 
-  const handleSavePnl = async () => {
-    if (captureBusy) return;
+  const handleSavePreview = async () => {
+    if (!previewUri || captureBusy) return;
     setCaptureBusy(true);
     try {
-      const uri = await capturePnl();
-      if (!uri) {
-        Alert.alert('خطا', 'ساخت عکس PnL ممکن نشد.');
-        return;
-      }
-      if (Platform.OS === 'web') {
-        Alert.alert('وب', 'ذخیره در گالری فقط روی گوشی پشتیبانی می‌شود.');
-        return;
-      }
       const perm = await MediaLibrary.requestPermissionsAsync().catch(() => ({ granted: false }) as { granted: boolean });
       if (!perm.granted) {
         Alert.alert('دسترسی داده نشد', 'برای ذخیره عکس در گالری، دسترسی رسانه را تأیید کنید.');
         return;
       }
-      await MediaLibrary.saveToLibraryAsync(uri);
+      await MediaLibrary.saveToLibraryAsync(previewUri);
       Alert.alert('ذخیره شد ✅', 'عکس PnL ربات در گالری گوشی ذخیره شد.');
     } catch {
       Alert.alert('خطا', 'ذخیره عکس انجام نشد.');
@@ -317,8 +355,10 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     }
   };
 
-  const hasAnyPosition = openPositions.length > 0 || realOpen.length > 0 ||
-    positions.some((p) => p.status === 'closed') || realPositions.some((p) => p.status === 'closed');
+  // v1.5.1 — نمایش سخت‌گیرانه: در هر حالت فقط داده‌های همان حالت (واقعی = بدون ریز دمو)
+  const hasAnyPosition = settings.mode === 'demo'
+    ? openPositions.length > 0 || positions.some((p) => p.status === 'closed')
+    : realOpen.length > 0 || realPositions.some((p) => p.status === 'closed');
 
   return (
     <View style={styles.card}>
@@ -672,7 +712,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     </Pressable>
                   ))}
                 </View>
-                {settings.mode === 'demo' || positions.length > 0 ? (
+                {settings.mode === 'demo' ? (
                   <View style={styles.pnlModeBlock}>
                     <Text style={styles.pnlModeLabel}>دمو</Text>
                     <PnlRow label="سود/زیان بسته‌شده" value={demoStats.realized} />
@@ -687,7 +727,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     </Text>
                   </View>
                 ) : null}
-                {(settings.mode === 'real' || realPositions.length > 0) && (
+                {settings.mode === 'real' && (
                   <View style={[styles.pnlModeBlock, styles.pnlModeBlockReal]}>
                     <Text style={styles.pnlModeLabel}>واقعی</Text>
                     <PnlRow label="سود/زیان بسته‌شده" value={realStats.realized} />
@@ -705,20 +745,51 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 <Text style={styles.pnlShareFooter}>PampDumpCoins • {AUTO_PNL_PERIOD_LABEL[pnlPeriod]}</Text>
               </View>
               <View style={styles.shareBtnRow}>
-                <Pressable style={[styles.shareBtn, styles.saveBtn]} onPress={() => void handleSavePnl()} disabled={captureBusy}>
-                  {captureBusy ? <ActivityIndicator size="small" color={colors.dark.background} /> : <Save size={13} color={colors.dark.background} />}
-                  <Text style={styles.shareBtnText}>ذخیره عکس</Text>
-                </Pressable>
-                <Pressable style={styles.shareBtn} onPress={() => void handleSharePnl()} disabled={captureBusy}>
-                  <Share2 size={13} color={colors.dark.background} />
-                  <Text style={styles.shareBtnText}>اشتراک‌گذاری عکس</Text>
+                {/* v1.5.1 — اول عکس ساخته و پیش‌نمایش داده می‌شود؛ ذخیره/اشتراک از داخل پیش‌نمایش */}
+                <Pressable style={styles.shareBtn} onPress={() => void handleMakePnlImage()} disabled={captureBusy} testID="pnl-make-image">
+                  {captureBusy ? <ActivityIndicator size="small" color={colors.dark.background} /> : <Camera size={13} color={colors.dark.background} />}
+                  <Text style={styles.shareBtnText}>ساخت عکس PnL (پیش‌نمایش)</Text>
                 </Pressable>
               </View>
+
+              {/* v1.5.1 — پیش‌نمایش عکس PnL: بعد از دیدن عکس، ذخیره یا اشتراک را انتخاب کنید */}
+              <Modal visible={!!previewUri} transparent animationType="fade">
+                <Pressable style={styles.previewOverlay} onPress={() => setPreviewUri(null)}>
+                  <View style={styles.previewCard} onStartShouldSetResponder={() => true}>
+                    <View style={styles.previewHead}>
+                      <Text style={styles.previewTitle}>پیش‌نمایش عکس PnL</Text>
+                      <Pressable hitSlop={8} onPress={() => setPreviewUri(null)}>
+                        <X size={18} color={colors.dark.textMuted} />
+                      </Pressable>
+                    </View>
+                    {previewUri && (
+                      <Image
+                        source={{ uri: previewUri }}
+                        style={styles.previewImage}
+                        resizeMode="contain"
+                      />
+                    )}
+                    <Text style={styles.previewHint}>
+                      اول عکس را ببینید؛ بعد ذخیره در گالری یا اشتراک‌گذاری را انتخاب کنید.
+                    </Text>
+                    <View style={styles.previewBtnRow}>
+                      <Pressable style={[styles.shareBtn, styles.saveBtn]} onPress={() => void handleSavePreview()} disabled={captureBusy} testID="pnl-preview-save">
+                        {captureBusy ? <ActivityIndicator size="small" color={colors.dark.background} /> : <Save size={13} color={colors.dark.background} />}
+                        <Text style={styles.shareBtnText}>ذخیره در گالری</Text>
+                      </Pressable>
+                      <Pressable style={styles.shareBtn} onPress={() => void handleSharePreview()} disabled={captureBusy} testID="pnl-preview-share">
+                        <Share2 size={13} color={colors.dark.background} />
+                        <Text style={styles.shareBtnText}>اشتراک‌گذاری</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                </Pressable>
+              </Modal>
             </View>
           )}
 
-          {/* demo positions */}
-          {(settings.mode === 'demo' || openPositions.length > 0) && (
+          {/* demo positions — فقط حالت دمو (در واقعی، ریز معاملات دمو نمایش داده نمی‌شود) */}
+          {settings.mode === 'demo' && (
             <View style={styles.sourceBox}>
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={totalPnl >= 0 ? colors.dark.green : colors.dark.red} />
@@ -764,7 +835,34 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               })}
               {closedPositions.length > 0 && (
                 <View style={styles.closedBox}>
-                  <Text style={styles.closedTitle}>بسته‌شده‌ها:</Text>
+                  <Text style={styles.closedTitle}>تاریخچه معاملات:</Text>
+                  <View style={styles.histPeriodRow}>
+                    {AUTO_PNL_PERIODS.map((p) => (
+                      <Pressable
+                        key={p}
+                        style={[styles.histPeriodChip, histPeriod === p && styles.histPeriodChipActive]}
+                        onPress={() => setHistPeriod(p)}
+                        testID={`auto-hist-${p}`}
+                      >
+                        <Text style={[styles.histPeriodText, histPeriod === p && styles.histPeriodTextActive]}>
+                          {AUTO_PNL_PERIOD_LABEL[p]}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                  {(() => {
+                    const sum = closedPositions.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
+                    return (
+                      <View style={styles.histSummary}>
+                        <Text style={styles.histSummaryText}>
+                          {closedPositions.length.toLocaleString('fa-IR')} معامله در این بازه
+                        </Text>
+                        <Text style={[styles.histSummaryPnl, { color: sum >= 0 ? colors.dark.green : colors.dark.red }]}>
+                          {sum >= 0 ? '+' : '−'}${Math.abs(sum).toFixed(2)}
+                        </Text>
+                      </View>
+                    );
+                  })()}
                   {closedPositions.map((p) => (
                     <View key={p.id} style={styles.closedRow}>
                       <Text style={styles.closedText} numberOfLines={1}>
@@ -780,8 +878,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             </View>
           )}
 
-          {/* real positions (tracked by the engine) */}
-          {(settings.mode === 'real' || realOpen.length > 0) && realKeys && (
+          {/* real positions (tracked by the engine) — فقط حالت واقعی */}
+          {settings.mode === 'real' && realKeys && (
             <View style={styles.sourceBox}>
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={realTotalPnl >= 0 ? colors.dark.green : colors.dark.red} />
@@ -837,7 +935,33 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               })}
               {realClosed.length > 0 && (
                 <View style={styles.closedBox}>
-                  <Text style={styles.closedTitle}>بسته‌شده‌های واقعی:</Text>
+                  <Text style={styles.closedTitle}>تاریخچه معاملات (واقعی):</Text>
+                  <View style={styles.histPeriodRow}>
+                    {AUTO_PNL_PERIODS.map((p) => (
+                      <Pressable
+                        key={p}
+                        style={[styles.histPeriodChip, histPeriod === p && styles.histPeriodChipActive]}
+                        onPress={() => setHistPeriod(p)}
+                      >
+                        <Text style={[styles.histPeriodText, histPeriod === p && styles.histPeriodTextActive]}>
+                          {AUTO_PNL_PERIOD_LABEL[p]}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                  {(() => {
+                    const sum = realClosed.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
+                    return (
+                      <View style={styles.histSummary}>
+                        <Text style={styles.histSummaryText}>
+                          {realClosed.length.toLocaleString('fa-IR')} معامله در این بازه
+                        </Text>
+                        <Text style={[styles.histSummaryPnl, { color: sum >= 0 ? colors.dark.green : colors.dark.red }]}>
+                          {sum >= 0 ? '+' : '−'}${Math.abs(sum).toFixed(2)}
+                        </Text>
+                      </View>
+                    );
+                  })()}
                   {realClosed.map((p) => (
                     <View key={p.id} style={styles.closedRow}>
                       <Text style={styles.closedText} numberOfLines={1}>
@@ -1316,6 +1440,98 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.dark.cardBorder,
     padding: 8,
+  },
+  /* v1.5.1 — فیلتر روز تاریخچه معاملات ربات */
+  histPeriodRow: {
+    flexDirection: 'row',
+    gap: 4,
+    marginBottom: 6,
+    marginTop: 2,
+  },
+  histPeriodChip: {
+    flex: 1,
+    alignItems: 'center',
+    paddingVertical: 5,
+    borderRadius: 7,
+    backgroundColor: colors.dark.surface,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+  },
+  histPeriodChipActive: {
+    backgroundColor: colors.dark.accent,
+    borderColor: colors.dark.accent,
+  },
+  histPeriodText: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: colors.dark.textSecondary,
+  },
+  histPeriodTextActive: {
+    color: colors.dark.background,
+    fontWeight: '800',
+  },
+  histSummary: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: colors.dark.surface,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    marginBottom: 4,
+  },
+  histSummaryText: {
+    fontSize: 9,
+    color: colors.dark.textSecondary,
+  },
+  histSummaryPnl: {
+    fontSize: 10.5,
+    fontWeight: '800',
+  },
+  /* v1.5.1 — پیش‌نمایش عکس PnL */
+  previewOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.75)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+  },
+  previewCard: {
+    width: '100%',
+    backgroundColor: colors.dark.surface,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+    padding: 12,
+  },
+  previewHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  previewTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: colors.dark.text,
+  },
+  previewImage: {
+    width: '100%',
+    height: 320,
+    borderRadius: 10,
+    backgroundColor: colors.dark.background,
+  },
+  previewHint: {
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+    textAlign: 'right',
+    marginTop: 8,
+    marginBottom: 8,
+    lineHeight: 15,
+  },
+  previewBtnRow: {
+    flexDirection: 'row',
+    gap: 6,
   },
   closedTitle: {
     fontSize: 9.5,

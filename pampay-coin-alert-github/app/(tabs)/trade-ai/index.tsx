@@ -10,6 +10,7 @@ import {
   ActivityIndicator,
   Animated,
   Platform,
+  Switch,
 } from 'react-native';
 import {
   Brain,
@@ -56,19 +57,33 @@ import {
   openDemoPosition,
   closeDemoPosition,
   updateDemoPositions,
+  loadEnabledStrategies,
+  saveEnabledStrategies,
+  primaryStrategy,
+  enabledStrategyList,
+  STRATEGY_ORDER,
+  DEFAULT_ENABLED_STRATEGIES,
+  EnabledStrategies,
 } from '@/utils/tradeAiService';
 import { fetchFuturesTickers } from '@/utils/binanceApi';
 import { sendTelegramAISignal, sendTelegramTradeNotification } from '@/utils/telegramService';
 import DropdownPicker from '@/components/DropdownPicker';
 import TradeAiSegmentHeader from '@/components/TradeAiSegmentHeader';
+import AutoTradingBotSection from '@/components/AutoTradingBotSection';
 
 const DEMO_KEY = '@trade_ai_demo';
 const SIGNALS_HISTORY_KEY = '@trade_ai_signals';
 
-const STRATEGY_OPTIONS = Object.entries(STRATEGY_CONFIGS).map(([key, val]) => ({
-  key,
-  label: `${val.name} (${val.nameEn})`,
-}));
+/** v1.5.1 — فیلتر روزِ تاریخچه معاملات دمو */
+type HistPeriod = 'today' | '7d' | '30d' | 'all';
+const HIST_PERIODS: { key: HistPeriod; label: string }[] = [
+  { key: 'today', label: 'امروز' },
+  { key: '7d', label: '۷ روز' },
+  { key: '30d', label: '۳۰ روز' },
+  { key: 'all', label: 'همه' },
+];
+const histWindowMs = (p: HistPeriod): number =>
+  p === 'today' ? 24 * 3600_000 : p === '7d' ? 7 * 24 * 3600_000 : p === '30d' ? 30 * 24 * 3600_000 : Infinity;
 
 const POPULAR_SYMBOLS = [
   'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
@@ -81,7 +96,8 @@ export default function TradeAiScreen() {
   const queryClient = useQueryClient();
   const router = useRouter();
   const { settings } = useApp();
-  const [strategy, setStrategy] = useState<TradingStrategy>('balanced');
+  const [enabledStrategies, setEnabledStrategies] = useState<EnabledStrategies>(DEFAULT_ENABLED_STRATEGIES);
+  const [histPeriod, setHistPeriod] = useState<HistPeriod>('all');
   const [selectedSymbol, setSelectedSymbol] = useState('BTCUSDT');
   const [customSymbol, setCustomSymbol] = useState('');
   const [demoAmount, setDemoAmount] = useState('100');
@@ -135,6 +151,34 @@ export default function TradeAiScreen() {
   const portfolio = demoQuery.data ?? createDemoPortfolio();
   const signalHistory = signalsQuery.data ?? [];
 
+  // v1.5.1 — استراتژی‌های روشن/خاموش (مشترک بین دمو و واقعی)
+  const strategiesQuery = useQuery({
+    queryKey: ['trading-strategies'],
+    queryFn: loadEnabledStrategies,
+    staleTime: Infinity,
+  });
+  useEffect(() => {
+    if (strategiesQuery.data) setEnabledStrategies(strategiesQuery.data);
+  }, [strategiesQuery.data]);
+
+  const toggleStrategy = useCallback((key: TradingStrategy) => {
+    setEnabledStrategies((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      if (!STRATEGY_ORDER.some((s) => next[s])) {
+        // حداقل یک استراتژی باید روشن بماند
+        Alert.alert('غیرممکن', 'حداقل یک استراتژی باید روشن باشد.');
+        return prev;
+      }
+      void saveEnabledStrategies(next).then(() => {
+        queryClient.invalidateQueries({ queryKey: ['trading-strategies'] });
+      });
+      return next;
+    });
+  }, [queryClient]);
+
+  const strategy = primaryStrategy(enabledStrategies);
+  const extraStrategies = enabledStrategyList(enabledStrategies).filter((s) => s !== strategy);
+
   const saveDemoMutation = useMutation({
     mutationFn: async (p: DemoPortfolio) => {
       await AsyncStorage.setItem(DEMO_KEY, JSON.stringify(p));
@@ -167,7 +211,7 @@ export default function TradeAiScreen() {
     const priceChange = parseFloat(ticker.priceChangePercent);
     const volume = parseFloat(ticker.quoteVolume);
 
-    const signal = await getAITradeSignal(cleanSymbol, strategy, currentPrice, priceChange, volume, settings.useVolumeOnlySignals ?? false);
+    const signal = await getAITradeSignal(cleanSymbol, strategy, currentPrice, priceChange, volume, settings.useVolumeOnlySignals ?? false, extraStrategies);
     if (!signal) throw new Error(`AI نتوانست سیگنال برای ${cleanSymbol} تولید کند`);
 
     if (settings.telegramEnabled && (settings.tradeAiNotifications ?? true)) {
@@ -175,7 +219,7 @@ export default function TradeAiScreen() {
     }
 
     return signal;
-  }, [strategy, settings]);
+  }, [strategy, extraStrategies, settings]);
 
   const analyzeMutation = useMutation({
     mutationFn: async () => {
@@ -408,7 +452,6 @@ export default function TradeAiScreen() {
   );
 
   const latestSignal = analyzeMutation.data;
-  const config = STRATEGY_CONFIGS[strategy];
   const totalPnlPercent = portfolio.initialBalance > 0
     ? ((portfolio.balance + portfolio.positions.reduce((s, p) => s + (p.size * p.currentPrice / p.leverage), 0) - portfolio.initialBalance) / portfolio.initialBalance) * 100
     : 0;
@@ -420,7 +463,7 @@ export default function TradeAiScreen() {
       showsVerticalScrollIndicator={false}
     >
       {/* v1.5.0 — سه سربخش: تحلیل AI / ترید واقعی / معامله خودکار */}
-      <TradeAiSegmentHeader active="ai" />
+      <TradeAiSegmentHeader active="demo" />
 
       <View style={styles.refreshTimerBar}>
         <View style={styles.refreshTimerLeft}>
@@ -498,41 +541,35 @@ export default function TradeAiScreen() {
         </View>
       </View>
 
+      {/* v1.5.1 — استراتژی‌ها به‌صورت گزینه‌های روشن/خاموش (مثل ردیابی نهنگ‌ها) */}
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>انتخاب استراتژی</Text>
-        <DropdownPicker
-          label="استراتژی معاملاتی"
-          value={strategy}
-          options={STRATEGY_OPTIONS}
-          onSelect={(key) => setStrategy(key as TradingStrategy)}
-          testID="strategy-dropdown"
-        />
-        <View style={styles.strategyInfo}>
-          <View style={styles.strategyInfoRow}>
-            <ShieldAlert size={12} color={colors.dark.orange} />
-            <Text style={styles.strategyInfoText}>{config.description}</Text>
-          </View>
-          <View style={styles.strategyDetails}>
-            <View style={styles.strategyDetail}>
-              <Text style={styles.strategyDetailLabel}>حداکثر اهرم</Text>
-              <Text style={styles.strategyDetailValue}>{config.maxLeverage}x</Text>
-            </View>
-            <View style={styles.strategyDetail}>
-              <Text style={styles.strategyDetailLabel}>حد ضرر</Text>
-              <Text style={styles.strategyDetailValue}>{config.stopLossPercent}%</Text>
-            </View>
-            <View style={styles.strategyDetail}>
-              <Text style={styles.strategyDetailLabel}>TP ضریب</Text>
-              <Text style={styles.strategyDetailValue}>{config.takeProfitMultiplier}x</Text>
-            </View>
-            {config.dcaEnabled && (
-              <View style={styles.strategyDetail}>
-                <Text style={styles.strategyDetailLabel}>DCA</Text>
-                <Text style={[styles.strategyDetailValue, { color: colors.dark.green }]}>فعال</Text>
+        <Text style={styles.sectionTitle}>استراتژی‌های معاملاتی (روشن/خاموش)</Text>
+        <Text style={styles.strategyTogglesHint}>
+          استراتژی‌های روشن در تحلیل AI لحاظ می‌شوند (هر دو تب دمو و واقعی از همین لیست استفاده می‌کنند). حداقل یک استراتژی باید روشن بماند.
+        </Text>
+        {STRATEGY_ORDER.map((key) => {
+          const cfg = STRATEGY_CONFIGS[key];
+          const on = enabledStrategies[key];
+          return (
+            <View key={key} style={[styles.strategyToggleRow, on && styles.strategyToggleRowActive]}>
+              <View style={styles.strategyToggleTexts}>
+                <Text style={styles.strategyToggleName}>
+                  {cfg.name} ({cfg.nameEn}){strategy === key ? ' — اصلی' : ''}
+                </Text>
+                <Text style={styles.strategyToggleDesc} numberOfLines={2}>
+                  {cfg.description} • اهرم {cfg.maxLeverage}x • حد ضرر {cfg.stopLossPercent}٪
+                </Text>
               </View>
-            )}
-          </View>
-        </View>
+              <Switch
+                value={on}
+                onValueChange={() => toggleStrategy(key)}
+                trackColor={{ true: colors.dark.green + '88', false: colors.dark.card }}
+                thumbColor={on ? colors.dark.green : colors.dark.textMuted}
+                style={{ transform: [{ scale: 0.75 }] }}
+              />
+            </View>
+          );
+        })}
       </View>
 
       <View style={styles.section}>
@@ -952,6 +989,78 @@ export default function TradeAiScreen() {
             <Text style={styles.sectionTitle}>عملکرد معاملات</Text>
           </View>
 
+          {/* v1.5.1 — فیلتر روز تاریخچه معاملات */}
+          <View style={styles.histPeriodRow}>
+            {HIST_PERIODS.map((p) => (
+              <Pressable
+                key={p.key}
+                style={[styles.histPeriodChip, histPeriod === p.key && styles.histPeriodChipActive]}
+                onPress={() => setHistPeriod(p.key)}
+                testID={`demo-hist-${p.key}`}
+              >
+                <Text style={[styles.histPeriodText, histPeriod === p.key && styles.histPeriodTextActive]}>
+                  {p.label}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+          {(() => {
+            const win = histWindowMs(histPeriod);
+            const filtered = portfolio.closedTrades
+              .filter((t) => win === Infinity || (t.closedAt && Date.now() - t.closedAt <= win))
+              .slice()
+              .reverse();
+            const sum = filtered.reduce((s, t) => s + t.pnl, 0);
+            const wins = filtered.filter((t) => t.pnl > 0).length;
+            return (
+              <>
+                <View style={styles.histFilterSummary}>
+                  <Text style={styles.histFilterSummaryText}>
+                    {filtered.length.toLocaleString('fa-IR')} معامله در این بازه
+                  </Text>
+                  <Text style={[styles.histFilterSummaryPnl, { color: sum >= 0 ? colors.dark.green : colors.dark.red }]}>
+                    {sum >= 0 ? '+' : '−'}${Math.abs(sum).toFixed(2)}
+                  </Text>
+                </View>
+                {filtered.length === 0 && (
+                  <Text style={styles.histEmpty}>معامله‌ای در این بازه نیست.</Text>
+                )}
+                {filtered.map((trade) => (
+                  <View key={trade.id} style={styles.tradeRow}>
+                    <View style={styles.tradeRowLeft}>
+                      <View style={[
+                        styles.sideBadgeSmall,
+                        trade.side === 'long' ? styles.sideBadgeLong : styles.sideBadgeShort,
+                      ]}>
+                        <Text style={[
+                          styles.sideBadgeSmallText,
+                          { color: trade.side === 'long' ? colors.dark.green : colors.dark.red },
+                        ]}>
+                          {trade.side === 'long' ? 'L' : 'S'}
+                        </Text>
+                      </View>
+                      <Text style={styles.tradeSymbol}>{trade.symbol.replace('USDT', '')}</Text>
+                    </View>
+                    <Text style={[
+                      styles.tradePnl,
+                      { color: trade.pnl >= 0 ? colors.dark.green : colors.dark.red },
+                    ]}>
+                      {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
+                    </Text>
+                    <Text style={styles.tradeTime}>
+                      {new Date(trade.closedAt).toLocaleDateString('fa-IR', { month: 'short', day: 'numeric' })}
+                    </Text>
+                  </View>
+                ))}
+                {filtered.length > 0 && (
+                  <Text style={styles.histWinRate}>
+                    نرخ برد این بازه: {filtered.length > 0 ? Math.round((wins / filtered.length) * 100).toLocaleString('fa-IR') : '۰'}٪
+                  </Text>
+                )}
+              </>
+            );
+          })()}
+
           <View style={styles.performanceGrid}>
             <View style={styles.performanceItem}>
               <Text style={styles.performanceLabel}>کل معاملات</Text>
@@ -979,34 +1088,6 @@ export default function TradeAiScreen() {
               </Text>
             </View>
           </View>
-
-          {portfolio.closedTrades.slice(-5).reverse().map((trade) => (
-            <View key={trade.id} style={styles.tradeRow}>
-              <View style={styles.tradeRowLeft}>
-                <View style={[
-                  styles.sideBadgeSmall,
-                  trade.side === 'long' ? styles.sideBadgeLong : styles.sideBadgeShort,
-                ]}>
-                  <Text style={[
-                    styles.sideBadgeSmallText,
-                    { color: trade.side === 'long' ? colors.dark.green : colors.dark.red },
-                  ]}>
-                    {trade.side === 'long' ? 'L' : 'S'}
-                  </Text>
-                </View>
-                <Text style={styles.tradeSymbol}>{trade.symbol.replace('USDT', '')}</Text>
-              </View>
-              <Text style={[
-                styles.tradePnl,
-                { color: trade.pnl >= 0 ? colors.dark.green : colors.dark.red },
-              ]}>
-                {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
-              </Text>
-              <Text style={styles.tradeTime}>
-                {new Date(trade.closedAt).toLocaleDateString('fa-IR', { month: 'short', day: 'numeric' })}
-              </Text>
-            </View>
-          ))}
         </View>
       )}
 
@@ -1021,12 +1102,15 @@ export default function TradeAiScreen() {
         <View style={styles.realTradeBtnLeft}>
           <Zap size={18} color="#fff" />
           <View>
-            <Text style={styles.realTradeBtnTitle}>ترید واقعی</Text>
+            <Text style={styles.realTradeBtnTitle}>رفتن به تب واقعی</Text>
             <Text style={styles.realTradeBtnSub}>معامله واقعی با API صرافی</Text>
           </View>
         </View>
         <ArrowRight size={18} color="#fff" />
       </Pressable>
+
+      {/* v1.5.1 — معامله‌گر خودکار داخل تب دمو (خودش حالت دمو/واقعی دارد) */}
+      <AutoTradingBotSection />
 
       <View style={styles.disclaimer}>
         <Text style={styles.disclaimerText}>
@@ -1182,6 +1266,104 @@ const styles = createThemedStyles(() => StyleSheet.create({
     backgroundColor: colors.dark.surface,
     borderRadius: 12,
     padding: 12,
+  },
+  /* v1.5.1 — استراتژی‌های روشن/خاموش */
+  strategyTogglesHint: {
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+    marginBottom: 8,
+    lineHeight: 15,
+    textAlign: 'right',
+  },
+  strategyToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: colors.dark.surface,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 6,
+  },
+  strategyToggleRowActive: {
+    borderColor: colors.dark.green + '55',
+    backgroundColor: colors.dark.green + '10',
+  },
+  strategyToggleTexts: {
+    flex: 1,
+  },
+  strategyToggleName: {
+    fontSize: 12,
+    fontWeight: '800' as const,
+    color: colors.dark.text,
+    marginBottom: 3,
+    textAlign: 'right',
+  },
+  strategyToggleDesc: {
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+    lineHeight: 14,
+    textAlign: 'right',
+  },
+  /* v1.5.1 — فیلتر روز تاریخچه معاملات */
+  histPeriodRow: {
+    flexDirection: 'row',
+    gap: 5,
+    marginBottom: 8,
+  },
+  histPeriodChip: {
+    flex: 1,
+    alignItems: 'center',
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: colors.dark.surface,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+  },
+  histPeriodChipActive: {
+    backgroundColor: colors.dark.accent,
+    borderColor: colors.dark.accent,
+  },
+  histPeriodText: {
+    fontSize: 9.5,
+    fontWeight: '700' as const,
+    color: colors.dark.textSecondary,
+  },
+  histPeriodTextActive: {
+    color: colors.dark.background,
+    fontWeight: '800' as const,
+  },
+  histFilterSummary: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: colors.dark.surface,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    marginBottom: 6,
+  },
+  histFilterSummaryText: {
+    fontSize: 10,
+    color: colors.dark.textSecondary,
+  },
+  histFilterSummaryPnl: {
+    fontSize: 11.5,
+    fontWeight: '800' as const,
+  },
+  histEmpty: {
+    fontSize: 10,
+    color: colors.dark.textMuted,
+    textAlign: 'center',
+    paddingVertical: 10,
+  },
+  histWinRate: {
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+    textAlign: 'right',
+    marginTop: 4,
+    marginBottom: 6,
   },
   strategyInfoRow: {
     flexDirection: 'row',

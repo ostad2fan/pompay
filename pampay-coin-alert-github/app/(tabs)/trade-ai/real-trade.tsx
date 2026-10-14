@@ -39,6 +39,7 @@ import {
   Trash2,
   Shield,
   BarChart3,
+  Layers,
 } from 'lucide-react-native';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -48,7 +49,14 @@ import colors from '@/constants/colors';
 import { createThemedStyles } from '@/utils/themeStyles';
 import { EXCHANGES, EXCHANGE_LIST } from '@/constants/exchanges';
 import { useApp } from '@/contexts/AppContext';
-import { AITradeSignal } from '@/types/tradeAi';
+import { AITradeSignal, TradingStrategy, STRATEGY_CONFIGS } from '@/types/tradeAi';
+import {
+  loadEnabledStrategies,
+  saveEnabledStrategies,
+  STRATEGY_ORDER,
+  DEFAULT_ENABLED_STRATEGIES,
+  EnabledStrategies,
+} from '@/utils/tradeAiService';
 import { ExchangeId } from '@/types/crypto';
 import {
   getPositions,
@@ -159,6 +167,10 @@ export default function RealTradeScreen() {
   const [autoLogs, setAutoLogs] = useState<AutoTradeLog[]>([]);
   const [showAutoLogs, setShowAutoLogs] = useState(false);
   const [showAutoSettings, setShowAutoSettings] = useState(false);
+  /** v1.5.1 — استراتژی‌های روشن/خاموش (مشترک با تب دمو) */
+  const [enabledStrategies, setEnabledStrategies] = useState<EnabledStrategies>(DEFAULT_ENABLED_STRATEGIES);
+  const enabledStrategiesRef = useRef(enabledStrategies);
+  enabledStrategiesRef.current = enabledStrategies;
 
   const [countdown, setCountdown] = useState(3);
   const countdownBarAnim = useRef(new Animated.Value(1)).current;
@@ -296,6 +308,30 @@ export default function RealTradeScreen() {
     () => signals.filter(s => s.action !== 'hold').slice(0, 20),
     [signals]
   );
+
+  // v1.5.1 — استراتژی‌های روشن/خاموش (همان لیست مشترک تب دمو)
+  const strategiesQuery = useQuery({
+    queryKey: ['trading-strategies'],
+    queryFn: loadEnabledStrategies,
+    staleTime: Infinity,
+  });
+  useEffect(() => {
+    if (strategiesQuery.data) setEnabledStrategies(strategiesQuery.data);
+  }, [strategiesQuery.data]);
+
+  const toggleStrategy = useCallback((key: TradingStrategy) => {
+    setEnabledStrategies((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      if (!STRATEGY_ORDER.some((s) => next[s])) {
+        Alert.alert('غیرممکن', 'حداقل یک استراتژی باید روشن باشد.');
+        return prev;
+      }
+      void saveEnabledStrategies(next).then(() => {
+        queryClient.invalidateQueries({ queryKey: ['trading-strategies'] });
+      });
+      return next;
+    });
+  }, [queryClient]);
 
   useEffect(() => {
     const loadPrevStates = async () => {
@@ -495,6 +531,8 @@ export default function RealTradeScreen() {
       for (const sig of signals) {
         if (sig.action === 'hold') continue;
         if (sig.confidence < autoConfig.minConfidence) continue;
+        // v1.5.1 — فقط سیگنال‌های استراتژی‌های روشن معامله می‌شوند
+        if (!enabledStrategiesRef.current[sig.strategy]) continue;
         const sigKey = `${sig.id}-${sig.action}`;
         if (processedSignalsRef.current.has(sigKey)) continue;
         if (!activeExchange.tradeAllSymbols && activeExchange.selectedSymbols.length > 0) {
@@ -981,6 +1019,41 @@ export default function RealTradeScreen() {
         </Pressable>
       </View>
 
+      {/* v1.5.1 — استراتژی‌های معاملاتی به‌صورت روشن/خاموش (مشترک با تب دمو) */}
+      <View style={styles.section}>
+        <View style={styles.sectionHeaderRow}>
+          <View style={styles.sectionHeaderLeft}>
+            <Layers size={16} color={colors.dark.accent} />
+            <Text style={styles.sectionTitle}>استراتژی‌های معاملاتی (روشن/خاموش)</Text>
+          </View>
+        </View>
+        <Text style={styles.strategiesHint}>
+          ربات فقط سیگنال‌های استراتژی‌های روشن را معامله می‌کند — همین لیست در تب «دمو» هم تنظیم می‌شود.
+        </Text>
+        {STRATEGY_ORDER.map((key) => {
+          const cfg = STRATEGY_CONFIGS[key];
+          const on = enabledStrategies[key];
+          return (
+            <View key={key} style={[styles.strategyToggleRow, on && styles.strategyToggleRowActive]}>
+              <View style={styles.strategyToggleTexts}>
+                <Text style={styles.strategyToggleName}>
+                  {cfg.name} ({cfg.nameEn})
+                </Text>
+                <Text style={styles.strategyToggleDesc} numberOfLines={2}>
+                  {cfg.description} • اهرم {cfg.maxLeverage}x • حد ضرر {cfg.stopLossPercent}٪
+                </Text>
+              </View>
+              <Switch
+                value={on}
+                onValueChange={() => toggleStrategy(key)}
+                trackColor={{ true: colors.dark.green + '88', false: colors.dark.surfaceLight }}
+                thumbColor={on ? colors.dark.green : colors.dark.textMuted}
+              />
+            </View>
+          );
+        })}
+      </View>
+
       {account && (
         <View style={styles.accountCard}>
           <View style={styles.accountRow}>
@@ -1046,24 +1119,65 @@ export default function RealTradeScreen() {
           <View style={styles.capitalManagementBox}>
             <View style={styles.capitalHeader}>
               <Shield size={14} color={colors.dark.accent} />
-              <Text style={styles.capitalTitle}>مدیریت سرمایه</Text>
+              <Text style={styles.capitalTitle}>مدیریت سرمایه (قابل تغییر دستی)</Text>
             </View>
             <View style={styles.capitalGrid}>
+              {/* v1.5.1 — جدول تنظیمات معامله: مقادیر مستقیماً قابل ویرایش */}
               <View style={styles.capitalItem}>
-                <Text style={styles.capitalLabel}>حفظ سرمایه</Text>
-                <Text style={styles.capitalValue}>{autoConfig.preserveCapitalPercent}%</Text>
+                <Text style={styles.capitalLabel}>حفظ سرمایه (٪)</Text>
+                <TextInput
+                  style={styles.capitalInput}
+                  value={String(autoConfig.preserveCapitalPercent)}
+                  onChangeText={(t) => {
+                    const val = parseInt(t.replace(/\D/g, '') || '50', 10) || 50;
+                    setAutoConfig((c) => ({ ...c, preserveCapitalPercent: Math.min(95, Math.max(50, val)) }));
+                  }}
+                  onEndEditing={() => saveAutoConfig(autoConfig)}
+                  keyboardType="number-pad"
+                  testID="capital-preserve-input"
+                />
               </View>
               <View style={styles.capitalItem}>
-                <Text style={styles.capitalLabel}>حداکثر ریسک</Text>
-                <Text style={styles.capitalValue}>{autoConfig.maxRiskPercent}%</Text>
+                <Text style={styles.capitalLabel}>حداکثر ریسک (٪)</Text>
+                <TextInput
+                  style={styles.capitalInput}
+                  value={String(autoConfig.maxRiskPercent)}
+                  onChangeText={(t) => {
+                    const val = parseFloat(t.replace(/[^\d.]/g, '') || '1') || 1;
+                    setAutoConfig((c) => ({ ...c, maxRiskPercent: Math.min(20, Math.max(1, val)) }));
+                  }}
+                  onEndEditing={() => saveAutoConfig(autoConfig)}
+                  keyboardType="decimal-pad"
+                  testID="capital-risk-input"
+                />
               </View>
               <View style={styles.capitalItem}>
-                <Text style={styles.capitalLabel}>حداقل اطمینان</Text>
-                <Text style={styles.capitalValue}>{autoConfig.minConfidence}%</Text>
+                <Text style={styles.capitalLabel}>حداقل اطمینان (٪)</Text>
+                <TextInput
+                  style={styles.capitalInput}
+                  value={String(autoConfig.minConfidence)}
+                  onChangeText={(t) => {
+                    const val = parseInt(t.replace(/\D/g, '') || '50', 10) || 50;
+                    setAutoConfig((c) => ({ ...c, minConfidence: Math.min(100, Math.max(50, val)) }));
+                  }}
+                  onEndEditing={() => saveAutoConfig(autoConfig)}
+                  keyboardType="number-pad"
+                  testID="capital-confidence-input"
+                />
               </View>
               <View style={styles.capitalItem}>
                 <Text style={styles.capitalLabel}>حداکثر پوزیشن</Text>
-                <Text style={styles.capitalValue}>{autoConfig.maxOpenPositions}</Text>
+                <TextInput
+                  style={styles.capitalInput}
+                  value={String(autoConfig.maxOpenPositions)}
+                  onChangeText={(t) => {
+                    const val = parseInt(t.replace(/\D/g, '') || '1', 10) || 1;
+                    setAutoConfig((c) => ({ ...c, maxOpenPositions: Math.min(10, Math.max(1, val)) }));
+                  }}
+                  onEndEditing={() => saveAutoConfig(autoConfig)}
+                  keyboardType="number-pad"
+                  testID="capital-positions-input"
+                />
               </View>
             </View>
           </View>
@@ -1101,55 +1215,13 @@ export default function RealTradeScreen() {
                 keyboardType="number-pad"
                 placeholderTextColor={colors.dark.textMuted}
               />
-              <Text style={styles.inputLabel}>حداقل درصد اطمینان برای ورود</Text>
-              <TextInput
-                style={styles.input}
-                value={String(autoConfig.minConfidence)}
-                onChangeText={(t) => {
-                  const val = parseInt(t, 10) || 50;
-                  saveAutoConfig({ ...autoConfig, minConfidence: Math.min(100, Math.max(50, val)) });
-                }}
-                keyboardType="number-pad"
-                placeholderTextColor={colors.dark.textMuted}
-              />
-              <Text style={styles.inputLabel}>حداکثر تعداد پوزیشن باز</Text>
-              <TextInput
-                style={styles.input}
-                value={String(autoConfig.maxOpenPositions)}
-                onChangeText={(t) => {
-                  const val = parseInt(t, 10) || 1;
-                  saveAutoConfig({ ...autoConfig, maxOpenPositions: Math.min(10, Math.max(1, val)) });
-                }}
-                keyboardType="number-pad"
-                placeholderTextColor={colors.dark.textMuted}
-              />
-              <Text style={styles.inputLabel}>حداکثر ریسک هر معامله (% از کل سرمایه)</Text>
-              <TextInput
-                style={styles.input}
-                value={String(autoConfig.maxRiskPercent)}
-                onChangeText={(t) => {
-                  const val = parseFloat(t) || 1;
-                  saveAutoConfig({ ...autoConfig, maxRiskPercent: Math.min(20, Math.max(1, val)) });
-                }}
-                keyboardType="decimal-pad"
-                placeholderTextColor={colors.dark.textMuted}
-              />
-              <Text style={styles.inputLabel}>حفظ سرمایه اولیه (% حداقل باقیمانده)</Text>
-              <TextInput
-                style={styles.input}
-                value={String(autoConfig.preserveCapitalPercent)}
-                onChangeText={(t) => {
-                  const val = parseInt(t, 10) || 50;
-                  saveAutoConfig({ ...autoConfig, preserveCapitalPercent: Math.min(95, Math.max(50, val)) });
-                }}
-                keyboardType="number-pad"
-                placeholderTextColor={colors.dark.textMuted}
-              />
+              {/* v1.5.1 — اطمینان/پوزیشن/ریسک/حفظ سرمایه: مستقیم در جدول «مدیریت سرمایه» بالا قابل تغییر هستند */}
 
               {activeExchange && (
                 <>
-                  {/* v1.5.0 — «منبع سیگنال این صرافی» حذف شد؛ منبع‌ها در تب
-                      «معامله خودکار» به‌صورت روشن/خاموش انتخاب می‌شوند. */}
+                  {/* v1.5.1 — «منبع سیگنال این صرافی» حذف شده؛ منبع‌های
+                      نهنگ/اندیکاتور در تب «دمو» (معامله‌گر خودکار) با کلید
+                      روشن/خاموش انتخاب می‌شوند. */}
                   <View style={styles.spacer} />
                   <View style={styles.switchRow}>
                     <Switch
@@ -1887,6 +1959,59 @@ const styles = createThemedStyles(() => StyleSheet.create({
     fontSize: 15,
     fontWeight: '800' as const,
     color: colors.dark.text,
+  },
+  /* v1.5.1 — جدول تنظیمات معامله: ورودی قابل ویرایش داخل جدول */
+  capitalInput: {
+    width: '100%',
+    backgroundColor: colors.dark.background,
+    borderWidth: 1,
+    borderColor: colors.dark.accent + '44',
+    borderRadius: 8,
+    color: colors.dark.text,
+    fontSize: 13,
+    fontWeight: '800' as const,
+    textAlign: 'center',
+    paddingVertical: 5,
+    paddingHorizontal: 4,
+  },
+  /* v1.5.1 — استراتژی‌های روشن/خاموش */
+  strategiesHint: {
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+    marginBottom: 8,
+    lineHeight: 15,
+    textAlign: 'right',
+  },
+  strategyToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: colors.dark.surface,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 6,
+  },
+  strategyToggleRowActive: {
+    borderColor: colors.dark.green + '55',
+    backgroundColor: colors.dark.green + '10',
+  },
+  strategyToggleTexts: {
+    flex: 1,
+  },
+  strategyToggleName: {
+    fontSize: 12,
+    fontWeight: '800' as const,
+    color: colors.dark.text,
+    marginBottom: 3,
+    textAlign: 'right',
+  },
+  strategyToggleDesc: {
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+    lineHeight: 14,
+    textAlign: 'right',
   },
   settingsToggle: {
     flexDirection: 'row',
