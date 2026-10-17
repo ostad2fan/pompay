@@ -31,14 +31,12 @@ import {
   Award,
   X,
   RefreshCw,
-  ArrowRight,
   Activity,
   Timer,
   Bot,
   Hand,
   Layers,
 } from 'lucide-react-native';
-import { useRouter } from 'expo-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import colors from '@/constants/colors';
@@ -69,7 +67,6 @@ import { fetchFuturesTickers } from '@/utils/binanceApi';
 import { sendTelegramAISignal, sendTelegramTradeNotification } from '@/utils/telegramService';
 import DropdownPicker from '@/components/DropdownPicker';
 import TradeAiSegmentHeader from '@/components/TradeAiSegmentHeader';
-import AutoTradingBotSection from '@/components/AutoTradingBotSection';
 
 const DEMO_KEY = '@trade_ai_demo';
 const SIGNALS_HISTORY_KEY = '@trade_ai_signals';
@@ -94,7 +91,6 @@ const POPULAR_SYMBOLS = [
 
 export default function TradeAiScreen() {
   const queryClient = useQueryClient();
-  const router = useRouter();
   const { settings } = useApp();
   const [enabledStrategies, setEnabledStrategies] = useState<EnabledStrategies>(DEFAULT_ENABLED_STRATEGIES);
   const [histPeriod, setHistPeriod] = useState<HistPeriod>('all');
@@ -457,13 +453,16 @@ export default function TradeAiScreen() {
     : 0;
 
   return (
+    <View style={styles.container}>
+      {/* v1.5.2 — هدر تب‌ها ثابت بالای صفحه (بیرون از اسکرول) */}
+      <View style={styles.segmentWrap}>
+        <TradeAiSegmentHeader active="demo" />
+      </View>
     <ScrollView
-      style={styles.container}
+      style={styles.scrollView}
       contentContainerStyle={styles.content}
       showsVerticalScrollIndicator={false}
     >
-      {/* v1.5.0 — سه سربخش: تحلیل AI / ترید واقعی / معامله خودکار */}
-      <TradeAiSegmentHeader active="demo" />
 
       <View style={styles.refreshTimerBar}>
         <View style={styles.refreshTimerLeft}>
@@ -1091,26 +1090,8 @@ export default function TradeAiScreen() {
         </View>
       )}
 
-      <Pressable
-        style={({ pressed }) => [
-          styles.realTradeBtn,
-          pressed && { opacity: 0.85 },
-        ]}
-        onPress={() => router.push('/trade-ai/real-trade')}
-        testID="go-real-trade"
-      >
-        <View style={styles.realTradeBtnLeft}>
-          <Zap size={18} color="#fff" />
-          <View>
-            <Text style={styles.realTradeBtnTitle}>رفتن به تب واقعی</Text>
-            <Text style={styles.realTradeBtnSub}>معامله واقعی با API صرافی</Text>
-          </View>
-        </View>
-        <ArrowRight size={18} color="#fff" />
-      </Pressable>
-
-      {/* v1.5.1 — معامله‌گر خودکار داخل تب دمو (خودش حالت دمو/واقعی دارد) */}
-      <AutoTradingBotSection />
+      {/* v1.5.2 — دکمه «رفتن به تب واقعی» حذف شد (طبق درخواست کاربر)؛
+          معامله‌گر خودکار هم به تب خودش («بک‌تست») رفت. */}
 
       <View style={styles.disclaimer}>
         <Text style={styles.disclaimerText}>
@@ -1118,6 +1099,7 @@ export default function TradeAiScreen() {
         </Text>
       </View>
     </ScrollView>
+    </View>
   );
 }
 
@@ -1126,9 +1108,18 @@ const styles = createThemedStyles(() => StyleSheet.create({
     flex: 1,
     backgroundColor: colors.dark.background,
   },
+  segmentWrap: {
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 2,
+    backgroundColor: colors.dark.background,
+  },
+  scrollView: {
+    flex: 1,
+  },
   content: {
     paddingHorizontal: 16,
-    paddingTop: 12,
+    paddingTop: 8,
     paddingBottom: 40,
   },
   heroCard: {
@@ -1812,30 +1803,6 @@ const styles = createThemedStyles(() => StyleSheet.create({
   tradeTime: {
     fontSize: 10,
     color: colors.dark.textMuted,
-  },
-  realTradeBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: colors.dark.green,
-    borderRadius: 16,
-    padding: 16,
-    marginBottom: 16,
-  },
-  realTradeBtnLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  realTradeBtnTitle: {
-    fontSize: 15,
-    fontWeight: '700' as const,
-    color: '#fff',
-  },
-  realTradeBtnSub: {
-    fontSize: 11,
-    color: 'rgba(255,255,255,0.75)',
-    marginTop: 2,
   },
   disclaimer: {
     backgroundColor: colors.dark.orangeDim,

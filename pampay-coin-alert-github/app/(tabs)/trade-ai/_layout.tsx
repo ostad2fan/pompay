@@ -19,6 +19,13 @@ export default function TradeAiLayout() {
         }}
       />
       <Stack.Screen
+        name="auto-trade"
+        options={{
+          title: 'ترید با AI — بک‌تست',
+          headerTitleAlign: 'center',
+        }}
+      />
+      <Stack.Screen
         name="real-trade"
         options={{
           title: 'ترید با AI — واقعی',

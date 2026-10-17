@@ -39,10 +39,12 @@ import {
   getPositions,
   openRealPosition,
   updateStopLoss,
+  updateTakeProfit,
 } from './binanceFuturesTrading';
 import { getUserIndicators, scanCustomIndicators } from './customIndicatorsService';
 import { getStoredHookSignals } from './hookReversalService';
 import { getStoredGainzAlgoSignals } from './gainzAlgoService';
+import { getServerUrl, getInstallSecret } from './scanServerApi';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -115,12 +117,16 @@ export interface AutoTradeSettings {
   maxLossPercent: number;
   /** ریوارد R:R — تیک‌پرافیت = فاصله استاپ × این عدد */
   rewardRatio: number;
-  /** حداکثر پوزیشن باز همزمان */
+  /** حداکثر پوزیشن باز همزمان (v1.5.2 — تا ۱۰۰؛ طبق درخواست کاربر بیشتر از ۱۰) */
   maxOpenPositions: number;
   /** v1.5.0 — trailing stop (system-managed, on by default). */
   trailing: AutoTrailingSettings;
   /** v1.5.0 — AI capital management (on by default). */
   aiCapital: AutoAiCapitalSettings;
+  /** v1.5.2 — سرمایه اولیه برای محاسبه PnL/ROI (مثل خروجی فیوچرز بایننس). */
+  initialCapitalUsd: number;
+  /** v1.5.2 — اعلام تلگرام ۲۴/۷ از سرور (حتی وقتی برنامه بسته است). */
+  server247: { enabled: boolean };
 }
 
 /** v1.5.0 — indicator option row for the auto-trader picker UI. */
@@ -271,6 +277,9 @@ export const DEFAULT_AUTO_SETTINGS: AutoTradeSettings = {
   // فعال کنه تا معامله سودده با ضرر بسته نشود»:
   trailing: { enabled: true, activationRatio: 0.5, trailRatio: 0.5 },
   aiCapital: { enabled: true, dailyLossLimitPercent: 3 },
+  // v1.5.2 — سرمایه اولیه برای PnL/ROI (مثل فیوچرز بایننس) + تلگرام ۲۴/۷
+  initialCapitalUsd: 1000,
+  server247: { enabled: true },
 };
 
 export async function loadAutoSettings(): Promise<AutoTradeSettings> {
@@ -292,6 +301,8 @@ export async function loadAutoSettings(): Promise<AutoTradeSettings> {
       indicators: { enabled: parsed.indicators?.enabled ?? false, selections: sel },
       trailing: { ...DEFAULT_AUTO_SETTINGS.trailing, ...parsed.trailing },
       aiCapital: { ...DEFAULT_AUTO_SETTINGS.aiCapital, ...parsed.aiCapital },
+      initialCapitalUsd: typeof parsed.initialCapitalUsd === 'number' && parsed.initialCapitalUsd > 0 ? parsed.initialCapitalUsd : DEFAULT_AUTO_SETTINGS.initialCapitalUsd,
+      server247: { ...DEFAULT_AUTO_SETTINGS.server247, ...parsed.server247 },
     };
   } catch {
     return DEFAULT_AUTO_SETTINGS;
@@ -362,8 +373,8 @@ async function notifyAutoTrade(title: string, body: string): Promise<void> {
 
 let binanceTickerCache: { at: number; map: Record<string, number> } | null = null;
 
-async function getBinancePrices(): Promise<Record<string, number>> {
-  if (binanceTickerCache && Date.now() - binanceTickerCache.at < 30_000) {
+async function getBinancePrices(maxAgeMs = 30_000): Promise<Record<string, number>> {
+  if (binanceTickerCache && Date.now() - binanceTickerCache.at < maxAgeMs) {
     return binanceTickerCache.map;
   }
   const map: Record<string, number> = {};
@@ -1197,6 +1208,12 @@ async function runGlobalCycle(): Promise<void> {
   try {
     const settings = await loadAutoSettings();
     if (!settings.enabled) return;
+    // v1.5.2 — سرور ۲۴/۷ فعال است؟ چرخه معاملاتی روی سرور اجرا می‌شود
+    // (اعلام تلگرام با برنامه بسته)؛ اینجا فقط state را sync می‌کنیم.
+    if (settings.server247.enabled && (await isServerModeActive())) {
+      await syncAutoTradeStateFromServer();
+      return;
+    }
     const realKeys = settings.mode === 'real' ? await loadRealKeys() : undefined;
     const res = await runAutoCycle({ settings, realKeys });
     for (const e of res.errors.slice(0, 2)) await appendLog('error', e);
@@ -1293,4 +1310,217 @@ export async function manualClosePosition(
     }
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.2 — ویرایش دستی TP/SL هر پوزیشن باز («بشه هر معامله را تی‌پی و استاپش
+// را دستی هم تغییر داد») + درصد سود/زیان هر پوزیشن در UI
+// ---------------------------------------------------------------------------
+
+export async function updatePositionTpsl(
+  settings: AutoTradeSettings,
+  keys: RealKeys | undefined,
+  pos: { id: string; symbol: string; side: 'long' | 'short'; qty: number; stopPrice: number; takePrice: number },
+  newStop: number,
+  newTake: number
+): Promise<boolean> {
+  if (!(newStop > 0) || !(newTake > 0) || !Number.isFinite(newStop) || !Number.isFinite(newTake)) {
+    return false;
+  }
+  const long = pos.side === 'long';
+  // جهت منطقی: برای لانگ استاپ پایین‌تر از تیک‌پرافیت (و برعکس برای شورت)
+  if (long && newStop >= newTake) return false;
+  if (!long && newStop <= newTake) return false;
+
+  if (settings.mode === 'demo') {
+    const positions = await loadDemoPositions();
+    const idx = positions.findIndex((p) => p.id === pos.id && p.status === 'open');
+    if (idx < 0) return false;
+    positions[idx].stopPrice = newStop;
+    positions[idx].takePrice = newTake;
+    await saveDemoPositions(positions);
+    await appendLog('info', `ویرایش دستی TP/SL ${pos.symbol}: SL ${newStop.toFixed(4)} / TP ${newTake.toFixed(4)}`);
+    return true;
+  }
+
+  if (keys) {
+    try {
+      await updateStopLoss(keys.apiKey, keys.apiSecret, `${pos.symbol}USDT`, pos.side, pos.qty, newStop);
+      await updateTakeProfit(keys.apiKey, keys.apiSecret, `${pos.symbol}USDT`, pos.side, pos.qty, newTake);
+      const tracked = await loadRealPositions();
+      const idx = tracked.findIndex((p) => p.id === pos.id && p.status === 'open');
+      if (idx >= 0) {
+        tracked[idx].stopPrice = newStop;
+        tracked[idx].takePrice = newTake;
+        await saveRealPositions(tracked);
+      }
+      await appendLog('info', `ویرایش دستی TP/SL واقعی ${pos.symbol}: SL ${newStop.toFixed(4)} / TP ${newTake.toFixed(4)}`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/** درصد PnL لحظه‌ای یک پوزیشن نسبت به مارجین (حجم دلاری × لوریج) — برای UI. */
+export function positionPnlPercent(
+  p: { side: 'long' | 'short'; entryPrice: number; lastPrice: number; qty: number; sizeUsd?: number; leverage?: number },
+  marginUsd?: number
+): number {
+  const dir = p.side === 'long' ? 1 : -1;
+  const pnl = (p.lastPrice - p.entryPrice) * dir * p.qty;
+  const margin = marginUsd && marginUsd > 0 ? marginUsd : p.sizeUsd && p.sizeUsd > 0 ? p.sizeUsd : (p.leverage ?? 1) > 0 ? (p.qty * p.entryPrice) / (p.leverage ?? 1) : 0;
+  if (!(margin > 0)) return 0;
+  return (pnl / margin) * 100;
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.2 — رفرش سبک هر ۳ ثانیه («پوزیشن‌های ربات بک‌تست هر ۳ ثانیه رفرش
+// بشن»): قیمت تازه + MTM + SL/TP + تریل — بدون اسکن سیگنال/نهنگ.
+// ---------------------------------------------------------------------------
+
+let lightMtmRunning = false;
+
+export async function runLightMtm(): Promise<void> {
+  if (lightMtmRunning) return;
+  lightMtmRunning = true;
+  try {
+    const settings = await loadAutoSettings();
+    if (!settings.enabled) return;
+    // حالت سرور ۲۴/۷: فقط state سرور را sync می‌کنیم (سرور خودش چرخه می‌زند)
+    if (settings.server247.enabled && (await isServerModeActive())) {
+      await syncAutoTradeStateFromServer();
+      return;
+    }
+    // قیمت با کش ۲.۵ ثانیه‌ای تا PnL نمایش واقعاً هر ۳ ثانیه تازه شود
+    const prices = await getBinancePrices(2_500).catch(() => ({}) as Record<string, number>);
+    try {
+      await markDemoPositions(prices, settings);
+    } catch {}
+    if (settings.mode === 'real') {
+      const keys = await loadRealKeys();
+      if (keys) {
+        try {
+          await manageRealPositions(settings, keys);
+        } catch {}
+      }
+    }
+  } catch {
+    // never die
+  } finally {
+    lightMtmRunning = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.2 — SERVER 24/7 («سیگنال‌های دمو یا واقعی بک‌تست در تلگرامم بیاد؛
+// حتماً برنامه بسته باشه این فعالیت‌هاش در تل اعلام بشه»):
+//   • pushAutoTradeConfigToServer — تنظیمات ربات (+ کلید بایننس در حالت
+//     واقعی) به سرور Railway می‌رود تا ربات روی سرور ۲۴/۷ اجرا شود.
+//   • syncAutoTradeStateFromServer — پوزیشن‌ها/لاگ‌ها از سرور برمی‌گردند و
+//     در همان کلیدهای محلی ذخیره می‌شوند (UI بدون تغییر کار می‌کند).
+// ---------------------------------------------------------------------------
+
+const SERVER_OK_KEY = '@auto_trade_server_ok_v1';
+
+async function isServerModeActive(): Promise<boolean> {
+  try {
+    return (await AsyncStorage.getItem(SERVER_OK_KEY)) === '1';
+  } catch {
+    return false;
+  }
+}
+
+async function setServerModeActive(on: boolean): Promise<void> {
+  try {
+    await AsyncStorage.setItem(SERVER_OK_KEY, on ? '1' : '0');
+  } catch {}
+}
+
+export async function isAutoServerModeActive(): Promise<boolean> {
+  return isServerModeActive();
+}
+
+export interface ServerAutoTradeState {
+  ok: boolean;
+  enabled: boolean;
+  mode: AutoMode;
+  demoPositions: DemoAutoPosition[];
+  realPositions: RealAutoPosition[];
+  logs: AutoEngineLog[];
+  lastCycleAt: number | null;
+  serverNow: number;
+}
+
+export async function pushAutoTradeConfigToServer(
+  settings: AutoTradeSettings
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const base = await getServerUrl();
+    if (!base) return { ok: false, error: 'آدرس سرور تنظیم نشده' };
+    const secret = await getInstallSecret();
+    const serverEnabled = settings.enabled && settings.server247.enabled;
+    const keys = settings.mode === 'real' && serverEnabled ? await loadRealKeys() : undefined;
+    if (settings.mode === 'real' && serverEnabled && !keys) {
+      return { ok: false, error: 'کلید API بایننس برای حالت واقعی پیدا نشد' };
+    }
+    const payload = {
+      secret,
+      config: {
+        // سرور فقط وقتی اجرا می‌شود که هم سوییچ ۲۴/۷ روشن باشد و هم خود ربات
+        enabled: settings.enabled && settings.server247.enabled,
+        mode: settings.mode,
+        whale: settings.whale,
+        indicators: settings.indicators,
+        leverage: settings.leverage,
+        positionSizeUsd: settings.positionSizeUsd,
+        maxLossPercent: settings.maxLossPercent,
+        rewardRatio: settings.rewardRatio,
+        maxOpenPositions: settings.maxOpenPositions,
+        trailing: settings.trailing,
+        aiCapital: settings.aiCapital,
+        initialCapitalUsd: settings.initialCapitalUsd,
+        binanceKeys: keys ? { apiKey: keys.apiKey, apiSecret: keys.apiSecret } : undefined,
+      },
+    };
+    const res = await fetch(`${base}/autotrade/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+    if (res.ok && data?.ok) {
+      await setServerModeActive(serverEnabled);
+      return { ok: true };
+    }
+    await setServerModeActive(false);
+    return { ok: false, error: data?.error ?? `HTTP ${res.status}` };
+  } catch (e) {
+    await setServerModeActive(false);
+    return { ok: false, error: e instanceof Error ? e.message : 'خطای شبکه' };
+  }
+}
+
+export async function syncAutoTradeStateFromServer(): Promise<boolean> {
+  try {
+    const settings = await loadAutoSettings();
+    if (!settings.server247.enabled) return false;
+    const base = await getServerUrl();
+    if (!base) return false;
+    const secret = await getInstallSecret();
+    const res = await fetch(`${base}/autotrade/state?secret=${encodeURIComponent(secret)}`);
+    if (!res.ok) return false;
+    const data = (await res.json()) as ServerAutoTradeState;
+    if (!data?.ok) return false;
+    if (Array.isArray(data.demoPositions)) await saveDemoPositions(data.demoPositions);
+    if (Array.isArray(data.realPositions)) await saveRealPositions(data.realPositions);
+    if (Array.isArray(data.logs)) {
+      await AsyncStorage.setItem(LOG_KEY, JSON.stringify(data.logs.slice(0, 60)));
+    }
+    if (typeof data.lastCycleAt === 'number') lastGlobalCycleAt = data.lastCycleAt;
+    return true;
+  } catch {
+    return false;
+  }
 }

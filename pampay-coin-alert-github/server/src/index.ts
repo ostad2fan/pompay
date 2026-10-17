@@ -27,6 +27,7 @@ import { runFastScanCycle, pumpDumpResponse } from "./fastScan";
 import { registerPushToken, unregisterPushToken, pushStatus } from "./push";
 import { sendTelegram, getLastTelegramError } from "./telegram";
 import { runWhaleWatch } from "./whaleWatch";
+import { startBacktestEngine, handleAutoTradeConfig, getAutoTradeStateFor } from "./backtestEngine";
 import {
   startBotCommandPoller,
   getPendingForApp,
@@ -195,6 +196,23 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // ---- v1.5.2: 24/7 backtest bot (Telegram announcements even app-closed) ----
+    if (req.method === "POST" && url.pathname === "/autotrade/config") {
+      const raw = await readBody(req);
+      try {
+        const body = JSON.parse(raw || "{}") as Record<string, unknown>;
+        const result = await handleAutoTradeConfig(body);
+        return json(res, result.status, result.payload);
+      } catch {
+        return json(res, 400, { ok: false, error: "invalid json" });
+      }
+    }
+    if (req.method === "GET" && url.pathname === "/autotrade/state") {
+      const secret = String(url.searchParams.get("secret") ?? "");
+      const result = await getAutoTradeStateFor(secret);
+      return json(res, result.status, result.payload);
+    }
+
     // ---- push notifications ----
     if (req.method === "POST" && url.pathname === "/push/register") {
       const raw = await readBody(req);
@@ -331,6 +349,13 @@ server.listen(PORT, () => {
     startBotCommandPoller();
   } catch (e) {
     console.log("[Server] bot command poller failed to start (non-fatal):", e);
+  }
+  // v1.5.2 — 24/7 backtest bot engine (Telegram announcements for demo+real
+  // backtest signals even with the app fully closed)
+  try {
+    startBacktestEngine();
+  } catch (e) {
+    console.log("[Server] backtest engine failed to start (non-fatal):", e);
   }
   // v1.4.17 — CONFIG SELF-HEAL: Railway restarts wipe the ephemeral
   // filesystem, which used to destroy the stored bot-token config →

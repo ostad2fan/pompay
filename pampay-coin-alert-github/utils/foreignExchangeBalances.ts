@@ -953,66 +953,93 @@ async function fetchPhemex(w: ForeignWallet): Promise<ForeignBalance[]> {
 }
 
 // ---------------------------------------------------------------------------
-// LBank v2 — POST form with md5(sorted params + secret)
+// LBank v2 — v1.5.2 FIX: LBank completed an API upgrade (official notice
+// https://www.lbank.com/support/articles/21533217989145):
+//   ۱) دامنه قدیمی api.lbank.info غیرفعال شد → دامنه جدید api.lbkex.com
+//      (端 قدیمی 404 برمی‌گرداند — «صرافی البانک ارور 404 می‌دهد»).
+//   ۲) امضای خصوصی عوض شد: MD5(sort(params)) با حروف بزرگ → سپس
+//      HmacSHA256(md5Upper, secret) → پارامتر sign؛ به‌علاوه پارامترهای
+//      echostr + signature_method + timestamp هم در فرم و هم در header لازم‌اند.
+//   ۳) پاسخ جدید /v2/supplement/user_info.do:
+//      {result:"true", data:[{coin, assetAmt, freezeAmt, usableAmt, ...}]}
 // ---------------------------------------------------------------------------
 
+function lbankEchostr(): string {
+  // 38-char alnum echo (server expects 30–40 chars)
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let s = '';
+  for (let i = 0; i < 38; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
 async function fetchLbank(w: ForeignWallet): Promise<ForeignBalance[]> {
+  const timestamp = Date.now().toString();
+  const echostr = lbankEchostr();
+  const signatureMethod = 'HmacSHA256';
   const params: Record<string, string> = {
     api_key: w.apiKey,
-    timestamp: Date.now().toString(),
-    type: 'all',
+    echostr,
+    signature_method: signatureMethod,
+    timestamp,
   };
-  const sorted = Object.keys(params)
+  // raw string = sorted key=value joined by & (NO url-encoding, per ccxt rawencode)
+  const raw = Object.keys(params)
     .sort()
     .map((k) => `${k}=${params[k]}`)
     .join('&');
-  const sign = md5Hex(`${sorted}${w.apiSecret}`);
-  const formBody = Object.keys(params)
-    .map((k) => `${k}=${encodeURIComponent(params[k])}`)
-    .join('&') + `&sign=${sign}`;
-  const res = await rawFetch(
-    'https://api.lbank.info/v2/supplement/user_info/account_balance.do',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: formBody,
-    }
-  );
+  const md5Upper = md5Hex(raw).toUpperCase();
+  const sign = CryptoJS.HmacSHA256(md5Upper, w.apiSecret).toString(CryptoJS.enc.Hex);
+  const all: Record<string, string> = { ...params, sign };
+  const formBody = Object.keys(all)
+    .sort()
+    .map((k) => `${k}=${encodeURIComponent(all[k])}`)
+    .join('&');
+  const res = await rawFetch('https://api.lbkex.com/v2/supplement/user_info.do', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      timestamp,
+      signature_method: signatureMethod,
+      echostr,
+    },
+    body: formBody,
+  });
   const body = parseJson(res.text);
   if (!body) {
-    throw new Error(
-      `پاسخ نامعتبر از LBank (HTTP ${res.status}) — اگر خطا ادامه داشت اطلاع دهید`
-    );
+    // دامنه قدیمی (api.lbank.info) برای این مسیر ۴۰۴ می‌دهد؛ اگر دامنه جدید هم
+    // پاسخ JSON نداد، روی دامنه قبلی retry نمی‌کنیم چون حذف شده است.
+    throw new Error(`پاسخ نامعتبر از LBank (HTTP ${res.status}) — اگر خطا ادامه داشت اطلاع دهید`);
   }
-  const data = (body.datas ?? {}) as Record<string, unknown>;
-  if (String(body.result) === 'true' && data) {
+  if (String(body.result) === 'true') {
     const out: ForeignBalance[] = [];
-    // v2 shape: datas.assetList → [{assetCode, availableAmount, frozenAmount}]
-    const assetList = asArray(data.assetList);
+    // v2 shape: data: [{coin, assetAmt, freezeAmt, usableAmt, ...}]
+    const dataArr = Array.isArray(body.data) ? (body.data as Array<Record<string, unknown>>) : [];
+    if (dataArr.length > 0) {
+      for (const a of dataArr) {
+        const total = toNum(a.assetAmt);
+        const frozen = toNum(a.freezeAmt ?? a.frozenAmount);
+        const usable = toNum(a.usableAmt);
+        const avail = usable > 0 ? usable : Math.max(0, total - frozen);
+        pushBalance(out, String(a.coin ?? a.assetCode ?? ''), avail, Math.min(frozen, Math.max(0, total - avail)));
+      }
+      return out;
+    }
+    // legacy fallback shapes (kept for safety): datas.assetList / datas map
+    const datas = (body.datas ?? {}) as Record<string, unknown>;
+    const assetList = asArray(datas.assetList);
     if (assetList.length > 0) {
       for (const a of assetList as Array<{
         assetCode?: string;
         availableAmount?: string;
         frozenAmount?: string;
       }>) {
-        pushBalance(
-          out,
-          String(a.assetCode ?? ''),
-          toNum(a.availableAmount),
-          toNum(a.frozenAmount)
-        );
+        pushBalance(out, String(a.assetCode ?? ''), toNum(a.availableAmount), toNum(a.frozenAmount));
       }
     } else {
-      // fallback: datas as map {BTC: {available, freeze}, ...}
-      for (const [coin, v] of Object.entries(data)) {
+      for (const [coin, v] of Object.entries(datas)) {
         const row = (v ?? {}) as Record<string, unknown>;
         if (row && typeof row === 'object') {
-          pushBalance(
-            out,
-            coin,
-            toNum(row.available),
-            toNum(row.freeze ?? row.frozen)
-          );
+          pushBalance(out, coin, toNum(row.available), toNum(row.freeze ?? row.frozen));
         }
       }
     }
@@ -1021,8 +1048,8 @@ async function fetchLbank(w: ForeignWallet): Promise<ForeignBalance[]> {
   const code = String(body.error_code ?? '');
   const msg = String(body.msg ?? '');
   throw new Error(
-    code === '1001' || /key/i.test(msg)
-      ? `کلید LBank معتبر نیست (کد ${code}: ${msg})`
+    code === '10005' || /key/i.test(msg)
+      ? `کلید LBank معتبر نیست یا با API جدید هماهنگ نشده (کد ${code}: ${msg})`
       : `خطای LBank (کد ${code}): ${msg}`
   );
 }

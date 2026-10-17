@@ -1,20 +1,22 @@
 /**
- * TradeAiSegmentHeader.tsx — v1.5.1
+ * TradeAiSegmentHeader.tsx — v1.5.2
  *
- * «ترید با AI» has exactly TWO main tabs (user demand):
- *   ۱) دمو — تحلیل هوش مصنوعی (همان بخش قبلی) + معامله‌گر خودکار
- *   ۲) واقعی — ترید واقعی (بخش کامل خودش)
+ * «ترید با AI» has THREE main tabs (user demand):
+ *   ۱) دمو — تحلیل هوش مصنوعی (همان بخش قبلی)
+ *   ۲) بک‌تست — معامله‌گر خودکار (ربات)؛ اسمش طبق درخواست کاربر «بک‌تست» شد
+ *   ۳) واقعی — ترید واقعی (بخش کامل خودش)
  *
- * Shared tab switcher rendered at the top of both screens.
+ * v1.5.2: هدر ثابت بالای صفحه (بیرون از ScrollView) — تب‌ها سر جایشان
+ * می‌مانند و با اسکرول بالا/پایین نمی‌روند.
  */
 
 import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useRouter } from 'expo-router';
-import { FlaskConical, Wallet2 } from 'lucide-react-native';
+import { FlaskConical, Bot, Wallet2 } from 'lucide-react-native';
 import colors from '@/constants/colors';
 
-export type TradeAiSegment = 'demo' | 'real';
+export type TradeAiSegment = 'demo' | 'backtest' | 'real';
 
 const SEGMENTS: {
   key: TradeAiSegment;
@@ -24,9 +26,15 @@ const SEGMENTS: {
 }[] = [
   {
     key: 'demo',
-    label: 'دمو (تحلیل AI + معامله خودکار)',
+    label: 'دمو (تحلیل AI)',
     route: '/trade-ai',
     icon: (s, c) => <FlaskConical size={s} color={c} />,
+  },
+  {
+    key: 'backtest',
+    label: 'بک‌تست (ربات)',
+    route: '/trade-ai/auto-trade',
+    icon: (s, c) => <Bot size={s} color={c} />,
   },
   {
     key: 'real',
@@ -52,7 +60,7 @@ export default function TradeAiSegmentHeader({ active }: { active: TradeAiSegmen
             }}
             testID={`trade-ai-segment-${seg.key}`}
           >
-            {seg.icon(on ? 14 : 14, on ? colors.dark.background : colors.dark.textSecondary)}
+            {seg.icon(14, on ? colors.dark.background : colors.dark.textSecondary)}
             <Text style={[styles.btnText, on && styles.btnTextActive]} numberOfLines={1}>
               {seg.label}
             </Text>
@@ -71,7 +79,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.dark.border,
     padding: 3,
-    marginBottom: 12,
+    paddingHorizontal: 6,
     gap: 3,
   },
   btn: {

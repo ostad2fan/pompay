@@ -1,7 +1,7 @@
 /**
- * AutoTradingBotSection.tsx — v1.5.1
+ * AutoTradingBotSection.tsx — v1.5.2
  *
- * «معامله‌گر خودکار» UI — کپی پوزیشن‌های نهنگ + سیگنال اندیکاتورها را
+ * «معامله‌گر خودکار» (بک‌تست) UI — کپی پوزیشن‌های نهنگ + سیگنال اندیکاتورها را
  * اتوماتیک (دمو یا واقعی) معامله می‌کند با تنظیمات کاربر: لوریج، حجم،
  * حداکثر ضرر (→ استاپ‌لاس اتوماتیک) و ریوارد R:R (→ تیک‌پرافیت اتوماتیک).
  *
@@ -15,12 +15,20 @@
  *  • رفرش پوزیشن‌های ربات = اجرای کامل یک چرخه (قیمت تازه + SL/TP + تریل).
  *
  * v1.5.1:
- *  • بخش داخل تب «دمو» ترید با AI (دو تب اصلی: دمو / واقعی).
  *  • نمایش سخت‌گیرانه: در هر حالت فقط ریز معاملات همان حالت نشان داده
  *    می‌شود (در واقعی، جزئیات دمو پنهان است) + بستن دستی پوزیشن باز.
  *  • خروجی عکس PnL: اول عکس ساخته و «پیش‌نمایش» داده می‌شود؛ بعد از دیدن،
  *    ذخیره در گالری یا اشتراک‌گذاری انتخاب می‌شود.
  *  • تاریخچه معاملات با فیلتر روز (امروز/۷/۳۰/همه) + جمع PnL همان بازه.
+ *
+ * v1.5.2:
+ *  • داخل تب «بک‌تست» (دمو | بک‌تست | واقعی).
+ *  • رفرش پوزیشن‌ها هر ۳ ثانیه (چرخه سبک MTM + تریل — بدون اسکن سیگنال).
+ *  • هر پوزیشن باز: درصد سود/زیان + ویرایش دستی TP/SL از روی خود پوزیشن.
+ *  • حداکثر پوزیشن تا ۱۰۰ (قبلاً سقف ۱۰ بود).
+ *  • سرمایه اولیه برای PnL/ROI — خروجی دقیقاً مثل فیوچرز بایننس (دلاری + درصد).
+ *  • عکس PnL: لوگوی برنامه در بک‌گراند + سود/زیان به درصد و دلاری.
+ *  • اعلام تلگرام ۲۴/۷ از سرور (حتی وقتی برنامه بسته است) — دمو و واقعی.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -56,6 +64,8 @@ import {
   Share2,
   Save,
   ShieldCheck,
+  Edit3,
+  Send,
 } from 'lucide-react-native';
 import { captureRef } from 'react-native-view-shot';
 import * as Sharing from 'expo-sharing';
@@ -84,11 +94,30 @@ import {
   loadRealKeys,
   loadRealPositions,
   manualClosePosition,
+  positionPnlPercent,
+  pushAutoTradeConfigToServer,
   runGlobalCycleNow,
+  runLightMtm,
   saveAutoSettings,
+  updatePositionTpsl,
 } from '@/utils/autoTradingEngine';
 
-const UI_REFRESH_MS = 5_000;
+const APP_LOGO = require('@/assets/images/icon.png');
+
+/** v1.5.2 — رفرش پوزیشن‌های ربات هر ۳ ثانیه (طبق درخواست کاربر). */
+const UI_REFRESH_MS = 3_000;
+
+/** پوزیشن در حال ویرایش TP/SL (دمو یا واقعی). */
+interface EditTpslTarget {
+  kind: 'demo' | 'real';
+  id: string;
+  symbol: string;
+  side: 'long' | 'short';
+  qty: number;
+  stopPrice: number;
+  takePrice: number;
+  lastPrice: number;
+}
 
 export default function AutoTradingBotSection({ realKeys: realKeysProp }: { realKeys?: RealKeys }) {
   const [settings, setSettings] = useState<AutoTradeSettings>(DEFAULT_AUTO_SETTINGS);
@@ -109,6 +138,16 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [previewUri, setPreviewUri] = useState<string | null>(null);
   /** v1.5.1 — فیلتر روزِ تاریخچه معاملات ربات. */
   const [histPeriod, setHistPeriod] = useState<AutoPnlPeriod>('all');
+  /** v1.5.2 — ویرایش دستی TP/SL پوزیشن باز. */
+  const [editTpsl, setEditTpsl] = useState<EditTpslTarget | null>(null);
+  const [editStopText, setEditStopText] = useState('');
+  const [editTakeText, setEditTakeText] = useState('');
+  const [tpslBusy, setTpslBusy] = useState(false);
+  /** v1.5.2 — وضعیت اتصال سرور ۲۴/۷ (تلگرام). */
+  const [server247State, setServer247State] = useState<{ busy: boolean; lastOk: boolean | null; error?: string }>({
+    busy: false,
+    lastOk: null,
+  });
   const pnlCardRef = useRef<View>(null);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -138,8 +177,17 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   }, [realKeysProp]);
 
   const persist = useCallback(async (next: AutoTradeSettings) => {
+    const wasServer = settingsRef.current.server247.enabled;
     setSettings(next);
     await saveAutoSettings(next);
+    // v1.5.2 — اعلام تلگرام ۲۴/۷: با هر تغییر تنظیمات (روشن/خاموش شدن سوییچ
+    // سرور، شروع/توقف ربات، تغییر حالت یا مقادیر) کانفیگ به سرور push می‌شود
+    // تا ربات روی سرور با تنظیمات تازه اجرا/متوقف شود.
+    if (next.server247.enabled || wasServer) {
+      setServer247State((s) => ({ ...s, busy: true }));
+      const r = await pushAutoTradeConfigToServer(next);
+      setServer247State((s) => ({ ...s, busy: false, lastOk: r.ok, error: r.error }));
+    }
   }, []);
 
   const refreshPositions = useCallback(async () => {
@@ -149,11 +197,15 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     setLastCycleAt(getLastGlobalCycleAt());
   }, []);
 
-  // light UI refresh loop — reads storage only (the ENGINE loop lives globally)
+  // v1.5.2 — «پوزیشن‌های ربات هر ۳ ثانیه رفرش شوند»: چرخه سبک MTM
+  // (قیمت تازه + تریل + چک SL/TP — بدون اسکن سیگنال/نهنگ) + ریلود ویو.
   useEffect(() => {
     if (!loaded) return;
     const t = setInterval(() => {
-      void refreshPositions();
+      void (async () => {
+        await runLightMtm();
+        await refreshPositions();
+      })();
     }, UI_REFRESH_MS);
     return () => clearInterval(t);
   }, [loaded, refreshPositions]);
@@ -265,7 +317,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       return;
     }
     if (settings.mode === 'real' && !realKeys) {
-      Alert.alert('کلید API نیست', 'برای معامله واقعی، ابتدا کلید API فیوچرز بایننس را در تب «ترید واقعی» اضافه کنید.');
+      Alert.alert('کلید API نیست', 'برای معامله واقعی، ابتدا کلید API فیوچرز بایننس را در تب «واقعی» اضافه کنید.');
       return;
     }
     Alert.alert(
@@ -355,10 +407,53 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     }
   };
 
+  // v1.5.2 — باز کردن مودال ویرایش دستی TP/SL برای یک پوزیشن باز
+  const openEditTpsl = (t: EditTpslTarget) => {
+    setEditTpsl(t);
+    setEditStopText(String(t.stopPrice));
+    setEditTakeText(String(t.takePrice));
+  };
+
+  const applyEditTpsl = async () => {
+    if (!editTpsl || tpslBusy) return;
+    const newStop = parseFloat(editStopText.replace(/[^\d.]/g, ''));
+    const newTake = parseFloat(editTakeText.replace(/[^\d.]/g, ''));
+    if (!(newStop > 0) || !(newTake > 0)) {
+      Alert.alert('خطا', 'قیمت استاپ و تیک‌پرافیت را درست وارد کنید (بزرگ‌تر از صفر).');
+      return;
+    }
+    const long = editTpsl.side === 'long';
+    if (long && newStop >= newTake) {
+      Alert.alert('خطا', 'در پوزیشن لانگ، استاپ باید پایین‌تر از تیک‌پرافیت باشد.');
+      return;
+    }
+    if (!long && newStop <= newTake) {
+      Alert.alert('خطا', 'در پوزیشن شورت، استاپ باید بالاتر از تیک‌پرافیت باشد.');
+      return;
+    }
+    setTpslBusy(true);
+    try {
+      const ok = await updatePositionTpsl(settings, realKeys, editTpsl, newStop, newTake);
+      if (ok) {
+        setEditTpsl(null);
+        await refreshPositions();
+      } else {
+        Alert.alert('ناموفق', 'تغییر TP/SL انجام نشد — اعداد را دوباره چک کنید و دوباره تلاش کنید.');
+      }
+    } finally {
+      setTpslBusy(false);
+    }
+  };
+
   // v1.5.1 — نمایش سخت‌گیرانه: در هر حالت فقط داده‌های همان حالت (واقعی = بدون ریز دمو)
   const hasAnyPosition = settings.mode === 'demo'
     ? openPositions.length > 0 || positions.some((p) => p.status === 'closed')
     : realOpen.length > 0 || realPositions.some((p) => p.status === 'closed');
+
+  // v1.5.2 — ROI٪ بر سرمایه اولیه (مثل خروجی فیوچرز بایننس)
+  // (plain function, not a hook — placed after the early `!loaded` return)
+  const roiOf = (pnlUsd: number): number =>
+    settings.initialCapitalUsd > 0 ? (pnlUsd / settings.initialCapitalUsd) * 100 : 0;
 
   return (
     <View style={styles.card}>
@@ -416,7 +511,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             )}
           </View>
           {settings.mode === 'real' && !realKeys && (
-            <Text style={styles.warn}>کلید API فیوچرز بایننس اضافه نشده — از تب «ترید واقعی» بگذارید (برای دمو لازم نیست).</Text>
+            <Text style={styles.warn}>کلید API فیوچرز بایننس اضافه نشده — از تب «واقعی» اضافه کنید (برای دمو لازم نیست).</Text>
           )}
           {settings.mode === 'real' && realKeys && (
             <Text style={styles.warnReal}>⚠ حالت واقعی: هر سیگنال با پول واقعی معامله می‌شود — استاپ/تیپی روی صرافی live می‌ماند.</Text>
@@ -623,10 +718,29 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 <TextInput
                   style={styles.settingInput}
                   value={String(settings.maxOpenPositions)}
-                  onChangeText={(t) => setSettings((s) => ({ ...s, maxOpenPositions: Math.max(1, Math.min(10, parseInt(t.replace(/\D/g, '') || '3', 10) || 3)) }))}
+                  onChangeText={(t) => setSettings((s) => ({ ...s, maxOpenPositions: Math.max(1, Math.min(100, parseInt(t.replace(/\D/g, '') || '3', 10) || 3)) }))}
                   onEndEditing={() => void persist(settings)}
                   keyboardType="number-pad"
                 />
+                <Text style={styles.settingHint}>۱ تا ۱۰۰ — قبلاً سقف ۱۰ بود</Text>
+              </View>
+              {/* v1.5.2 — سرمایه اولیه برای محاسبه PnL/ROI (مثل فیوچرز بایننس) */}
+              <View style={styles.settingCell}>
+                <Text style={styles.settingLabel}>سرمایه اولیه ($)</Text>
+                <TextInput
+                  style={styles.settingInput}
+                  value={String(settings.initialCapitalUsd)}
+                  onChangeText={(t) =>
+                    setSettings((s) => ({
+                      ...s,
+                      initialCapitalUsd: Math.max(1, Math.min(10_000_000, parseFloat(t.replace(/[^\d.]/g, '') || '1000') || 1000)),
+                    }))
+                  }
+                  onEndEditing={() => void persist(settings)}
+                  keyboardType="decimal-pad"
+                  testID="initial-capital-input"
+                />
+                <Text style={styles.settingHint}>درصد PnL نسبت به این حساب می‌شود</Text>
               </View>
             </View>
             <Text style={styles.sourceHint}>
@@ -690,15 +804,54 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             )}
           </View>
 
-          {/* v1.5.0 — PnL card (capturable as image) */}
+          {/* v1.5.2 — اعلام تلگرام ۲۴/۷ از سرور: باز/بسته شدن پوزیشن‌های دمو یا
+              واقعیِ بک‌تست حتی وقتی برنامه بسته است به تلگرام اعلام می‌شود */}
+          <View style={styles.sourceBox}>
+            <View style={styles.sourceHead}>
+              <Send size={13} color={colors.dark.blue} />
+              <Text style={styles.sourceTitle}>اعلام تلگرام ۲۴/۷ (سرور)</Text>
+              {server247State.busy ? (
+                <ActivityIndicator size="small" color={colors.dark.accent} />
+              ) : (
+                <Switch
+                  value={settings.server247.enabled}
+                  onValueChange={(v) => void persist({ ...settings, server247: { ...settings.server247, enabled: v } })}
+                  trackColor={{ true: colors.dark.green + '88', false: colors.dark.card }}
+                  thumbColor={settings.server247.enabled ? colors.dark.green : colors.dark.textMuted}
+                  style={{ transform: [{ scale: 0.7 }] }}
+                  testID="server247-switch"
+                />
+              )}
+            </View>
+            <Text style={styles.sourceHint}>
+              وقتی روشن باشد، ربات بک‌تست روی سرور ۲۴/۷ اجرا می‌شود و هر باز/بسته شدن پوزیشن (دمو یا واقعی) با سود/زیانش به تلگرام شما اعلام می‌شود — حتی وقتی برنامه بسته است. تنظیمات با هر تغییر، خودکار به سرور می‌روند.
+            </Text>
+            {settings.server247.enabled && (
+              <View style={[styles.engineBadge, server247State.lastOk === false && { borderColor: colors.dark.red + '44', backgroundColor: colors.dark.red + '0F' }]}>
+                <ShieldCheck size={11} color={server247State.lastOk === false ? colors.dark.red : colors.dark.green} />
+                <Text style={[styles.engineBadgeText, server247State.lastOk === false && { color: colors.dark.red }]}>
+                  {server247State.lastOk === false
+                    ? `اتصال سرور ناموفق: ${server247State.error ?? 'خطا'} — ربات روی خود گوشی ادامه می‌دهد.`
+                    : 'ربات روی سرور فعال است — فعالیت‌ها به تلگرام اعلام می‌شود. در حالت واقعی، کلید API برای اجرای روی سرور ارسال و روی سرور شما ذخیره می‌شود.'}
+                </Text>
+              </View>
+            )}
+          </View>
+
+          {/* v1.5.0 — PnL card (capturable as image) — v1.5.2: دقیقاً مثل
+              خروجی فیوچرز بایننس (دلاری + درصد بر اساس سرمایه اولیه) +
+              لوگوی برنامه در بک‌گراند عکس */}
           {hasAnyPosition && (
             <View style={styles.sourceBox}>
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={(demoStats.realized + demoStats.open + realStats.realized + realStats.open) >= 0 ? colors.dark.green : colors.dark.red} />
-                <Text style={styles.sourceTitle}>PnL ربات در تایم‌فریم‌های مختلف</Text>
+                <Text style={styles.sourceTitle}>PnL ربات (USDT) — مثل فیوچرز بایننس</Text>
               </View>
               <View ref={pnlCardRef} collapsable={false} style={styles.pnlShareCard}>
-                <Text style={styles.pnlShareTitle}>🤖 معامله‌گر خودکار — PnL</Text>
+                {/* v1.5.2 — لوگوی برنامه در بک‌گراند عکس */}
+                <Image source={APP_LOGO} style={styles.pnlLogoBg} resizeMode="contain" />
+                <Text style={styles.pnlShareTitle}>🤖 بک‌تست — PNL (USDT)</Text>
+                {/* انتخاب بازه (همان چیپ‌های قبلی) */}
                 <View style={styles.pnlPeriodRow}>
                   {AUTO_PNL_PERIODS.map((p) => (
                     <Pressable
@@ -715,9 +868,10 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 {settings.mode === 'demo' ? (
                   <View style={styles.pnlModeBlock}>
                     <Text style={styles.pnlModeLabel}>دمو</Text>
-                    <PnlRow label="سود/زیان بسته‌شده" value={demoStats.realized} />
-                    <PnlRow label="سود/زیان باز (لحظه‌ای)" value={demoStats.open} />
-                    <PnlRow label="مجموع" value={demoStats.realized + demoStats.open} bold />
+                    {/* ردیف‌های بایننس‌مانند: سود/زیان دلاری + درصد ROI بر سرمایه اولیه */}
+                    <PnlRow label="PNL بسته‌شده" value={demoStats.realized} pct={roiOf(demoStats.realized)} />
+                    <PnlRow label="PNL باز (لحظه‌ای)" value={demoStats.open} pct={roiOf(demoStats.open)} />
+                    <PnlRow label="مجموع PNL" value={demoStats.realized + demoStats.open} pct={roiOf(demoStats.realized + demoStats.open)} bold />
                     <Text style={styles.pnlMetaText}>
                       {demoStats.trades.toLocaleString('fa-IR')} معامله • نرخ برد{' '}
                       {demoStats.trades > 0
@@ -730,9 +884,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 {settings.mode === 'real' && (
                   <View style={[styles.pnlModeBlock, styles.pnlModeBlockReal]}>
                     <Text style={styles.pnlModeLabel}>واقعی</Text>
-                    <PnlRow label="سود/زیان بسته‌شده" value={realStats.realized} />
-                    <PnlRow label="سود/زیان باز (لحظه‌ای)" value={realStats.open} />
-                    <PnlRow label="مجموع" value={realStats.realized + realStats.open} bold />
+                    <PnlRow label="PNL بسته‌شده" value={realStats.realized} pct={roiOf(realStats.realized)} />
+                    <PnlRow label="PNL باز (لحظه‌ای)" value={realStats.open} pct={roiOf(realStats.open)} />
+                    <PnlRow label="مجموع PNL" value={realStats.realized + realStats.open} pct={roiOf(realStats.realized + realStats.open)} bold />
                     <Text style={styles.pnlMetaText}>
                       {realStats.trades.toLocaleString('fa-IR')} معامله • نرخ برد{' '}
                       {realStats.trades > 0
@@ -742,7 +896,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     </Text>
                   </View>
                 )}
-                <Text style={styles.pnlShareFooter}>PampDumpCoins • {AUTO_PNL_PERIOD_LABEL[pnlPeriod]}</Text>
+                <Text style={styles.pnlShareFooter}>
+                  PampDumpCoins • سرمایه اولیه ${settings.initialCapitalUsd.toLocaleString('en-US')} • {AUTO_PNL_PERIOD_LABEL[pnlPeriod]}
+                </Text>
               </View>
               <View style={styles.shareBtnRow}>
                 {/* v1.5.1 — اول عکس ساخته و پیش‌نمایش داده می‌شود؛ ذخیره/اشتراک از داخل پیش‌نمایش */}
@@ -788,6 +944,53 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             </View>
           )}
 
+          {/* v1.5.2 — مودال ویرایش دستی TP/SL یک پوزیشن باز (دمو یا واقعی) */}
+          <Modal visible={!!editTpsl} transparent animationType="fade">
+            <Pressable style={styles.previewOverlay} onPress={() => setEditTpsl(null)}>
+              <View style={styles.tpslModal} onStartShouldSetResponder={() => true}>
+                <View style={styles.previewHead}>
+                  <Text style={styles.previewTitle}>
+                    ویرایش TP/SL — {editTpsl?.symbol} ({editTpsl?.side === 'long' ? 'لانگ' : 'شورت'})
+                  </Text>
+                  <Pressable hitSlop={8} onPress={() => setEditTpsl(null)}>
+                    <X size={18} color={colors.dark.textMuted} />
+                  </Pressable>
+                </View>
+                {editTpsl && (
+                  <>
+                    <Text style={styles.tpslHint}>
+                      قیمت فعلی: {editTpsl.lastPrice.toFixed(4)} • ورود از مودال: {editTpsl.stopPrice.toFixed(4)} / {editTpsl.takePrice.toFixed(4)}
+                      {'\n'}
+                      {editTpsl.kind === 'real'
+                        ? 'در حالت واقعی، استاپ و تیک‌پرافیت روی خود صرافی بایننس جایگزین می‌شوند.'
+                        : 'در حالت دمو، مقادیر همین پوزیشن شبیه‌سازی‌شده عوض می‌شوند.'}
+                    </Text>
+                    <Text style={styles.tpslLabel}>قیمت استاپ‌لاس (SL)</Text>
+                    <TextInput
+                      style={styles.tpslInput}
+                      value={editStopText}
+                      onChangeText={setEditStopText}
+                      keyboardType="decimal-pad"
+                      testID="tpsl-stop-input"
+                    />
+                    <Text style={styles.tpslLabel}>قیمت تیک‌پرافیت (TP)</Text>
+                    <TextInput
+                      style={styles.tpslInput}
+                      value={editTakeText}
+                      onChangeText={setEditTakeText}
+                      keyboardType="decimal-pad"
+                      testID="tpsl-take-input"
+                    />
+                    <Pressable style={styles.shareBtn} onPress={() => void applyEditTpsl()} disabled={tpslBusy} testID="tpsl-apply">
+                      {tpslBusy ? <ActivityIndicator size="small" color={colors.dark.background} /> : <Edit3 size={13} color={colors.dark.background} />}
+                      <Text style={styles.shareBtnText}>ذخیره TP/SL</Text>
+                    </Pressable>
+                  </>
+                )}
+              </View>
+            </Pressable>
+          </Modal>
+
           {/* demo positions — فقط حالت دمو (در واقعی، ریز معاملات دمو نمایش داده نمی‌شود) */}
           {settings.mode === 'demo' && (
             <View style={styles.sourceBox}>
@@ -808,6 +1011,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               {openPositions.map((p) => {
                 const dir = p.side === 'long' ? 1 : -1;
                 const pnl = (p.lastPrice - p.entryPrice) * dir * p.qty;
+                // v1.5.2 — درصد سود/زیان هر معامله باز (نسبت به مارجین)
+                const pnlPct = positionPnlPercent(p);
                 return (
                   <View key={p.id} style={styles.posRow}>
                     <View style={styles.posMain}>
@@ -826,6 +1031,29 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       <Text style={[styles.posPnl, { color: pnl >= 0 ? colors.dark.green : colors.dark.red }]}>
                         {pnl >= 0 ? '+' : '−'}${Math.abs(pnl).toFixed(2)}
                       </Text>
+                      <Text style={[styles.posPnlPct, { color: pnlPct >= 0 ? colors.dark.green : colors.dark.red }]}>
+                        {pnlPct >= 0 ? '+' : '−'}{Math.abs(pnlPct).toFixed(2)}٪
+                      </Text>
+                      {/* v1.5.2 — ویرایش دستی TP/SL این معامله */}
+                      <Pressable
+                        style={styles.posEditBtn}
+                        hitSlop={6}
+                        onPress={() =>
+                          openEditTpsl({
+                            kind: 'demo',
+                            id: p.id,
+                            symbol: p.symbol,
+                            side: p.side,
+                            qty: p.qty,
+                            stopPrice: p.stopPrice,
+                            takePrice: p.takePrice,
+                            lastPrice: p.lastPrice,
+                          })
+                        }
+                        testID={`pos-edit-tpsl-${p.id}`}
+                      >
+                        <Edit3 size={11} color={colors.dark.accent} />
+                      </Pressable>
                       <Pressable style={styles.posCloseBtn} onPress={() => void manualClosePosition(settings, realKeys, p).then(refreshPositions)}>
                         <X size={11} color={colors.dark.red} />
                       </Pressable>
@@ -898,6 +1126,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               {realOpen.map((p) => {
                 const dir = p.side === 'long' ? 1 : -1;
                 const pnl = (p.lastPrice - p.entryPrice) * dir * p.qty;
+                // v1.5.2 — درصد سود/زیان هر معامله باز (نسبت به مارجین)
+                const marginUsd = p.leverage > 0 ? (p.qty * p.entryPrice) / p.leverage : 0;
+                const pnlPct = positionPnlPercent(p, marginUsd);
                 return (
                   <View key={p.id} style={styles.posRow}>
                     <View style={styles.posMain}>
@@ -916,6 +1147,28 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       <Text style={[styles.posPnl, { color: pnl >= 0 ? colors.dark.green : colors.dark.red }]}>
                         {pnl >= 0 ? '+' : '−'}${Math.abs(pnl).toFixed(2)}
                       </Text>
+                      <Text style={[styles.posPnlPct, { color: pnlPct >= 0 ? colors.dark.green : colors.dark.red }]}>
+                        {pnlPct >= 0 ? '+' : '−'}{Math.abs(pnlPct).toFixed(2)}٪
+                      </Text>
+                      {/* v1.5.2 — ویرایش دستی TP/SL این معامله واقعی */}
+                      <Pressable
+                        style={styles.posEditBtn}
+                        hitSlop={6}
+                        onPress={() =>
+                          openEditTpsl({
+                            kind: 'real',
+                            id: p.id,
+                            symbol: p.symbol,
+                            side: p.side,
+                            qty: p.qty,
+                            stopPrice: p.stopPrice,
+                            takePrice: p.takePrice,
+                            lastPrice: p.lastPrice,
+                          })
+                        }
+                      >
+                        <Edit3 size={11} color={colors.dark.accent} />
+                      </Pressable>
                       <Pressable
                         style={styles.posCloseBtn}
                         onPress={() =>
@@ -998,13 +1251,21 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   );
 }
 
-function PnlRow({ label, value, bold }: { label: string; value: number; bold?: boolean }) {
+function PnlRow({ label, value, pct, bold }: { label: string; value: number; pct?: number; bold?: boolean }) {
   return (
     <View style={styles.pnlShareRow}>
       <Text style={[styles.pnlShareRowLabel, bold && { fontWeight: '800' }]}>{label}</Text>
-      <Text style={[styles.pnlShareRowValue, { color: value >= 0 ? colors.dark.green : colors.dark.red }, bold && { fontWeight: '800' }]}>
-        {value >= 0 ? '+' : '−'} ${Math.abs(value).toFixed(2)}
-      </Text>
+      {/* v1.5.2 — سود/زیان هم دلاری هم درصدی (مثل بایننس) */}
+      <View style={styles.pnlShareRowRight}>
+        <Text style={[styles.pnlShareRowValue, { color: value >= 0 ? colors.dark.green : colors.dark.red }, bold && { fontWeight: '800' }]}>
+          {value >= 0 ? '+' : '−'} ${Math.abs(value).toFixed(2)}
+        </Text>
+        {typeof pct === 'number' && (
+          <Text style={[styles.pnlShareRowPct, { color: pct >= 0 ? colors.dark.green : colors.dark.red }, bold && { fontWeight: '800' }]}>
+            {pct >= 0 ? '+' : '−'}{Math.abs(pct).toFixed(2)}٪
+          </Text>
+        )}
+      </View>
     </View>
   );
 }
@@ -1352,6 +1613,12 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
     paddingHorizontal: 4,
   },
+  /* v1.5.2 — راهنمای ریز زیر هر سلول تنظیمات */
+  settingHint: {
+    fontSize: 7.5,
+    color: colors.dark.textMuted,
+    marginTop: 2,
+  },
   settingCellInline: {
     backgroundColor: colors.dark.card,
     borderRadius: 8,
@@ -1424,6 +1691,22 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '800',
     direction: 'ltr',
+  },
+  /* v1.5.2 — درصد سود/زیان هر پوزیشن باز */
+  posPnlPct: {
+    fontSize: 8.5,
+    fontWeight: '700',
+    direction: 'ltr',
+    marginTop: 1,
+  },
+  /* v1.5.2 — دکمه ویرایش TP/SL روی هر پوزیشن */
+  posEditBtn: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    backgroundColor: colors.dark.accent + '1C',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   posCloseBtn: {
     width: 22,
@@ -1503,6 +1786,42 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.dark.border,
     padding: 12,
+  },
+  /* v1.5.2 — مودال ویرایش دستی TP/SL */
+  tpslModal: {
+    width: '100%',
+    backgroundColor: colors.dark.surface,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+    padding: 14,
+  },
+  tpslHint: {
+    fontSize: 9,
+    color: colors.dark.textSecondary,
+    lineHeight: 14,
+    marginBottom: 8,
+  },
+  tpslLabel: {
+    fontSize: 9.5,
+    fontWeight: '700',
+    color: colors.dark.text,
+    marginTop: 6,
+    marginBottom: 3,
+  },
+  tpslInput: {
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    borderRadius: 8,
+    color: colors.dark.text,
+    fontSize: 13,
+    fontWeight: '700',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    direction: 'ltr',
+    textAlign: 'left',
+    marginBottom: 6,
   },
   previewHead: {
     flexDirection: 'row',
@@ -1639,6 +1958,26 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '700',
     direction: 'ltr',
+  },
+  /* v1.5.2 — دلار + درصد کنار هم در ردیف PnL (مثل بایننس) */
+  pnlShareRowRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  pnlShareRowPct: {
+    fontSize: 9.5,
+    fontWeight: '700',
+    direction: 'ltr',
+  },
+  /* v1.5.2 — لوگوی برنامه در بک‌گراند عکس PnL */
+  pnlLogoBg: {
+    position: 'absolute',
+    alignSelf: 'center',
+    top: 0,
+    bottom: 0,
+    width: 220,
+    opacity: 0.08,
   },
   pnlMetaText: {
     fontSize: 9,

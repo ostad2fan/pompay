@@ -805,8 +805,12 @@ export default function RealTradeScreen() {
 
   if (exchangeConfigs.length === 0) {
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.centerContent}>
-        <TradeAiSegmentHeader active="real" />
+      <View style={styles.container}>
+        {/* v1.5.2 — هدر تب‌ها ثابت بالا (حتی در حالت بدون صرافی) */}
+        <View style={styles.segmentWrap}>
+          <TradeAiSegmentHeader active="real" />
+        </View>
+        <ScrollView style={styles.scrollView} contentContainerStyle={styles.centerContent}>
         <View style={styles.noApiCard}>
           <Lock size={48} color={colors.dark.accent} />
           <Text style={styles.noApiTitle}>صرافی وارد نشده</Text>
@@ -829,12 +833,16 @@ export default function RealTradeScreen() {
             </View>
           </Pressable>
         </Modal>
-      </ScrollView>
+        </ScrollView>
+      </View>
     );
   }
 
   function renderExchangeForm() {
+    // v1.5.2 — فیکس «گزینه افزودن صرافی زیر دکمه‌های پایین گوشی می‌افتد»:
+    // کل فرم داخل ScrollView + دکمه در انتها؛ دیگر بیرون از صفحه نمی‌رود.
     return (
+      <ScrollView style={styles.modalFormScroll} showsVerticalScrollIndicator={false}>
       <View>
         <View style={styles.modalHeader}>
           <Text style={styles.modalTitle}>افزودن صرافی</Text>
@@ -939,16 +947,21 @@ export default function RealTradeScreen() {
           <Text style={styles.openBtnText}>افزودن صرافی</Text>
         </Pressable>
       </View>
+      </ScrollView>
     );
   }
 
   return (
+    <View style={styles.container}>
+      {/* v1.5.2 — هدر تب‌ها ثابت بالای صفحه (بیرون از اسکرول) — سر جایشان می‌مانند */}
+      <View style={styles.segmentWrap}>
+        <TradeAiSegmentHeader active="real" />
+      </View>
     <ScrollView
-      style={styles.container}
+      style={styles.scrollView}
       contentContainerStyle={styles.content}
       showsVerticalScrollIndicator={false}
     >
-      <TradeAiSegmentHeader active="real" />
 
       <View style={styles.refreshTimerBar}>
         <View style={styles.refreshTimerLeft}>
@@ -1658,6 +1671,7 @@ export default function RealTradeScreen() {
         </Pressable>
       </Modal>
     </ScrollView>
+    </View>
   );
 }
 
@@ -1666,9 +1680,18 @@ const styles = createThemedStyles(() => StyleSheet.create({
     flex: 1,
     backgroundColor: colors.dark.background,
   },
+  segmentWrap: {
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 2,
+    backgroundColor: colors.dark.background,
+  },
+  scrollView: {
+    flex: 1,
+  },
   content: {
     paddingHorizontal: 16,
-    paddingTop: 12,
+    paddingTop: 8,
     paddingBottom: 40,
   },
   centerContent: {
@@ -2401,9 +2424,16 @@ const styles = createThemedStyles(() => StyleSheet.create({
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     padding: 20,
-    maxHeight: '80%',
+    // v1.5.2 — فیکس «دکمه افزودن صرافی زیر دکمه‌های پایین گوشی می‌افتد»:
+    // فاصله امن از نوار پایین سیستم + اسکرول داخل خود مودال.
+    paddingBottom: 34,
+    maxHeight: '86%',
     borderWidth: 1,
     borderColor: colors.dark.cardBorder,
+  },
+  modalFormScroll: {
+    // v1.5.2 — فرم افزودن صرافی داخل ScrollView تا دکمه پایین هرگز بیرون نزند
+    flexGrow: 0,
   },
   modalHeader: {
     flexDirection: 'row',
