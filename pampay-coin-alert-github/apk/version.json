@@ -1,7 +1,7 @@
 {
-  "latestVersion": "1.5.1",
-  "versionCode": 26,
-  "apkUrl": "https://cdn.jsdelivr.net/gh/ostad2fan/pompay@main/pampay-coin-alert-github/apk/PampDumpCoins-v1.5.1.apk",
-  "updatedAt": "2026-10-15",
+  "latestVersion": "1.5.2",
+  "versionCode": 27,
+  "apkUrl": "https://cdn.jsdelivr.net/gh/ostad2fan/pompay@main/pampay-coin-alert-github/apk/PampDumpCoins-v1.5.2.apk",
+  "updatedAt": "2026-10-16",
   "notes": "نسخه ۱.۵.۱ — ترید با AI دو تب اصلی شد: «دمو» (تحلیل هوش مصنوعی + معامله‌گر خودکار) و «واقعی» (بخش کامل خودش) + استراتژی‌های معاملاتی به‌صورت گزینه‌های روشن/خاموش در هر دو تب + خروجی عکس PnL با پیش‌نمایش (اول عکس را می‌بینید، بعد ذخیره یا اشتراک‌گذاری) + تاریخچه معاملات با فیلتر روز (امروز/۷/۳۰/همه) در دمو و ربات + جدول مدیریت سرمایه در ترید واقعی مستقیماً دستی قابل تغییر + در حالت واقعی دیگر ریز معاملات دمو نشان داده نمی‌شود و پوزیشن‌های باز هر حالت با دکمه ضربدر دستی بسته می‌شوند"
 }
