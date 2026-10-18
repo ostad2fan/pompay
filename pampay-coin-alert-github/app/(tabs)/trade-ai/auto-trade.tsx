@@ -1,12 +1,15 @@
 /**
- * app/(tabs)/trade-ai/auto-trade.tsx — v1.5.2
+ * app/(tabs)/trade-ai/auto-trade.tsx — v1.5.3
  *
  * تب «بک‌تست» — معامله‌گر خودکار ربات (کپی نهنگ + سیگنال اندیکاتورها)
  * که طبق درخواست کاربر از داخل تب دمو جدا شد و اسمش «بک‌تست» شد.
  *
  *   • هدر سه‌تبی (دمو / بک‌تست / واقعی) ثابت بالای صفحه.
- *   • استراتژی‌های معاملاتی (روشن/خاموش) — همان لیست مشترک دمو/واقعی؛
- *     طبق درخواست کاربر اینجا هم اضافه شد تا برای بک‌تست تنظیم شوند.
+ *   • استراتژی‌های معاملاتی (روشن/خاموش) — همان لیست مشترک دمو/واقعی.
+ *   • v1.5.3 — «هر نوع استراتژی انتخاب میکنم بک‌تست طبق همون جدولشو پر کنه»:
+ *     با روشن کردن هر استراتژی، جدول «تنظیمات هر معامله» ربات همان لحظه
+ *     با پارامترهای همان استراتژی پر می‌شود (مثلاً اسکالپر: لوریج ۷،
+ *     حد ضرر ۱٪، ریوارد ۱.۲) — جدول با استراتژی مچ و پر می‌شود.
  *   • خودِ ربات: components/AutoTradingBotSection
  */
 
@@ -33,6 +36,7 @@ import {
   primaryStrategy,
 } from '@/utils/tradeAiService';
 import { STRATEGY_CONFIGS, TradingStrategy } from '@/types/tradeAi';
+import { loadAutoSettings, saveAutoSettings } from '@/utils/autoTradingEngine';
 
 export default function AutoTradeScreen() {
   const queryClient = useQueryClient();
@@ -57,6 +61,24 @@ export default function AutoTradeScreen() {
         void saveEnabledStrategies(next).then(() => {
           queryClient.invalidateQueries({ queryKey: ['trading-strategies'] });
         });
+        // v1.5.3 — «هر نوع استراتژی انتخاب میکنم بک‌تست طبق همون جدولشو پر کنه»:
+        // با روشن شدن هر استراتژی، جدول تنظیمات هر معامله ربات با پارامترهای
+        // همان استراتژی هم‌مقدار می‌شود (اسکالپر → لوریج ۷ / حد ضرر ۱٪ / RR ۱.۲).
+        if (next[key]) {
+          const preset = STRATEGY_CONFIGS[key];
+          void (async () => {
+            try {
+              const cur = await loadAutoSettings();
+              const updated = {
+                ...cur,
+                leverage: preset.maxLeverage,
+                maxLossPercent: preset.stopLossPercent,
+                rewardRatio: preset.takeProfitMultiplier,
+              };
+              await saveAutoSettings(updated);
+            } catch {}
+          })();
+        }
         return next;
       });
     },
@@ -85,6 +107,7 @@ export default function AutoTradeScreen() {
             </View>
             <Text style={styles.hint}>
               استراتژی‌های روشن در تحلیل AI ربات لحاظ می‌شوند — همین لیست مشترکاً در تب‌های «دمو» و «واقعی» هم استفاده می‌شود. حداقل یک استراتژی باید روشن بماند.
+              {'\n'}★ با روشن کردن هر استراتژی، جدول «تنظیمات هر معامله» (لوریج / حد ضرر / ریوارد) همان لحظه با پارامترهای همان استراتژی پر می‌شود — مثلاً اسکالپر: لوریج ۷ و حد ضرر ۱٪.
             </Text>
             {STRATEGY_ORDER.map((key) => {
               const cfg = STRATEGY_CONFIGS[key];
