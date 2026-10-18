@@ -75,7 +75,6 @@ import {
   Save,
   ShieldCheck,
   Edit3,
-  Send,
   RotateCcw,
   Scissors,
 } from 'lucide-react-native';
@@ -108,7 +107,6 @@ import {
   manualClosePosition,
   manualPartialClosePosition,
   positionPnlPercent,
-  pushAutoTradeConfigToServer,
   resetDemoBacktest,
   runGlobalCycleNow,
   runLightMtm,
@@ -190,15 +188,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [partialPctText, setPartialPctText] = useState('50');
   const [partialBusy, setPartialBusy] = useState(false);
   const [partialHint, setPartialHint] = useState('');
-  /** v1.5.2 — وضعیت اتصال سرور ۲۴/۷ (تلگرام). */
-  const [server247State, setServer247State] = useState<{ busy: boolean; lastOk: boolean | null; error?: string; telegramOk?: boolean | null }>({
-    busy: false,
-    lastOk: null,
-    telegramOk: null,
-  });
   const pnlCardRef = useRef<View>(null);
-  const settingsRef = useRef(settings);
-  settingsRef.current = settings;
 
   // load everything on mount
   useEffect(() => {
@@ -225,17 +215,11 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   }, [realKeysProp]);
 
   const persist = useCallback(async (next: AutoTradeSettings) => {
-    const wasServer = settingsRef.current.server247.enabled;
     setSettings(next);
     await saveAutoSettings(next);
-    // v1.5.2 — اعلام تلگرام ۲۴/۷: با هر تغییر تنظیمات (روشن/خاموش شدن سوییچ
-    // سرور، شروع/توقف ربات، تغییر حالت یا مقادیر) کانفیگ به سرور push می‌شود
-    // تا ربات روی سرور با تنظیمات تازه اجرا/متوقف شود.
-    if (next.server247.enabled || wasServer) {
-      setServer247State((s) => ({ ...s, busy: true }));
-      const r = await pushAutoTradeConfigToServer(next);
-      setServer247State((s) => ({ ...s, busy: false, lastOk: r.ok, error: r.error, telegramOk: r.ok ? (r.telegramConfigured ?? null) : null }));
-    }
+    // v1.5.5 — سوییچ «اعلام تلگرام ۲۴/۷ (سرور)» حذف شد؛ دیگر کانفیگی به
+    // سرور push نمی‌شود. ربات روی خود گوشی اجرا می‌شود و اعلام تلگرام
+    // از خود برنامه (announceTelegram) ارسال می‌شود.
   }, []);
 
   const refreshPositions = useCallback(async () => {
@@ -285,7 +269,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       .filter((p) => p.status === 'closed' && (win === Infinity || (!!p.closedAt && now - p.closedAt <= win)))
       .slice()
       .reverse()
-      .slice(0, 30);
+      .slice(0, 100);
   }, [positions, histPeriod, histWindowMs]);
   const realOpen = useMemo(() => realPositions.filter((p) => p.status === 'open'), [realPositions]);
   const realClosed = useMemo(() => {
@@ -295,7 +279,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       .filter((p) => p.status === 'closed' && (win === Infinity || (!!p.closedAt && now - p.closedAt <= win)))
       .slice()
       .reverse()
-      .slice(0, 30);
+      .slice(0, 100);
   }, [realPositions, histPeriod, histWindowMs]);
 
   const totalPnl = openPositions.reduce((s, p) => {
@@ -582,13 +566,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             setResetBusy(true);
             void (async () => {
               try {
-                const r = await resetDemoBacktest();
+                await resetDemoBacktest();
                 await refreshPositions();
-                if (r.server.ok) {
-                  Alert.alert('ریست شد ✅', 'بک‌تست دمو از صفر شروع شد — سرور ۲۴/۷ هم ریست شد.');
-                } else if (settings.server247.enabled) {
-                  Alert.alert('ریست شد ✅', `بک‌تست دمو از صفر شروع شد.\n(ریست سرور ناموفق: ${r.server.error ?? 'خطا'})`);
-                }
+                Alert.alert('ریست شد ✅', 'بک‌تست دمو از صفر شروع شد — در اولین چرخه، سیگنال‌های ۷ روز اخیر دوباره تا سقف پوزیشن‌های همزمان باز می‌شوند.');
               } finally {
                 setResetBusy(false);
               }
@@ -610,7 +590,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             <Text style={styles.title}>معامله‌گر خودکار</Text>
             <Text style={styles.subtitle}>
               {settings.enabled
-                ? `${settings.mode === 'demo' ? 'دمو' : 'واقعی'} فعال • ${settings.mode === 'demo' ? `${openPositions.length} پوزیشن دمو` : `${realOpen.length} پوزیشن واقعی`} • همیشه روشن`
+                ? `${settings.mode === 'demo' ? 'دمو' : 'واقعی'} فعال • ${settings.mode === 'demo' ? `${openPositions.length}/${settings.maxOpenPositions} پوزیشن دمو` : `${realOpen.length} پوزیشن واقعی`} • همیشه روشن`
                 : 'کپی نهنگ‌ها + سیگنال اندیکاتورها — دمو یا واقعی'}
             </Text>
           </View>
@@ -958,48 +938,11 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             )}
           </View>
 
-          {/* v1.5.2 — اعلام تلگرام ۲۴/۷ از سرور: باز/بسته شدن پوزیشن‌های دمو یا
-              واقعیِ بک‌تست حتی وقتی برنامه بسته است به تلگرام اعلام می‌شود */}
-          <View style={styles.sourceBox}>
-            <View style={styles.sourceHead}>
-              <Send size={13} color={colors.dark.blue} />
-              <Text style={styles.sourceTitle}>اعلام تلگرام ۲۴/۷ (سرور)</Text>
-              {server247State.busy ? (
-                <ActivityIndicator size="small" color={colors.dark.accent} />
-              ) : (
-                <Switch
-                  value={settings.server247.enabled}
-                  onValueChange={(v) => void persist({ ...settings, server247: { ...settings.server247, enabled: v } })}
-                  trackColor={{ true: colors.dark.green + '88', false: colors.dark.card }}
-                  thumbColor={settings.server247.enabled ? colors.dark.green : colors.dark.textMuted}
-                  style={{ transform: [{ scale: 0.7 }] }}
-                  testID="server247-switch"
-                />
-              )}
-            </View>
-            <Text style={styles.sourceHint}>
-              وقتی روشن باشد، ربات بک‌تست روی سرور ۲۴/۷ اجرا می‌شود و هر باز/بسته شدن پوزیشن (دمو یا واقعی) با سود/زیانش به تلگرام شما اعلام می‌شود — حتی وقتی برنامه بسته است. تنظیمات با هر تغییر، خودکار به سرور می‌روند.
-            </Text>
-            {settings.server247.enabled && (
-              <View style={[styles.engineBadge, server247State.lastOk === false && { borderColor: colors.dark.red + '44', backgroundColor: colors.dark.red + '0F' }]}>
-                <ShieldCheck size={11} color={server247State.lastOk === false ? colors.dark.red : colors.dark.green} />
-                <Text style={[styles.engineBadgeText, server247State.lastOk === false && { color: colors.dark.red }]}>
-                  {server247State.lastOk === false
-                    ? `اتصال سرور ناموفق: ${server247State.error ?? 'خطا'} — ربات روی خود گوشی ادامه می‌دهد.`
-                    : 'ربات روی سرور فعال است — فعالیت‌ها به تلگرام اعلام می‌شود. در حالت واقعی، کلید API برای اجرای روی سرور ارسال و روی سرور شما ذخیره می‌شود.'}
-                </Text>
-              </View>
-            )}
-            {/* v1.5.4 — وضعیت اعلان تلگرام: توکن ربات خود کاربر حالا همراه کانفیگ به سرور می‌رود */}
-            {settings.server247.enabled && server247State.lastOk === true && server247State.telegramOk === false && (
-              <View style={[styles.engineBadge, { borderColor: colors.dark.accent + '44', backgroundColor: colors.dark.accent + '0F' }]}>
-                <Send size={11} color={colors.dark.accent} />
-                <Text style={styles.engineBadgeText}>
-                  اعلان‌های تلگرام تنظیم نشده — در تنظیمات برنامه، «ربات تلگرام» را وصل کنید (توکن و چت‌آیدی) تا پیام‌های ۲۴/۷ برسد.
-                </Text>
-              </View>
-            )}
-          </View>
+          {/* v1.5.5 — سوییچ «اعلام تلگرام ۲۴/۷ (سرور)» حذف شد (بازخورد کاربر:
+              روشن‌کردنش چرخه محلی را قطع می‌کرد و هیچ داده‌ای نه در برنامه و نه
+              در تلگرام نمی‌آمد). ربات روی خود گوشی اجرا می‌شود؛ اعلام‌های
+              تلگرام باز/بسته شدن از خود برنامه ارسال می‌شوند و ربات سیگنال
+              سرور ۲۴/۷ (نهنگ/اندیکاتور) مستقل از این مورد کار می‌کند. */}
 
           {/* v1.5.0 — PnL card (capturable as image) — v1.5.2: دقیقاً مثل
               خروجی فیوچرز بایننس (دلاری + درصد بر اساس سرمایه اولیه) +
