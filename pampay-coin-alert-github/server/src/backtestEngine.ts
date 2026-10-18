@@ -60,6 +60,9 @@ export interface AutoCfg {
   initialCapitalUsd: number;
   /** v1.5.3 — نام استراتژی فعال (از تب بک‌تست اپ). */
   strategyLabel?: string;
+  /** v1.5.4 — توکن تلگرام که اپ همراه کانفیگ فرستاده (اعلان‌های ۲۴/۷ بدون
+   * راه‌اندازی جداگانه ربات تلگرام سرور — «حتی در تلگرام نمی‌آمد»). */
+  telegram?: { botToken: string; chatId: string };
   binanceKeys?: { apiKey: string; apiSecret: string };
 }
 
@@ -165,14 +168,89 @@ async function dropStoppedLogs(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// v1.5.4 — seed sanitizers: پوزیشن‌ها/لاگ‌هایی که اپ همراه کانفیگ می‌فرستد
+// قبل از ذخیره در state سرور اعتبارسنجی می‌شوند (فیلدهای الزامی عددی/رشته‌ای).
+// ---------------------------------------------------------------------------
+
+function num(v: unknown, fallback = 0): number {
+  const n = typeof v === "number" ? v : typeof v === "string" ? parseFloat(v) : NaN;
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function sanitizePositions(rows: unknown[] | undefined): BtPosition[] {
+  if (!Array.isArray(rows)) return [];
+  const out: BtPosition[] = [];
+  for (const r of rows) {
+    if (!r || typeof r !== "object") continue;
+    const p = r as Record<string, unknown>;
+    const id = String(p.id ?? "");
+    const symbol = String(p.symbol ?? "");
+    if (!id || !symbol) continue;
+    out.push({
+      id,
+      symbol,
+      side: p.side === "short" ? "short" : "long",
+      entryPrice: num(p.entryPrice),
+      qty: num(p.qty),
+      sizeUsd: p.sizeUsd !== undefined ? num(p.sizeUsd) : undefined,
+      leverage: num(p.leverage, 1) || 1,
+      stopPrice: num(p.stopPrice),
+      takePrice: num(p.takePrice),
+      openedAt: num(p.openedAt, Date.now()) || Date.now(),
+      source: p.source === "whale" ? "whale" : "indicator",
+      sourceLabel: String(p.sourceLabel ?? ""),
+      status: p.status === "closed" ? "closed" : "open",
+      lastPrice: num(p.lastPrice, num(p.entryPrice)),
+      closeReason:
+        p.closeReason === "stop" || p.closeReason === "take" || p.closeReason === "signal" || p.closeReason === "whale-close" || p.closeReason === "manual" || p.closeReason === "partial" || p.closeReason === "partial-manual"
+          ? p.closeReason
+          : undefined,
+      closedAt: p.closedAt !== undefined ? num(p.closedAt) : undefined,
+      realizedPnl: p.realizedPnl !== undefined ? num(p.realizedPnl) : undefined,
+      initialStopPrice: p.initialStopPrice !== undefined ? num(p.initialStopPrice) : undefined,
+      highWater: p.highWater !== undefined ? num(p.highWater) : undefined,
+      lowWater: p.lowWater !== undefined ? num(p.lowWater) : undefined,
+      trailArmed: p.trailArmed === true,
+      strategyName: p.strategyName !== undefined ? String(p.strategyName) : undefined,
+      partialsDone: p.partialsDone !== undefined ? num(p.partialsDone) : undefined,
+    });
+  }
+  return out.slice(0, 200);
+}
+
+function sanitizeLogs(rows: unknown[] | undefined): BtLog[] {
+  if (!Array.isArray(rows)) return [];
+  const out: BtLog[] = [];
+  for (const r of rows) {
+    if (!r || typeof r !== "object") continue;
+    const l = r as Record<string, unknown>;
+    const id = String(l.id ?? "");
+    const message = String(l.message ?? "");
+    if (!id || !message) continue;
+    out.push({
+      id,
+      at: num(l.at, Date.now()) || Date.now(),
+      kind: l.kind === "open" || l.kind === "close" || l.kind === "error" || l.kind === "info" ? l.kind : "info",
+      message,
+    });
+  }
+  return out.slice(0, 60);
+}
+
 async function announce(title: string, text: string): Promise<void> {
-  const cfg = await store.get<{ botToken?: string; chatId?: string }>("config");
-  if (!cfg?.botToken || !cfg.chatId) {
+  // v1.5.4 — اولویت با توکنی است که اپ همراه کانفیگ فرستاده (رباتِ خود کاربر)؛
+  // اگر نبود، تنظیمات سرور (ربات تلگرام سرور) استفاده می‌شود.
+  const btCfg = await getConfig();
+  const serverCfg = await store.get<{ botToken?: string; chatId?: string }>("config");
+  const botToken = btCfg?.cfg.telegram?.botToken ?? serverCfg?.botToken;
+  const chatId = btCfg?.cfg.telegram?.chatId ?? serverCfg?.chatId;
+  if (!botToken || !chatId) {
     // v1.5.3 — دلیل سکوت تلگرام در لاگ دیده شود («اعلان‌ها اصلا نمیاد» → معلوم چرا)
     await appendLog("error", "اعلام تلگرام ارسال نشد: توکن/چت‌آیدی تلگرام روی سرور ثبت نشده — ربات تلگرام را در تنظیمات برنامه وصل کنید");
     return;
   }
-  const ok = await sendTelegram({ botToken: cfg.botToken, chatId: cfg.chatId }, `<b>${title}</b>\n${text}`);
+  const ok = await sendTelegram({ botToken, chatId }, `<b>${title}</b>\n${text}`);
   if (!ok) {
     await appendLog("error", "اعلام تلگرام ناموفق بود (توکن/چت‌آیدی نامعتبر یا شبکه) — پیام‌های ربات بک‌تست ارسال نمی‌شود");
   }
@@ -1048,7 +1126,17 @@ export function startBacktestEngine(): void {
 // ---------------------------------------------------------------------------
 
 export async function handleAutoTradeConfig(body: unknown): Promise<{ status: number; payload: Record<string, unknown> }> {
-  const b = body as { secret?: string; config?: Partial<AutoCfg>; reset?: boolean };
+  const b = body as {
+    secret?: string;
+    config?: Partial<AutoCfg> & {
+      state?: {
+        demoPositions?: unknown[];
+        realPositions?: unknown[];
+        logs?: unknown[];
+      };
+    };
+    reset?: boolean;
+  };
   const serverCfg = await store.get<{ secret?: string }>("config");
   if (!serverCfg?.secret || !b?.secret || serverCfg.secret !== b.secret) {
     return { status: 403, payload: { ok: false, error: "راز نصب مطابقت ندارد — از همان گوشی که پیکربندی سرور را ثبت کرده فعال کنید" } };
@@ -1090,6 +1178,13 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
     initialCapitalUsd: Math.max(1, Number(c.initialCapitalUsd ?? 1000) || 1000),
     // v1.5.3 — استراتژی فعال (برچسب پوزیشن‌ها در تاریخچه)
     strategyLabel: c.strategyLabel ? String(c.strategyLabel) : undefined,
+    // v1.5.4 — توکن تلگرام اپ (اعلان‌های ۲۴/۷ بدون ربات جداگانه).
+    // اگر این push توکن نداشت، قبلی حفظ می‌شود (فراخوانی‌های قدیمی/سایر کلاینت‌ها
+    // نباید اتصال تلگرام را قطع کنند).
+    telegram:
+      c.telegram && String(c.telegram.botToken ?? "").length > 10 && String(c.telegram.chatId ?? "").length > 0
+        ? { botToken: String(c.telegram.botToken), chatId: String(c.telegram.chatId) }
+        : prev?.cfg.telegram,
     binanceKeys:
       c.binanceKeys && String(c.binanceKeys.apiKey ?? "").length > 0
         ? { apiKey: String(c.binanceKeys.apiKey), apiSecret: String(c.binanceKeys.apiSecret ?? "") }
@@ -1103,6 +1198,28 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
     lossStreak: prev?.lossStreak ?? 0,
     updatedAt: Date.now(),
   };
+
+  // v1.5.4 — seed: وضعیت بک‌تست از خود اپ منتقل می‌شود تا سرور از همان‌جا
+  // ادامه دهد («روشن کردن سوییچ تلگرام همه‌چیز را پاک می‌کرد» — حالا تاریخچه
+  // و پوزیشن‌ها همان لحظه روی سرور هست و sync اپ هیچ‌وقت چیزهایی را پاک نمی‌کند).
+  // فقط وقتی state سرور «دختر/خام» است seed می‌کنیم (نه روی state فعال سرور).
+  const cur = await getState();
+  const virginState = cur.demo.length === 0 && cur.real.length === 0 && cur.logs.length === 0 && cur.lastCycleAt === null;
+  if (!b.reset && virginState && b.config?.state) {
+    const seedDemo = sanitizePositions(b.config.state.demoPositions);
+    const seedReal = sanitizePositions(b.config.state.realPositions);
+    const seedLogs = sanitizeLogs(b.config.state.logs);
+    if (seedDemo.length + seedReal.length + seedLogs.length > 0) {
+      await putState({ demo: seedDemo, real: seedReal, logs: seedLogs, lastCycleAt: null });
+      if (cfg.enabled) {
+        await appendLog(
+          "info",
+          `وضعیت بک‌تست از برنامه منتقل شد (${(seedDemo.length + seedReal.length).toLocaleString("fa-IR")} پوزیشن) — سرور همین‌جا ادامه می‌دهد`
+        );
+      }
+    }
+  }
+
   await putConfig(st);
 
   // v1.5.3 — «ریست کامل دمو»: همه‌چیز (حتی تاریخچه) پاک شود
@@ -1121,7 +1238,7 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
       );
       void runBacktestCycle();
     }
-    return { status: 200, payload: { ok: true, enabled: cfg.enabled, mode: cfg.mode, reset: true } };
+    return { status: 200, payload: { ok: true, enabled: cfg.enabled, mode: cfg.mode, reset: true, telegramConfigured: !!cfg.telegram } };
   }
 
   if (cfg.enabled) {
@@ -1158,17 +1275,19 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
   }
   return {
     status: 200,
-    payload: { ok: true, enabled: cfg.enabled, mode: cfg.mode },
+    payload: { ok: true, enabled: cfg.enabled, mode: cfg.mode, telegramConfigured: !!cfg.telegram },
   };
 }
 
 export async function getAutoTradeStateFor(secret: string): Promise<{ status: number; payload: Record<string, unknown> }> {
-  const serverCfg = await store.get<{ secret?: string }>("config");
+  const serverCfg = await store.get<{ secret?: string; botToken?: string; chatId?: string }>("config");
   if (!serverCfg?.secret || !secret || serverCfg.secret !== secret) {
     return { status: 403, payload: { ok: false, error: "secret mismatch" } };
   }
   const st = await getConfig();
   const state = await getState();
+  // v1.5.4 — آیا اعلان‌های تلگرام روی سرور تنظیم شده (توکن اپ یا ربات سرور)؟
+  const telegramConfigured = !!(st?.cfg.telegram?.botToken || serverCfg?.botToken);
   return {
     status: 200,
     payload: {
@@ -1176,6 +1295,7 @@ export async function getAutoTradeStateFor(secret: string): Promise<{ status: nu
       enabled: st?.cfg.enabled ?? false,
       mode: st?.cfg.mode ?? "demo",
       strategyLabel: st?.cfg.strategyLabel ?? null,
+      telegramConfigured,
       demoPositions: state.demo.slice(0, 200),
       realPositions: state.real.slice(0, 200),
       logs: state.logs.slice(0, 60),

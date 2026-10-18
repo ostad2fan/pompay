@@ -20,6 +20,7 @@ import CryptoJS from 'crypto-js';
 import { ExchangeId } from '@/types/crypto';
 import { exchangeNow, markClockStale } from './exchangeClock';
 import { geoBlockErrorFor, noteResponseStatus } from './geoBlock';
+import { isRsaSecret, rsaSignSha256 } from './rsaSign';
 
 export interface ForeignWallet {
   apiKey: string;
@@ -1034,7 +1035,47 @@ async function fetchPhemex(w: ForeignWallet): Promise<ForeignBalance[]> {
 //      echostr + signature_method + timestamp هم در فرم و هم در header لازم‌اند.
 //   ۳) پاسخ جدید /v2/supplement/user_info.do:
 //      {result:"true", data:[{coin, assetAmt, freezeAmt, usableAmt, ...}]}
+// v1.5.4 FIX (ارور 10203 — «مدیریت دارایی صرافی البانک هنوز ارور می‌دهد»):
+//   کد 10203 در مستند رسمی LBank = «签名方式错误» = روش امضا با نوع کلید
+//   هماهنگ نیست. کلیدهای جدید LBank به‌صورت پیش‌فرض RSA هستند (Secret =
+//   کلید خصوصی PKCS#8)؛ برنامه قبلاً همیشه signature_method=HmacSHA256
+//   می‌فرستاد → سرور 10203 می‌داد. حالا:
+//     • Secret کوتاه (HMAC) → HmacSHA256 مثل قبل.
+//     • Secret طولانی/PEM (RSA) → signature_method=RSA و امضای
+//       Base64(SHA256withRSA(md5Upper)) — دقیقاً مثل مثال رسمی LBank/Java
+//       (utils/rsaSign.ts — پیاده‌سازی خالص، تست‌شده در برابر openssl).
 // ---------------------------------------------------------------------------
+
+/** v1.5.4 — پیام فارسی دقیق برای کدهای رسمی LBank (از مستند رسمی). */
+function lbankErrorMessage(code: string, msg: string): Error {
+  switch (code) {
+    case '10203':
+      return new Error(
+        `روش امضا با کلید LBank شما هماهنگ نیست (10203) — Secret کلید را کامل کپی کنید (کلیدهای RSA طولانی هستند و باید تمام متن کپی شود)`
+      );
+    case '10205':
+      return new Error(
+        `LBank به دلیل قوانین کشور/منطقه این سرویس را نمی‌دهد (10205) — IP فیلترشکن را به کشور دیگری تغییر دهید و دوباره تلاش کنید`
+      );
+    case '10022':
+      return new Error(
+        `کلید LBank مجوز این کار را ندارد یا IP شما مجاز نیست (10022) — در تنظیمات کلید در LBank محدودیت IP را بردارید یا IP فعلی را اضافه کنید`
+      );
+    case '10600':
+      return new Error(
+        `ساعت درخواست با سرور LBank نخوانده شد (10600) — تاریخ و ساعت گوشی را روی «خودکار» بگذارید و دوباره تلاش کنید`
+      );
+    case '10031':
+      return new Error(`پارامتر echostr نامعتبر است (10031) — دوباره تلاش کنید`);
+    case '10005':
+    case '10006':
+      return new Error(`کلید LBank پیدا نشد (کد ${code}) — کلید API را دقیق کپی کنید یا یک کلید جدید در LBank بسازید`);
+    case '10004':
+      return new Error(`درخواست‌ها زیاد شد (10004) — چند ثانیه صبر کنید و دوباره تلاش کنید`);
+    default:
+      return new Error(`خطای LBank (کد ${code}): ${msg}`);
+  }
+}
 
 function lbankEchostr(): string {
   // 38-char alnum echo (server expects 30–40 chars)
@@ -1047,7 +1088,11 @@ function lbankEchostr(): string {
 async function fetchLbank(w: ForeignWallet): Promise<ForeignBalance[]> {
   const timestamp = Date.now().toString();
   const echostr = lbankEchostr();
-  const signatureMethod = 'HmacSHA256';
+  // v1.5.4 — کلیدهای جدید LBank از نوع RSA هستند (ارور 10203 = «روش امضا
+  // اشتباه»): اگر Secret یک کلید خصوصی RSA بود، امضا با SHA256withRSA و
+  // signature_method=«RSA» انجام می‌شود؛ در غیر این صورت HmacSHA256 مثل قبل.
+  const useRsa = isRsaSecret(w.apiSecret);
+  const signatureMethod = useRsa ? 'RSA' : 'HmacSHA256';
   const params: Record<string, string> = {
     api_key: w.apiKey,
     echostr,
@@ -1060,7 +1105,18 @@ async function fetchLbank(w: ForeignWallet): Promise<ForeignBalance[]> {
     .map((k) => `${k}=${params[k]}`)
     .join('&');
   const md5Upper = md5Hex(raw).toUpperCase();
-  const sign = CryptoJS.HmacSHA256(md5Upper, w.apiSecret).toString(CryptoJS.enc.Hex);
+  let sign: string;
+  if (useRsa) {
+    const rsa = rsaSignSha256(md5Upper, w.apiSecret);
+    if (!rsa) {
+      throw new Error(
+        'کلید خصوصی RSA البانک خوانده نشد — Secret کلید را کامل (از اول تا آخر، بدون کم‌وکسر) کپی کنید'
+      );
+    }
+    sign = rsa; // base64 — مثل مثال رسمی LBank (SHA256withRSA)
+  } else {
+    sign = CryptoJS.HmacSHA256(md5Upper, w.apiSecret).toString(CryptoJS.enc.Hex);
+  }
   const all: Record<string, string> = { ...params, sign };
   const formBody = Object.keys(all)
     .sort()
@@ -1119,11 +1175,7 @@ async function fetchLbank(w: ForeignWallet): Promise<ForeignBalance[]> {
   }
   const code = String(body.error_code ?? '');
   const msg = String(body.msg ?? '');
-  throw new Error(
-    code === '10005' || /key/i.test(msg)
-      ? `کلید LBank معتبر نیست یا با API جدید هماهنگ نشده (کد ${code}: ${msg})`
-      : `خطای LBank (کد ${code}): ${msg}`
-  );
+  throw lbankErrorMessage(code, msg);
 }
 
 // ---------------------------------------------------------------------------

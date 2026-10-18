@@ -60,6 +60,7 @@ import { getUserIndicators, scanCustomIndicators } from './customIndicatorsServi
 import { getStoredHookSignals } from './hookReversalService';
 import { getStoredGainzAlgoSignals } from './gainzAlgoService';
 import { getServerUrl, getInstallSecret } from './scanServerApi';
+import { mergePositionsById } from './autoMerge';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1471,9 +1472,12 @@ async function runGlobalCycle(): Promise<void> {
     if (!settings.enabled) return;
     // v1.5.2 — سرور ۲۴/۷ فعال است؟ چرخه معاملاتی روی سرور اجرا می‌شود
     // (اعلام تلگرام با برنامه بسته)؛ اینجا فقط state را sync می‌کنیم.
+    // v1.5.4 — اگر sync شکست بخورد (سرور خاموش/غیرقابل‌دسترس/deploy قدیم)
+    // چرخه «محلی» ادامه می‌دهد تا ربات هرگز ساکت نشود — بازخورد کاربر:
+    // «روشن کردن بکتست ربات تلگرام، همه معاملات و تاریخچه را قطع کرد».
     if (settings.server247.enabled && (await isServerModeActive())) {
-      await syncAutoTradeStateFromServer();
-      return;
+      const synced = await syncAutoTradeStateFromServer();
+      if (synced) return;
     }
     const realKeys = settings.mode === 'real' ? await loadRealKeys() : undefined;
     const res = await runAutoCycle({ settings, realKeys });
@@ -1711,10 +1715,11 @@ export async function runLightMtm(): Promise<void> {
   try {
     const settings = await loadAutoSettings();
     if (!settings.enabled) return;
-    // حالت سرور ۲۴/۷: فقط state سرور را sync می‌کنیم (سرور خودش چرخه می‌زند)
+    // حالت سرور ۲۴/۷: state سرور sync می‌شود (سرور خودش چرخه می‌زند).
+    // v1.5.4 — اگر sync ناموفق بود، MTM محلی ادامه می‌دهد (ربات ساکت نشود).
     if (settings.server247.enabled && (await isServerModeActive())) {
-      await syncAutoTradeStateFromServer();
-      return;
+      const synced = await syncAutoTradeStateFromServer();
+      if (synced) return;
     }
     // قیمت با کش ۲.۵ ثانیه‌ای تا PnL نمایش واقعاً هر ۳ ثانیه تازه شود
     const prices = await getBinancePrices(2_500).catch(() => ({}) as Record<string, number>);
@@ -1774,12 +1779,34 @@ export interface ServerAutoTradeState {
   logs: AutoEngineLog[];
   lastCycleAt: number | null;
   serverNow: number;
+  /** v1.5.4 — آیا توکن/چت‌آیدی تلگرام روی سرور تنظیم شده (اعلان‌ها می‌روند؟). */
+  telegramConfigured?: boolean;
+}
+
+// v1.5.4 — منطق merge در فایل مستقل utils/autoMerge.ts (قابل تست در Node)
+export { mergePositionsById } from './autoMerge';
+
+/**
+ * v1.5.4 — توکن/چت‌آیدی تلگرام که برنامه برای اعلان‌های خودش استفاده می‌کند
+ * (@crypto_scanner_settings) — حالا با کانفیگ ربات به سرور هم فرستاده می‌شود
+ * تا اعلان‌های ۲۴/۷ بدون راه‌اندازی جداگانه ربات تلگرام سرور کار کنند.
+ */
+async function loadTelegramAnnounceCreds(): Promise<{ botToken: string; chatId: string } | undefined> {
+  try {
+    const raw = await AsyncStorage.getItem('@crypto_scanner_settings');
+    if (!raw) return undefined;
+    const s = JSON.parse(raw) as { telegramEnabled?: boolean; telegramBotToken?: string; telegramChatId?: string };
+    if (!s?.telegramBotToken || !s?.telegramChatId) return undefined;
+    return { botToken: s.telegramBotToken, chatId: s.telegramChatId };
+  } catch {
+    return undefined;
+  }
 }
 
 export async function pushAutoTradeConfigToServer(
   settings: AutoTradeSettings,
   reset = false
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; telegramConfigured?: boolean }> {
   try {
     const base = await getServerUrl();
     if (!base) return { ok: false, error: 'آدرس سرور تنظیم نشده' };
@@ -1788,6 +1815,21 @@ export async function pushAutoTradeConfigToServer(
     const keys = settings.mode === 'real' && serverEnabled ? await loadRealKeys() : undefined;
     if (settings.mode === 'real' && serverEnabled && !keys) {
       return { ok: false, error: 'کلید API بایننس برای حالت واقعی پیدا نشد' };
+    }
+    // v1.5.4 — snapshot وضعیت محلی به‌عنوان seed: سرور بک‌تست را از همان‌جایی که
+    // برنامه بوده ادامه می‌دهد (تاریخچه حفظ می‌شود — «روشن کردن سوییچ تلگرام
+    // همه‌چیز را پاک کرد» دیگر رخ نمی‌دهد) + توکن تلگرام برنامه هم فرستاده می‌شود.
+    let demoPositions: DemoAutoPosition[] = [];
+    let realPositions: RealAutoPosition[] = [];
+    let logs: AutoEngineLog[] = [];
+    let telegram: { botToken: string; chatId: string } | undefined;
+    if (!reset) {
+      [demoPositions, realPositions, logs, telegram] = await Promise.all([
+        loadDemoPositions(),
+        loadRealPositions(),
+        getAutoLogs(),
+        loadTelegramAnnounceCreds(),
+      ]);
     }
     const payload = {
       secret,
@@ -1808,6 +1850,14 @@ export async function pushAutoTradeConfigToServer(
         // v1.5.3 — برچسب استراتژی فعال + پرچم ریست کامل دمو
         strategyLabel: await currentStrategyLabel(),
         reset,
+        // v1.5.4 — توکن تلگرام برنامه → اعلان‌های ۲۴/۷ سرور بدون تنظیم جداگانه
+        telegram,
+        // v1.5.4 — وضعیت فعلی بک‌تست (سرور از همین‌جا ادامه می‌دهد)
+        state: {
+          demoPositions: demoPositions.slice(0, 200),
+          realPositions: realPositions.slice(0, 200),
+          logs: logs.slice(0, 60),
+        },
         binanceKeys: keys ? { apiKey: keys.apiKey, apiSecret: keys.apiSecret } : undefined,
       },
     };
@@ -1816,10 +1866,10 @@ export async function pushAutoTradeConfigToServer(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; telegramConfigured?: boolean };
     if (res.ok && data?.ok) {
       await setServerModeActive(serverEnabled);
-      return { ok: true };
+      return { ok: true, telegramConfigured: data?.telegramConfigured };
     }
     await setServerModeActive(false);
     // v1.5.3 — 404 = سرور هنوز کد موتور بک‌تست را ندارد (Railway دوباره deploy نشده)
@@ -1847,9 +1897,25 @@ export async function syncAutoTradeStateFromServer(): Promise<boolean> {
     if (!res.ok) return false;
     const data = (await res.json()) as ServerAutoTradeState;
     if (!data?.ok) return false;
-    if (Array.isArray(data.demoPositions)) await saveDemoPositions(data.demoPositions);
-    if (Array.isArray(data.realPositions)) await saveRealPositions(data.realPositions);
-    if (Array.isArray(data.logs)) {
+    // v1.5.4 — ریشه‌ای: sync دیگر هرگز داده محلی را «پاک» نمی‌کند.
+    // قبلاً آرایه خالی سرور (مثلاً لحظه اول روشن کردن سوییچ تلگرام که سرور
+    // هنوز state نداشت) روی داده‌های محلی نوشته می‌شد و کاربر «همه‌چیز
+    // پاک شد، هیچ معامله‌ای نیست» می‌دید. حالا:
+    //   • آرایه غیرخالی سرور → merge بر اساس id (نسخه سرور برنده)
+    //   • آرایه خالی سرور + داده محلی موجود → محلی دست‌نخورده می‌ماند
+    const localDemo = await loadDemoPositions();
+    const localReal = await loadRealPositions();
+    if (Array.isArray(data.demoPositions)) {
+      if (data.demoPositions.length > 0 || localDemo.length === 0) {
+        await saveDemoPositions(mergePositionsById(localDemo, data.demoPositions));
+      }
+    }
+    if (Array.isArray(data.realPositions)) {
+      if (data.realPositions.length > 0 || localReal.length === 0) {
+        await saveRealPositions(mergePositionsById(localReal, data.realPositions));
+      }
+    }
+    if (Array.isArray(data.logs) && data.logs.length > 0) {
       await AsyncStorage.setItem(LOG_KEY, JSON.stringify(data.logs.slice(0, 60)));
     }
     if (typeof data.lastCycleAt === 'number') lastGlobalCycleAt = data.lastCycleAt;

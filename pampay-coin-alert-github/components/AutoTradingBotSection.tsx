@@ -134,6 +134,31 @@ interface EditTpslTarget {
   lastPrice: number;
 }
 
+/** v1.5.4 — پوزیشن هدف «بستن بخشی از معامله» (دکمه ✂ — درصد دلخواه + تایید). */
+interface PartialCloseTarget {
+  kind: 'demo' | 'real';
+  id: string;
+  symbol: string;
+  side: 'long' | 'short';
+  qty: number;
+  entryPrice: number;
+  leverage: number;
+  lastPrice: number;
+}
+
+/** v1.5.4 — ارقام فارسی/عربی → لاتین (ورودی درصد کاربر). */
+function parseFaPercent(text: string): number {
+  const faToEn = (s: string): string =>
+    s
+      .replace(/[۰-۹]/g, (d) => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)))
+      .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+      .replace(/٫/g, '.')
+      .replace(/[٪%]/g, '')
+      .replace(/[^0-9.]/g, '');
+  const n = parseFloat(faToEn(text).replace(/\.(?=.*\.)/g, ''));
+  return Number.isFinite(n) ? n : NaN;
+}
+
 export default function AutoTradingBotSection({ realKeys: realKeysProp }: { realKeys?: RealKeys }) {
   const [settings, setSettings] = useState<AutoTradeSettings>(DEFAULT_AUTO_SETTINGS);
   const [whales, setWhales] = useState<{ address: string; label: string }[]>([]);
@@ -160,10 +185,16 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [editStopText, setEditStopText] = useState('');
   const [editTakeText, setEditTakeText] = useState('');
   const [tpslBusy, setTpslBusy] = useState(false);
+  /** v1.5.4 — بستن بخشی از حجم با درصد دلخواه + تایید (دکمه ✂). */
+  const [partialTarget, setPartialTarget] = useState<PartialCloseTarget | null>(null);
+  const [partialPctText, setPartialPctText] = useState('50');
+  const [partialBusy, setPartialBusy] = useState(false);
+  const [partialHint, setPartialHint] = useState('');
   /** v1.5.2 — وضعیت اتصال سرور ۲۴/۷ (تلگرام). */
-  const [server247State, setServer247State] = useState<{ busy: boolean; lastOk: boolean | null; error?: string }>({
+  const [server247State, setServer247State] = useState<{ busy: boolean; lastOk: boolean | null; error?: string; telegramOk?: boolean | null }>({
     busy: false,
     lastOk: null,
+    telegramOk: null,
   });
   const pnlCardRef = useRef<View>(null);
   const settingsRef = useRef(settings);
@@ -203,7 +234,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     if (next.server247.enabled || wasServer) {
       setServer247State((s) => ({ ...s, busy: true }));
       const r = await pushAutoTradeConfigToServer(next);
-      setServer247State((s) => ({ ...s, busy: false, lastOk: r.ok, error: r.error }));
+      setServer247State((s) => ({ ...s, busy: false, lastOk: r.ok, error: r.error, telegramOk: r.ok ? (r.telegramConfigured ?? null) : null }));
     }
   }, []);
 
@@ -460,6 +491,46 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     } finally {
       setTpslBusy(false);
     }
+  };
+
+  /**
+   * v1.5.4 — «دکمه کات را می‌زنم یه پیغام بده و بهم بگه چند درصد از حجم را
+   * می‌خوای ببندی با انتخاب خودم و تایید» — بستن درصد دلخواه از حجم معامله
+   * بعد از تأیید. ۱۰۰٪ = بستن کامل.
+   */
+  const applyPartialClose = async () => {
+    if (!partialTarget || partialBusy) return;
+    const pct = parseFaPercent(partialPctText);
+    if (!Number.isFinite(pct) || pct < 10) {
+      setPartialHint('درصد را بین ۱۰ تا ۱۰۰ وارد کنید (کمتر از ۱۰٪ مجاز نیست).');
+      return;
+    }
+    setPartialHint('');
+    setPartialBusy(true);
+    try {
+      let ok = false;
+      if (pct >= 95) {
+        // بستن کامل
+        ok = await manualClosePosition(settings, realKeys, partialTarget);
+      } else {
+        ok = await manualPartialClosePosition(settings, realKeys, partialTarget, pct / 100);
+      }
+      if (ok) {
+        setPartialTarget(null);
+        await refreshPositions();
+      } else {
+        setPartialHint('بستن انجام نشد — دوباره تلاش کنید (در حالت واقعی اتصال صرافی لازم است).');
+      }
+    } finally {
+      setPartialBusy(false);
+    }
+  };
+
+  /** v1.5.4 — باز کردن مودال درصد برای دکمه ✂ (پیش‌فرض ۵۰٪). */
+  const openPartialClose = (t: PartialCloseTarget) => {
+    setPartialHint('');
+    setPartialPctText('50');
+    setPartialTarget(t);
   };
 
   // v1.5.1 — نمایش سخت‌گیرانه: در هر حالت فقط داده‌های همان حالت (واقعی = بدون ریز دمو)
@@ -919,6 +990,15 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 </Text>
               </View>
             )}
+            {/* v1.5.4 — وضعیت اعلان تلگرام: توکن ربات خود کاربر حالا همراه کانفیگ به سرور می‌رود */}
+            {settings.server247.enabled && server247State.lastOk === true && server247State.telegramOk === false && (
+              <View style={[styles.engineBadge, { borderColor: colors.dark.accent + '44', backgroundColor: colors.dark.accent + '0F' }]}>
+                <Send size={11} color={colors.dark.accent} />
+                <Text style={styles.engineBadgeText}>
+                  اعلان‌های تلگرام تنظیم نشده — در تنظیمات برنامه، «ربات تلگرام» را وصل کنید (توکن و چت‌آیدی) تا پیام‌های ۲۴/۷ برسد.
+                </Text>
+              </View>
+            )}
           </View>
 
           {/* v1.5.0 — PnL card (capturable as image) — v1.5.2: دقیقاً مثل
@@ -1083,6 +1163,82 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             </Pressable>
           </Modal>
 
+          {/* v1.5.4 — مودال «بستن بخشی از معامله» (دکمه ✂): درصد دلخواه + تایید */}
+          <Modal visible={!!partialTarget} transparent animationType="fade">
+            <Pressable style={styles.previewOverlay} onPress={() => setPartialTarget(null)}>
+              <View style={styles.tpslModal} onStartShouldSetResponder={() => true}>
+                <View style={styles.previewHead}>
+                  <Text style={styles.previewTitle}>
+                    بستن بخشی از معامله — {partialTarget?.symbol} ({partialTarget?.side === 'long' ? 'لانگ' : 'شورت'})
+                  </Text>
+                  <Pressable hitSlop={8} onPress={() => setPartialTarget(null)}>
+                    <X size={18} color={colors.dark.textMuted} />
+                  </Pressable>
+                </View>
+                {partialTarget && (
+                  <>
+                    {(() => {
+                      const margin = partialTarget.leverage > 0 ? (partialTarget.qty * partialTarget.entryPrice) / partialTarget.leverage : 0;
+                      const pct = parseFaPercent(partialPctText);
+                      const closeUsd = Number.isFinite(pct) ? (margin * pct) / 100 : 0;
+                      return (
+                        <Text style={styles.tpslHint}>
+                          حجم فعلی: {partialTarget.qty.toPrecision(6)} • مارجین: ${margin.toFixed(2)}
+                          {'\n'}
+                          {Number.isFinite(pct) && pct >= 10 && pct < 95
+                            ? `با ${partialPctText}٪ ≈ $${closeUsd.toFixed(2)} از مارجین این معامله بسته می‌شود`
+                            : Number.isFinite(pct) && pct >= 95
+                              ? 'بستن ۱۰۰٪ — کل معامله بسته می‌شود'
+                              : 'درصد بستن را انتخاب یا وارد کنید (۱۰ تا ۱۰۰)'}
+                        </Text>
+                      );
+                    })()}
+                    <View style={styles.partialChipRow}>
+                      {['25', '50', '75'].map((v) => (
+                        <Pressable
+                          key={v}
+                          style={[styles.partialChip, partialPctText === v && styles.partialChipActive]}
+                          onPress={() => {
+                            setPartialPctText(v);
+                            setPartialHint('');
+                          }}
+                          testID={`partial-chip-${v}`}
+                        >
+                          <Text style={[styles.partialChipText, partialPctText === v && styles.partialChipTextActive]}>{v}٪</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                    <Text style={styles.tpslLabel}>درصد حجم برای بستن (۱۰ تا ۱۰۰)</Text>
+                    <TextInput
+                      style={styles.tpslInput}
+                      value={partialPctText}
+                      onChangeText={(t) => {
+                        setPartialPctText(t);
+                        setPartialHint('');
+                      }}
+                      keyboardType="decimal-pad"
+                      testID="partial-pct-input"
+                    />
+                    {partialHint ? <Text style={styles.partialHintText}>{partialHint}</Text> : null}
+                    <Pressable style={styles.partialCloseBtn} onPress={() => void applyPartialClose()} disabled={partialBusy} testID="partial-apply">
+                      {partialBusy ? (
+                        <ActivityIndicator size="small" color={colors.dark.background} />
+                      ) : (
+                        <Scissors size={14} color={colors.dark.background} />
+                      )}
+                      <Text style={styles.tpslSaveBtnText}>ببند ({partialPctText || '—'}٪)</Text>
+                    </Pressable>
+                    <Text style={styles.partialNoteText}>
+                      {partialTarget.kind === 'real'
+                        ? 'در حالت واقعی سفارش reduceOnly فرستاده می‌شود — استاپ و تیک‌پرافیت صرافی روی حجم باقی‌مانده فعال می‌ماند.'
+                        : 'در حالت دمو، بخش بسته‌شده با دلیل «بستن دستی بخشی از حجم» در تاریخچه و PnL ثبت می‌شود.'}
+                    </Text>
+                  </>
+                )}
+              </View>
+            </Pressable>
+          </Modal>
+
           {/* demo positions — فقط حالت دمو (در واقعی، ریز معاملات دمو نمایش داده نمی‌شود) */}
           {settings.mode === 'demo' && (
             <View style={styles.sourceBox}>
@@ -1105,6 +1261,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 const pnl = (p.lastPrice - p.entryPrice) * dir * p.qty;
                 // v1.5.2 — درصد سود/زیان هر معامله باز (نسبت به مارجین)
                 const pnlPct = positionPnlPercent(p);
+                // v1.5.4 — «حجم مارجین ورودی تو پوزیشنا باز هم نشون بده»
+                const posMarginUsd = p.leverage > 0 ? (p.qty * p.entryPrice) / p.leverage : 0;
+                const posNotionalUsd = p.qty * p.entryPrice;
                 return (
                   <View key={p.id} style={styles.posRow}>
                     <View style={styles.posMain}>
@@ -1123,6 +1282,10 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       </Text>
                       <Text style={styles.posPrices}>
                         SL {fmtExact(p.stopPrice)} / TP {fmtExact(p.takePrice)}
+                      </Text>
+                      {/* v1.5.4 — مارجین ورودی + ارزش فعلی پوزیشن */}
+                      <Text style={styles.posMargin}>
+                        مارجین ورودی: ${posMarginUsd.toFixed(2)} • ارزش پوزیشن: ${posNotionalUsd.toFixed(2)}
                       </Text>
                       {/* v1.5.3 — ساعت و تاریخ باز شدن معامله */}
                       <Text style={styles.posTime}>باز شد: {fmtOpenTime(p.openedAt)}</Text>
@@ -1154,17 +1317,21 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       >
                         <Edit3 size={11} color={colors.dark.accent} />
                       </Pressable>
-                      {/* v1.5.3 — «بصورت دستی هم بشه بخشی از حجم را ببندم» */}
+                      {/* v1.5.4 — ✂ بستن درصد دلخواه (اول درصد پرسیده می‌شود) */}
                       <Pressable
                         style={styles.posHalfBtn}
                         hitSlop={6}
                         onPress={() =>
-                          void manualPartialClosePosition(settings, realKeys, {
+                          openPartialClose({
+                            kind: 'demo',
                             id: p.id,
                             symbol: p.symbol,
                             side: p.side,
+                            qty: p.qty,
+                            entryPrice: p.entryPrice,
+                            leverage: p.leverage,
                             lastPrice: p.lastPrice,
-                          }).then(refreshPositions)
+                          })
                         }
                         testID={`pos-half-${p.id}`}
                       >
@@ -1249,6 +1416,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 // v1.5.2 — درصد سود/زیان هر معامله باز (نسبت به مارجین)
                 const marginUsd = p.leverage > 0 ? (p.qty * p.entryPrice) / p.leverage : 0;
                 const pnlPct = positionPnlPercent(p, marginUsd);
+                // v1.5.4 — «حجم مارجین ورودی تو پوزیشنا باز هم نشون بده»
+                const posNotionalUsd = p.qty * p.entryPrice;
                 return (
                   <View key={p.id} style={styles.posRow}>
                     <View style={styles.posMain}>
@@ -1267,6 +1436,10 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       </Text>
                       <Text style={styles.posPrices}>
                         SL {fmtExact(p.stopPrice)} / TP {fmtExact(p.takePrice)}
+                      </Text>
+                      {/* v1.5.4 — مارجین ورودی + ارزش فعلی پوزیشن */}
+                      <Text style={styles.posMargin}>
+                        مارجین ورودی: ${marginUsd.toFixed(2)} • ارزش پوزیشن: ${posNotionalUsd.toFixed(2)}
                       </Text>
                       {/* v1.5.3 — ساعت و تاریخ باز شدن معامله */}
                       <Text style={styles.posTime}>باز شد: {fmtOpenTime(p.openedAt)}</Text>
@@ -1297,18 +1470,23 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       >
                         <Edit3 size={11} color={colors.dark.accent} />
                       </Pressable>
-                      {/* v1.5.3 — بستن دستی نصف حجم (واقعی) */}
+                      {/* v1.5.4 — ✂ بستن درصد دلخواه (اول درصد پرسیده می‌شود) */}
                       <Pressable
                         style={styles.posHalfBtn}
                         hitSlop={6}
                         onPress={() =>
-                          void manualPartialClosePosition(settings, realKeys, {
+                          openPartialClose({
+                            kind: 'real',
                             id: p.id,
                             symbol: p.symbol,
                             side: p.side,
+                            qty: p.qty,
+                            entryPrice: p.entryPrice,
+                            leverage: p.leverage,
                             lastPrice: p.lastPrice,
-                          }).then(refreshPositions)
+                          })
                         }
+                        testID={`pos-half-real-${p.id}`}
                       >
                         <Scissors size={11} color={colors.dark.blue} />
                       </Pressable>
@@ -1877,6 +2055,62 @@ const styles = StyleSheet.create({
     fontSize: 8.5,
     color: colors.dark.textMuted,
     marginTop: 2,
+  },
+  /* v1.5.4 — «حجم مارجین ورودی تو پوزیشنا نشون بده» */
+  posMargin: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: colors.dark.blue,
+    marginTop: 2,
+  },
+  /* v1.5.4 — مودال بستن درصد دلخواه (✂) */
+  partialChipRow: {
+    flexDirection: 'row',
+    gap: 6,
+    marginBottom: 4,
+  },
+  partialChip: {
+    flex: 1,
+    alignItems: 'center',
+    paddingVertical: 7,
+    borderRadius: 8,
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+  },
+  partialChipActive: {
+    backgroundColor: colors.dark.blue + '26',
+    borderColor: colors.dark.blue,
+  },
+  partialChipText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: colors.dark.textSecondary,
+  },
+  partialChipTextActive: {
+    color: colors.dark.blue,
+  },
+  partialCloseBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    alignSelf: 'stretch',
+    backgroundColor: colors.dark.red,
+    borderRadius: 10,
+    paddingVertical: 12,
+    marginTop: 8,
+  },
+  partialHintText: {
+    fontSize: 9,
+    color: colors.dark.red,
+    marginTop: 4,
+  },
+  partialNoteText: {
+    fontSize: 8.5,
+    color: colors.dark.textMuted,
+    lineHeight: 13,
+    marginTop: 8,
   },
   /* v1.5.3 — برچسب استراتژی کنار نماد ارز */
   posStrategy: {
