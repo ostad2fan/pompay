@@ -1,4 +1,18 @@
 /**
+ * autoTradingEngine.ts — v1.5.3
+ *
+ * v1.5.3 (طبق بازخورد کاربر):
+ *   • حد ضرر با لوریج دقیق می‌بندد: «حد ضرر ۳٪ با لوریج ۵ = دقیقاً ۱۵٪ ضرر
+ *     حساب» — فاصله قیمت استاپ = حد ضرر ÷ لوریج.
+ *   • تریل استاپ جدید: با ۱٪ حرکت اسپات به سود (با لوریج ۵ یعنی ۵٪ سود)
+ *     معامله ریسک‌فری می‌شود؛ بعدش استاپ همیشه روی نصفِ بیشترین سود
+ *     می‌نشیند (۲٪ اسپات × ۵ = ۱۰٪ → استاپ روی ۵٪ سود).
+ *   • برداشت سود پله‌ای: وقتی سود حساب به ۲۵٪ یا ۵۰٪ برسد ربات خودش
+ *     نصف حجم را می‌بندد + دکمه «بستن نصف» دستی برای هر پوزیشن.
+ *   • ریست کامل دمو (پاک شدن همه‌چیز حتی تاریخچه).
+ *   • اعلام تلگرام حتی وقتی سرور ۲۴/۷ فعال نیست (برنامه باز → پیام می‌رود).
+ *   • هر پوزیشن نام استراتژی فعال موقع باز شدن را نگه می‌دارد (تاریخچه).
+ *
  * autoTradingEngine.ts — v1.5.0
  *
  * «معامله‌گر خودکار» — copies WHALE positions and trades INDICATOR signals
@@ -36,6 +50,7 @@ import {
 } from './hyperliquidApi';
 import {
   closePosition as closeRealPosition,
+  closePartialPosition,
   getPositions,
   openRealPosition,
   updateStopLoss,
@@ -153,7 +168,7 @@ export interface DemoAutoPosition {
   sourceLabel: string;
   status: 'open' | 'closed';
   lastPrice: number;
-  closeReason?: 'stop' | 'take' | 'signal' | 'whale-close' | 'manual';
+  closeReason?: 'stop' | 'take' | 'signal' | 'whale-close' | 'manual' | 'partial' | 'partial-manual';
   closedAt?: number;
   realizedPnl?: number;
   /** v1.5.0 — trailing-stop bookkeeping. */
@@ -161,6 +176,10 @@ export interface DemoAutoPosition {
   highWater?: number;
   lowWater?: number;
   trailArmed?: boolean;
+  /** v1.5.3 — نام استراتژی فعال در لحظه باز شدن (برای تاریخچه). */
+  strategyName?: string;
+  /** v1.5.3 — چند بار ربات خودش نصف حجم بسته (۰/۱/۲ — آستانه ۲۵٪ و ۵۰٪). */
+  partialsDone?: number;
 }
 
 /** v1.5.0 — a REAL position the engine opened (tracked for trailing/PnL). */
@@ -178,13 +197,17 @@ export interface RealAutoPosition {
   sourceLabel: string;
   status: 'open' | 'closed';
   lastPrice: number;
-  closeReason?: 'stop' | 'take' | 'signal' | 'whale-close' | 'manual';
+  closeReason?: 'stop' | 'take' | 'signal' | 'whale-close' | 'manual' | 'partial' | 'partial-manual';
   closedAt?: number;
   realizedPnl?: number;
   initialStopPrice?: number;
   highWater?: number;
   lowWater?: number;
   trailArmed?: boolean;
+  /** v1.5.3 — نام استراتژی فعال در لحظه باز شدن (برای تاریخچه). */
+  strategyName?: string;
+  /** v1.5.3 — چند بار ربات خودش نصف حجم بسته (۰/۱/۲ — آستانه ۲۵٪ و ۵۰٪). */
+  partialsDone?: number;
 }
 
 export interface AutoEngineLog {
@@ -391,15 +414,22 @@ async function getBinancePrices(maxAgeMs = 30_000): Promise<Record<string, numbe
 
 // ---------------------------------------------------------------------------
 // SL/TP math — «خودش اتومات استاپ و تیپی را نسبت به نقطه ورود بگذارد»
+// v1.5.3 — «وقتی حد ضرر را روی مثلا ۳درصد میزارم با لوریج ۵ دقیقا روی
+// ۱۵ درصد ببنده»: فاصله قیمت استاپ = حد ضرر ÷ لوریج؛ چون ضرر حساب =
+// حرکت قیمت × لوریج، یعنی ضررِ بسته‌شده دقیقاً همان «حد ضرر» می‌شود.
 // ---------------------------------------------------------------------------
 
 export function computeStopTake(
   side: 'long' | 'short',
   entry: number,
   maxLossPercent: number,
-  rewardRatio: number
+  rewardRatio: number,
+  leverage = 1
 ): { stopPrice: number; takePrice: number } {
-  const risk = (Math.max(0.5, Math.min(90, maxLossPercent)) / 100) * entry;
+  const lev = Math.max(1, leverage);
+  const lossPct = Math.max(0.5, Math.min(90, maxLossPercent));
+  // price distance = loss% / leverage (so ACCOUNT loss = loss% exactly)
+  const risk = (lossPct / 100 / lev) * entry;
   const stopPrice = side === 'long' ? entry - risk : entry + risk;
   const takePrice =
     side === 'long' ? entry + risk * Math.max(0.5, rewardRatio) : entry - risk * Math.max(0.5, rewardRatio);
@@ -407,13 +437,24 @@ export function computeStopTake(
 }
 
 // ---------------------------------------------------------------------------
-// v1.5.0 — TRAILING STOP math («هیچ معامله سودده با ضرر بسته نشود»)
+// v1.5.3 — TRAILING STOP جدید (طبق مشخصات دقیق کاربر)
+//   ۱) ریسک‌فری: وقتی قیمت ۱٪ به سود برود (با لوریج ۵ یعنی ۵٪ سود حساب)،
+//      استاپ به نقطه ورود (+کارمزد) می‌چسبد — دیگر ضرر ممکن نیست.
+//   ۲) بعد از آن استاپ روی «نصفِ بیشترین سود» می‌نشیند و فقط بالا می‌رود:
+//      ۲٪ اسپات × ۵ = ۱۰٪ سود → استاپ روی ۵٪ سود؛ برگشت قیمت = حداقل
+//      نصف سود قفل‌شده از آب درمی‌آید.
+//   ۳) (این تابع فقط استاپ را جابه‌جا می‌کند؛ برداشت سود پله‌ای ۲۵٪/۵۰٪
+//      در markDemoPositions/manageRealPositions انجام می‌شود.)
 // ---------------------------------------------------------------------------
 
 /** Binance futures taker fee ≈ 0.05% per side → 0.1% round trip of notional. */
 const FEE_ROUNDTRIP = 0.001;
-/** arm the breakeven+fee floor once the favorable excursion exceeds fee + margin. */
-const FEE_ARM_MARGIN = 0.0015;
+/** ۱٪ حرکت قیمت به سود → فعال‌شدن ریسک‌فری (طبق مثال کاربر با لوریج ۵). */
+const RISK_FREE_SPOT_PCT = 0.01;
+/** استاپ روی نصفِ بیشترین سود می‌نشیند. */
+const LOCK_RATIO = 0.5;
+/** آستانه‌های سودِ حساب (٪ مارجین) که ربات نصف حجم را می‌بندد. */
+export const PARTIAL_TAKE_PNL_PCTS = [25, 50];
 
 export interface TrailingUpdate {
   newStop: number;
@@ -425,14 +466,12 @@ export interface TrailingUpdate {
 }
 
 /**
- * Ratchet a position's stop upward (long) / downward (short):
- *  1. FEE FLOOR (independent, earliest): the moment the favorable excursion
- *     covers the round-trip fee, the stop floors at breakeven+fee → from
- *     then on the trade can NEVER close at a loss, and a risk-freed trade
- *     always takes at least the exchange fee out («هیچ معامله سودده‌ای با
- *     ضرر بسته نمی‌شود» + «اگر ریسک‌فری شود حداقل کارمزد در می‌آید»).
- *  2. TRAIL: arms once the excursion reaches activationRatio × risk, then
- *     follows the best price at trailRatio × risk behind it.
+ * v1.5.3 — رatchet a position's stop (long up / short down), user spec:
+ *  1. RISK-FREE (earliest): favorable price move ≥ 1% (spot) → stop floors at
+ *     breakeven+fee → the trade can NEVER close at a loss anymore.
+ *  2. TRAIL: after risk-free, the stop follows the best price, locking
+ *     LOCK_RATIO (50%) of the PEAK favorable move — with leverage 5: 10%
+ *     account profit → stop at 5% account profit, so a reversal still pays.
  */
 export function computeTrailing(
   p: {
@@ -447,32 +486,26 @@ export function computeTrailing(
   px: number,
   t: AutoTrailingSettings
 ): TrailingUpdate {
-  const initialStop = p.initialStopPrice ?? p.stopPrice;
-  const risk = Math.abs(p.entryPrice - initialStop);
   const highWater = Math.max(p.highWater ?? p.entryPrice, px);
   const lowWater = Math.min(p.lowWater ?? p.entryPrice, px);
-  if (!t.enabled || !(risk > 0)) {
+  if (!t.enabled) {
     return { newStop: p.stopPrice, armed: p.trailArmed ?? false, highWater, lowWater, changed: false };
   }
   const long = p.side === 'long';
   const best = long ? highWater : lowWater;
   const favorable = long ? best - p.entryPrice : p.entryPrice - best;
-  const armed = (p.trailArmed ?? false) || favorable >= t.activationRatio * risk;
-  // candidate starts as "no change"
+  const spotPct = favorable / p.entryPrice;
+  // v1.5.3 — ۱٪ حرکت اسپات به سود = فعال شدن ریسک‌فری
+  const armed = (p.trailArmed ?? false) || spotPct >= RISK_FREE_SPOT_PCT;
   let candidate = long ? -Infinity : Infinity;
-  // 1) fee-guaranteed breakeven floor — as soon as the excursion covers fees
-  const excursionPct = favorable / p.entryPrice;
-  if (excursionPct > FEE_ARM_MARGIN) {
-    const breakeven = long
+  if (armed && favorable > 0) {
+    // ریسک‌فری: حداقل سربه‌سر + کارمزد
+    const feeFloor = long
       ? p.entryPrice * (1 + FEE_ROUNDTRIP)
       : p.entryPrice * (1 - FEE_ROUNDTRIP);
-    candidate = long ? Math.max(candidate, breakeven) : Math.min(candidate, breakeven);
-  }
-  // 2) trailing behind the extreme once armed
-  if (armed) {
-    const trailDist = t.trailRatio * risk;
-    const c = long ? best - trailDist : best + trailDist;
-    candidate = long ? Math.max(candidate, c) : Math.min(candidate, c);
+    // تریل: نصفِ بیشترین سود قفل شود
+    const lockPrice = p.entryPrice + (long ? 1 : -1) * favorable * LOCK_RATIO;
+    candidate = long ? Math.max(feeFloor, lockPrice) : Math.min(feeFloor, lockPrice);
   }
   if (!Number.isFinite(candidate)) {
     return { newStop: p.stopPrice, armed, highWater, lowWater, changed: false };
@@ -481,6 +514,66 @@ export function computeTrailing(
   const newStop = long ? Math.max(p.stopPrice, candidate) : Math.min(p.stopPrice, candidate);
   const changed = newStop !== p.stopPrice;
   return { newStop, armed, highWater, lowWater, changed };
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.3 — Partial take-profit («وقتی معامله به ۲۵٪ یا ۵۰٪ رسید نصف معامله
+// را ببنده — ربات مدیریت سرمایه کنه که سودی از دست نره») + helperهای مشترک
+// ---------------------------------------------------------------------------
+
+/** سود لحظه‌ای به درصدِ مارجینِ باقی‌مانده (بعد از پارشیال هم درست می‌ماند). */
+function marginPnlPctOf(
+  p: { side: 'long' | 'short'; entryPrice: number; qty: number; leverage?: number; sizeUsd?: number },
+  px: number
+): number {
+  const dir = p.side === 'long' ? 1 : -1;
+  const pnl = (px - p.entryPrice) * dir * p.qty;
+  const margin = (p.qty * p.entryPrice) / Math.max(1, p.leverage ?? 1);
+  return margin > 0 ? (pnl / margin) * 100 : 0;
+}
+
+/** v1.5.3 — نام استراتژی فعال (از لیست روشن/خاموش تب بک‌تست). */
+const STRATEGY_LABELS: Record<string, string> = {
+  conservative: 'محافظه‌کارانه',
+  balanced: 'متعادل',
+  aggressive: 'تهاجمی',
+  scalper: 'اسکالپر',
+};
+
+async function currentStrategyLabel(): Promise<string> {
+  try {
+    const raw = await AsyncStorage.getItem('@trading_strategies_v1');
+    if (!raw) return STRATEGY_LABELS.balanced;
+    const m = JSON.parse(raw) as Record<string, boolean>;
+    const order = ['conservative', 'balanced', 'aggressive', 'scalper'];
+    const first = order.find((k) => m[k]);
+    return STRATEGY_LABELS[first ?? 'balanced'] ?? STRATEGY_LABELS.balanced;
+  } catch {
+    return STRATEGY_LABELS.balanced;
+  }
+}
+
+/** v1.5.3 — اعلام تلگرام سمت برنامه (وقتی برنامه باز است حتی بدون سرور ۲۴/۷). */
+async function announceTelegram(title: string, text: string): Promise<void> {
+  try {
+    if (Platform.OS === 'web') return;
+    const raw = await AsyncStorage.getItem('@crypto_scanner_settings');
+    if (!raw) return;
+    const s = JSON.parse(raw) as { telegramEnabled?: boolean; telegramBotToken?: string; telegramChatId?: string };
+    if (!s?.telegramEnabled || !s?.telegramBotToken || !s?.telegramChatId) return;
+    await fetch(`https://api.telegram.org/bot${s.telegramBotToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: s.telegramChatId,
+        text: `🤖 ${title}\n${text}`,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+  } catch {
+    // never fatal
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -592,7 +685,8 @@ async function openDemo(
     return false;
   }
   const sizeUsd = gate.sizeUsd;
-  const { stopPrice, takePrice } = computeStopTake(side, price, settings.maxLossPercent, settings.rewardRatio);
+  const { stopPrice, takePrice } = computeStopTake(side, price, settings.maxLossPercent, settings.rewardRatio, settings.leverage);
+  const strategyName = await currentStrategyLabel();
   const qty = (sizeUsd * settings.leverage) / price;
   const pos: DemoAutoPosition = {
     id: `d-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -613,15 +707,22 @@ async function openDemo(
     highWater: price,
     lowWater: price,
     trailArmed: false,
+    strategyName,
+    partialsDone: 0,
   };
   await saveDemoPositions([pos, ...positions]);
   await appendLog(
     'open',
-    `دمو ${side === 'long' ? 'خرید' : 'فروش'} ${symbol} @ ${price} (${sourceLabel}) — SL ${stopPrice.toFixed(4)} / TP ${takePrice.toFixed(4)}${sizeUsd !== settings.positionSizeUsd ? ` • حجم هوشمند: $${sizeUsd.toFixed(1)}` : ''}`
+    `دمو ${side === 'long' ? 'خرید' : 'فروش'} ${symbol} @ ${price} (${sourceLabel} • استراتژی ${strategyName}) — SL ${stopPrice.toFixed(4)} / TP ${takePrice.toFixed(4)}${sizeUsd !== settings.positionSizeUsd ? ` • حجم هوشمند: $${sizeUsd.toFixed(1)}` : ''}`
   );
   await notifyAutoTrade(
     `🤖 ربات: ${side === 'long' ? 'خرید' : 'فروش'} ${symbol}`,
     `ورود ${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)} (${sourceLabel} — دمو)`
+  );
+  // v1.5.3 — اعلام تلگرام از خود برنامه (وقتی برنامه باز است)
+  await announceTelegram(
+    `بک‌تست (دمو): ${side === 'long' ? '🟢 خرید' : '🔴 فروش'} ${symbol}`,
+    `ورود ${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)}\nمنبع: ${sourceLabel} • لوریج ${settings.leverage}x • استراتژی ${strategyName}`
   );
   return true;
 }
@@ -648,6 +749,117 @@ async function closeDemo(
     `🤖 ربات: بستن ${p.symbol}`,
     `${reason === 'stop' ? 'استاپ' : reason === 'take' ? 'تیک‌پرافیت' : reason === 'whale-close' ? 'بستن نهنگ' : 'سیگنال'} • ${pnl >= 0 ? 'سود' : 'ضرر'} $${Math.abs(pnl).toFixed(2)} (دمو)`
   );
+  await announceTelegram(
+    `بک‌تست (دمو): بستن ${p.symbol}`,
+    `${reason === 'stop' ? 'استاپ' : reason === 'take' ? 'تیک‌پرافیت' : reason === 'whale-close' ? 'نهنگ بست' : 'سیگنال'} • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} $${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ''}`
+  );
+  return true;
+}
+
+/**
+ * v1.5.3 — بستن بخشی از یک پوزیشن دمو («نصف معامله را ببند»):
+ * حجم باز کم می‌شود و برای بخشِ بسته‌شده یک رکورد «بسته» با دلیل
+ * partial ثبت می‌شود (در تاریخچه و PnL حساب می‌آید — مثل بایننس).
+ */
+async function partialCloseDemo(
+  id: string,
+  price: number,
+  fraction: number,
+  reason: 'partial' | 'partial-manual'
+): Promise<boolean> {
+  const positions = await loadDemoPositions();
+  const idx = positions.findIndex((p) => p.id === id && p.status === 'open');
+  if (idx < 0) return false;
+  const p = positions[idx];
+  const dir = p.side === 'long' ? 1 : -1;
+  const closedQty = p.qty * Math.max(0.1, Math.min(0.9, fraction));
+  const remainingQty = p.qty - closedQty;
+  // اگر باقی‌مانده خیلی کوچک شد، کل معامله بسته می‌شود
+  if (remainingQty * price < 1) {
+    return closeDemo(id, price, reason === 'partial' ? 'take' : 'manual');
+  }
+  const pnl = (price - p.entryPrice) * dir * closedQty;
+  positions[idx] = {
+    ...p,
+    qty: remainingQty,
+    partialsDone: (p.partialsDone ?? 0) + 1,
+    lastPrice: price,
+  };
+  const partialRecord: DemoAutoPosition = {
+    ...p,
+    id: `${p.id}-p${(p.partialsDone ?? 0) + 1}`,
+    qty: closedQty,
+    status: 'closed',
+    closedAt: Date.now(),
+    closeReason: reason,
+    realizedPnl: pnl,
+    lastPrice: price,
+    partialsDone: undefined,
+  };
+  positions.splice(idx + 1, 0, partialRecord);
+  await saveDemoPositions(positions);
+  await recordClosedPnl(pnl);
+  const label = reason === 'partial' ? 'برداشت سود پله‌ای (نصف حجم)' : 'بستن دستی نصف حجم';
+  await appendLog(
+    'close',
+    `${label} — ${p.symbol}: ${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)} (باقی‌مانده حجم: ${remainingQty.toPrecision(4)})`
+  );
+  await notifyAutoTrade(
+    `🤖 ربات: نصف حجم ${p.symbol} بسته شد`,
+    `${label} • ${pnl >= 0 ? 'سود' : 'ضرر'} $${Math.abs(pnl).toFixed(2)} (دمو)`
+  );
+  await announceTelegram(
+    `بک‌تست (دمو): نصف حجم ${p.symbol} بسته شد`,
+    `${label} • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} $${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ''}`
+  );
+  return true;
+}
+
+/**
+ * v1.5.3 — بستن بخشی از یک پوزیشن واقعی (reduceOnly بدون لغو SL/TP —
+ * استاپ/تیکی با closePosition:true روی حجمِ باقی‌مانده محافظت می‌کنند).
+ */
+async function partialCloseReal(
+  keys: RealKeys,
+  pos: RealAutoPosition,
+  price: number,
+  fraction: number,
+  reason: 'partial' | 'partial-manual'
+): Promise<boolean> {
+  const closedQty = pos.qty * Math.max(0.1, Math.min(0.9, fraction));
+  if (!(closedQty > 0)) return false;
+  try {
+    await closePartialPosition(keys.apiKey, keys.apiSecret, `${pos.symbol}USDT`, pos.side, closedQty);
+  } catch {
+    return false;
+  }
+  const remainingQty = pos.qty - closedQty;
+  const dir = pos.side === 'long' ? 1 : -1;
+  const pnl = (price - pos.entryPrice) * dir * closedQty;
+  const tracked = await loadRealPositions();
+  const idx = tracked.findIndex((p) => p.id === pos.id && p.status === 'open');
+  if (idx < 0) return false;
+  tracked[idx] = { ...tracked[idx], qty: remainingQty, partialsDone: (tracked[idx].partialsDone ?? 0) + 1, lastPrice: price };
+  const partialRecord: RealAutoPosition = {
+    ...tracked[idx],
+    id: `${pos.id}-p${(pos.partialsDone ?? 0) + 1}`,
+    qty: closedQty,
+    status: 'closed',
+    closedAt: Date.now(),
+    closeReason: reason,
+    realizedPnl: pnl,
+    lastPrice: price,
+    partialsDone: undefined,
+  };
+  tracked.splice(idx + 1, 0, partialRecord);
+  await saveRealPositions(tracked);
+  await recordClosedPnl(pnl);
+  const label = reason === 'partial' ? 'برداشت سود پله‌ای (نصف حجم)' : 'بستن دستی نصف حجم';
+  await appendLog('close', `${label} — واقعی ${pos.symbol}: ${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)} تقریبی`);
+  await announceTelegram(
+    `بک‌تست (واقعی): نصف حجم ${pos.symbol} بسته شد`,
+    `${label} • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} ~$${Math.abs(pnl).toFixed(2)}${pos.strategyName ? ` • استراتژی ${pos.strategyName}` : ''}`
+  );
   return true;
 }
 
@@ -657,12 +869,31 @@ async function markDemoPositions(prices: Record<string, number>, settings: AutoT
   let dirty = false;
   let closedCount = 0;
   for (let i = 0; i < positions.length; i++) {
-    const p = positions[i];
+    let p = positions[i];
     if (p.status !== 'open') continue;
     const px = prices[`${p.symbol}USDT`];
     if (!px || !(px > 0)) continue;
     positions[i].lastPrice = px;
     dirty = true;
+    // v1.5.3 — برداشت سود پله‌ای: سود حساب به ۲۵٪ / ۵۰٪ رسید → نصف حجم ببند
+    // (سپس در همان چرخه تریل روی حجم باقی‌مانده اعمال می‌شود).
+    const marginPct = marginPnlPctOf(positions[i], px);
+    const done = positions[i].partialsDone ?? 0;
+    if (done < PARTIAL_TAKE_PNL_PCTS.length && marginPct >= PARTIAL_TAKE_PNL_PCTS[done]) {
+      await saveDemoPositions(positions);
+      await partialCloseDemo(p.id, px, 0.5, 'partial');
+      const fresh = await loadDemoPositions();
+      positions.length = 0;
+      positions.push(...fresh);
+      const fi = positions.findIndex((x) => x.id === p.id && x.status === 'open');
+      if (fi < 0) {
+        dirty = false;
+        continue;
+      }
+      i = fi;
+      p = positions[fi];
+      dirty = false;
+    }
     // v1.5.0 — trailing ratchet BEFORE the SL/TP check (a tightened stop can
     // trigger this very tick).
     const tr = computeTrailing(positions[i], px, settings.trailing);
@@ -696,6 +927,10 @@ async function markDemoPositions(prices: Record<string, number>, settings: AutoT
       await notifyAutoTrade(
         `🤖 ربات: بستن ${p.symbol}`,
         `${hitStop ? 'استاپ' : 'تیک‌پرافیت'} • ${pnl >= 0 ? 'سود' : 'ضرر'} $${Math.abs(pnl).toFixed(2)} (دمو)`
+      );
+      await announceTelegram(
+        `بک‌تست (دمو): بستن ${p.symbol}`,
+        `${hitStop ? 'استاپ' : 'تیک‌پرافیت'}${hitStop && pnl >= 0 ? ' (ریسک‌فری)' : ''} • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} $${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ''}`
       );
     }
   }
@@ -895,7 +1130,8 @@ async function openReal(
     return null;
   }
   const sizeUsd = gate.sizeUsd;
-  const { stopPrice, takePrice } = computeStopTake(side, price, settings.maxLossPercent, settings.rewardRatio);
+  const { stopPrice, takePrice } = computeStopTake(side, price, settings.maxLossPercent, settings.rewardRatio, settings.leverage);
+  const strategyName = await currentStrategyLabel();
   await openRealPosition(
     keys.apiKey,
     keys.apiSecret,
@@ -925,16 +1161,22 @@ async function openReal(
     highWater: price,
     lowWater: price,
     trailArmed: false,
+    strategyName,
+    partialsDone: 0,
   };
   const tracked = await loadRealPositions();
   await saveRealPositions([pos, ...tracked]);
   await appendLog(
     'open',
-    `واقعی ${side === 'long' ? 'خرید' : 'فروش'} ${symbol} @ ~${price} (${sourceLabel}) — SL ${stopPrice.toFixed(4)} / TP ${takePrice.toFixed(4)}${sizeUsd !== settings.positionSizeUsd ? ` • حجم هوشمند: $${sizeUsd.toFixed(1)}` : ''}`
+    `واقعی ${side === 'long' ? 'خرید' : 'فروش'} ${symbol} @ ~${price} (${sourceLabel} • استراتژی ${strategyName}) — SL ${stopPrice.toFixed(4)} / TP ${takePrice.toFixed(4)}${sizeUsd !== settings.positionSizeUsd ? ` • حجم هوشمند: $${sizeUsd.toFixed(1)}` : ''}`
   );
   await notifyAutoTrade(
     `🤖 ربات واقعی: ${side === 'long' ? 'خرید' : 'فروش'} ${symbol}`,
     `ورود ~${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)} (${sourceLabel})`
+  );
+  await announceTelegram(
+    `بک‌تست (واقعی): ${side === 'long' ? '🟢 خرید' : '🔴 فروش'} ${symbol}`,
+    `ورود ~${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)}\nمنبع: ${sourceLabel} • لوریج ${settings.leverage}x • استراتژی ${strategyName}`
   );
   return pos;
 }
@@ -970,7 +1212,7 @@ async function manageRealPositions(
   }
   const liveMap = new Map(live.map((p) => [p.symbol, p]));
   for (let i = 0; i < tracked.length; i++) {
-    const p = tracked[i];
+    let p = tracked[i];
     if (p.status !== 'open') continue;
     const lp = liveMap.get(`${p.symbol}USDT`);
     if (!lp || parseFloat(lp.positionAmt) === 0) {
@@ -988,12 +1230,31 @@ async function manageRealPositions(
         `🤖 ربات واقعی: بستن ${p.symbol}`,
         `بسته شد روی صرافی • ${pnl >= 0 ? 'سود' : 'ضرر'} ~$${Math.abs(pnl).toFixed(2)}`
       );
+      await announceTelegram(
+        `بک‌تست (واقعی): بستن ${p.symbol}`,
+        `بسته شد روی صرافی (استاپ/تیک‌پرافیت) • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} ~$${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ''}`
+      );
       continue;
     }
     const mark = parseFloat(lp.markPrice) || p.lastPrice;
     const liveQty = Math.abs(parseFloat(lp.positionAmt));
     tracked[i].lastPrice = mark;
     if (liveQty > 0) tracked[i].qty = liveQty;
+    // v1.5.3 — برداشت سود پله‌ای روی پوزیشن واقعی (۲۵٪ / ۵۰٪ سود حساب)؛
+    // سپس تریل روی حجم باقی‌مانده در همان چرخه اعمال می‌شود.
+    const marginPct = marginPnlPctOf(tracked[i], mark);
+    const done = tracked[i].partialsDone ?? 0;
+    if (done < PARTIAL_TAKE_PNL_PCTS.length && marginPct >= PARTIAL_TAKE_PNL_PCTS[done]) {
+      await saveRealPositions(tracked);
+      await partialCloseReal(keys, tracked[i], mark, 0.5, 'partial');
+      const fresh = await loadRealPositions();
+      tracked.length = 0;
+      tracked.push(...fresh);
+      const fi = tracked.findIndex((x) => x.id === p.id && x.status === 'open');
+      if (fi < 0) continue;
+      i = fi;
+      p = tracked[fi];
+    }
     const tr = computeTrailing(tracked[i], mark, settings.trailing);
     tracked[i].stopPrice = tr.newStop;
     tracked[i].highWater = tr.highWater;
@@ -1312,6 +1573,60 @@ export async function manualClosePosition(
   return false;
 }
 
+/**
+ * v1.5.3 — «بصورت دستی هم بشه بخشی از حجم را ببندم»: بستن نصف (یا کسر دلخواه)
+ * یک پوزیشن باز از روی خود پوزیشن. دمو = ریاضی محلی؛ واقعی = سفارش
+ * reduceOnly (SL/TP های صرافی حفظ می‌شوند چون closePosition:true هستند).
+ */
+export async function manualPartialClosePosition(
+  settings: AutoTradeSettings,
+  keys: RealKeys | undefined,
+  pos: { id: string; symbol: string; side: 'long' | 'short'; lastPrice: number },
+  fraction = 0.5
+): Promise<boolean> {
+  if (settings.mode === 'demo') {
+    return partialCloseDemo(pos.id, pos.lastPrice, fraction, 'partial-manual');
+  }
+  if (keys) {
+    const tracked = await loadRealPositions();
+    const idx = tracked.findIndex(
+      (p) => p.status === 'open' && p.id === pos.id
+    );
+    if (idx < 0) return false;
+    return partialCloseReal(keys, tracked[idx], pos.lastPrice, fraction, 'partial-manual');
+  }
+  return false;
+}
+
+/**
+ * v1.5.3 — «برای حالت دمو گزینه ریست بزار که همه چیز از اول بتونم بک‌تست
+ * بگیرم حتی تاریخچه هم پاک بشه»: پاک‌کردن کامل حالت دمو — پوزیشن‌ها،
+ * تاریخچه، لاگ‌ها، آمار روزانه، استریک و اسنپ‌شات نهنگ. اگر سرور ۲۴/۷
+ * فعال باشد، سرور هم ریست می‌شود.
+ */
+export async function resetDemoBacktest(): Promise<{ local: boolean; server: { ok: boolean; error?: string } }> {
+  try {
+    await AsyncStorage.multiRemove([
+      DEMO_POSITIONS_KEY,
+      LOG_KEY,
+      WHALE_SNAPSHOT_KEY,
+      DAILY_KEY,
+      `${DAILY_KEY}:streak`,
+      LAST_SIGNAL_AT_KEY,
+    ]);
+  } catch {}
+  await appendLog('info', 'ریست کامل بک‌تست دمو انجام شد — همه‌چیز از صفر شروع می‌شود (حتی تاریخچه پاک شد)');
+  // سرور ۲۴/۷: اگر روشن است، state سرور هم پاک شود
+  let server: { ok: boolean; error?: string } = { ok: false };
+  try {
+    const settings = await loadAutoSettings();
+    if (settings.server247.enabled && (await isServerModeActive())) {
+      server = await pushAutoTradeConfigToServer(settings, true);
+    }
+  } catch {}
+  return { local: true, server };
+}
+
 // ---------------------------------------------------------------------------
 // v1.5.2 — ویرایش دستی TP/SL هر پوزیشن باز («بشه هر معامله را تی‌پی و استاپش
 // را دستی هم تغییر داد») + درصد سود/زیان هر پوزیشن در UI
@@ -1363,14 +1678,22 @@ export async function updatePositionTpsl(
   return false;
 }
 
-/** درصد PnL لحظه‌ای یک پوزیشن نسبت به مارجین (حجم دلاری × لوریج) — برای UI. */
+/** درصد PnL لحظه‌ای یک پوزیشن نسبت به مارجین (حجم دلاری × لوریج) — برای UI.
+ *  v1.5.3 — مارجین پویا (qty×ورود÷لوریج) تا بعد از بستن نصف حجم هم درصد درست بماند. */
 export function positionPnlPercent(
   p: { side: 'long' | 'short'; entryPrice: number; lastPrice: number; qty: number; sizeUsd?: number; leverage?: number },
   marginUsd?: number
 ): number {
   const dir = p.side === 'long' ? 1 : -1;
   const pnl = (p.lastPrice - p.entryPrice) * dir * p.qty;
-  const margin = marginUsd && marginUsd > 0 ? marginUsd : p.sizeUsd && p.sizeUsd > 0 ? p.sizeUsd : (p.leverage ?? 1) > 0 ? (p.qty * p.entryPrice) / (p.leverage ?? 1) : 0;
+  const margin =
+    marginUsd && marginUsd > 0
+      ? marginUsd
+      : (p.leverage ?? 1) > 0
+        ? (p.qty * p.entryPrice) / (p.leverage ?? 1)
+        : p.sizeUsd && p.sizeUsd > 0
+          ? p.sizeUsd
+          : 0;
   if (!(margin > 0)) return 0;
   return (pnl / margin) * 100;
 }
@@ -1454,7 +1777,8 @@ export interface ServerAutoTradeState {
 }
 
 export async function pushAutoTradeConfigToServer(
-  settings: AutoTradeSettings
+  settings: AutoTradeSettings,
+  reset = false
 ): Promise<{ ok: boolean; error?: string }> {
   try {
     const base = await getServerUrl();
@@ -1481,6 +1805,9 @@ export async function pushAutoTradeConfigToServer(
         trailing: settings.trailing,
         aiCapital: settings.aiCapital,
         initialCapitalUsd: settings.initialCapitalUsd,
+        // v1.5.3 — برچسب استراتژی فعال + پرچم ریست کامل دمو
+        strategyLabel: await currentStrategyLabel(),
+        reset,
         binanceKeys: keys ? { apiKey: keys.apiKey, apiSecret: keys.apiSecret } : undefined,
       },
     };
@@ -1495,6 +1822,13 @@ export async function pushAutoTradeConfigToServer(
       return { ok: true };
     }
     await setServerModeActive(false);
+    // v1.5.3 — 404 = سرور هنوز کد موتور بک‌تست را ندارد (Railway دوباره deploy نشده)
+    if (res.status === 404) {
+      return {
+        ok: false,
+        error: 'سرور شما موتور بک‌تست ۲۴/۷ را ندارد — کد سرور (پوشه server) را روی Railway دوباره deploy کنید',
+      };
+    }
     return { ok: false, error: data?.error ?? `HTTP ${res.status}` };
   } catch (e) {
     await setServerModeActive(false);

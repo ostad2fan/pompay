@@ -283,6 +283,37 @@ export async function closePosition(
   return data as BinanceFuturesOrder;
 }
 
+/**
+ * v1.5.3 — «بصورت دستی هم بشه بخشی از حجم را ببندم» + برداشت سود پله‌ای ربات:
+ * closes only PART of a position with a reduceOnly MARKET order.
+ * IMPORTANT: does NOT cancel the SL/TP orders — they were placed with
+ * closePosition:true, so they keep protecting whatever volume remains.
+ */
+export async function closePartialPosition(
+  apiKey: string,
+  apiSecret: string,
+  symbol: string,
+  side: 'long' | 'short',
+  qty: number,
+): Promise<BinanceFuturesOrder> {
+  const symbolInfo = await getSymbolInfo(symbol);
+  const factor = Math.pow(10, symbolInfo.quantityPrecision);
+  const quantity = Math.floor(qty * factor) / factor;
+  if (quantity <= 0 || quantity < symbolInfo.minQty) {
+    throw new Error(`حجم بخش قابل‌بستن کم است. حداقل: ${symbolInfo.minQty}`);
+  }
+  const orderSide = side === 'long' ? 'SELL' : 'BUY';
+  console.log(`[BinanceFutures] Partial close: ${orderSide} ${quantity} ${symbol}`);
+  const data = await signedRequest('POST', '/fapi/v1/order', {
+    symbol,
+    side: orderSide,
+    type: 'MARKET',
+    quantity,
+    reduceOnly: 'true',
+  }, apiKey, apiSecret);
+  return data as BinanceFuturesOrder;
+}
+
 export async function getSymbolInfo(symbol: string): Promise<{ pricePrecision: number; quantityPrecision: number; minQty: number; minNotional: number }> {
   console.log(`[BinanceFutures] Getting symbol info for ${symbol}`);
   const response = await fetch(`${FUTURES_BASE}/fapi/v1/exchangeInfo`);

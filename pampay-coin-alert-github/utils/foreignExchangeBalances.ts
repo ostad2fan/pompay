@@ -137,18 +137,90 @@ async function getUsdPriceMap(): Promise<Record<string, number>> {
   return map;
 }
 
-/** Fill valueUsd for rows that came back without a USD value. */
-async function valueInUsd(balances: ForeignBalance[]): Promise<void> {
+// v1.5.3 — Binance FUTURES price map (fallback for coins that exist on
+// futures but not spot — e.g. 1000X-style symbols / delisted-from-spot).
+let futuresPriceCache: { at: number; map: Record<string, number> } | null = null;
+
+async function getFuturesPriceMap(): Promise<Record<string, number>> {
+  if (futuresPriceCache && Date.now() - futuresPriceCache.at < 60_000) {
+    return futuresPriceCache.map;
+  }
+  const map: Record<string, number> = {};
+  try {
+    const res = await rawFetch('https://fapi.binance.com/fapi/v1/ticker/price');
+    if (res.ok) {
+      const prices = parseJson(res.text);
+      if (Array.isArray(prices)) {
+        for (const p of prices as Array<{ symbol?: string; price?: string }>) {
+          if (p?.symbol && p?.price) map[p.symbol] = parseFloat(p.price);
+        }
+      }
+    }
+  } catch {}
+  futuresPriceCache = { at: Date.now(), map };
+  return map;
+}
+
+// v1.5.3 — LBank OWN ticker (user: «صرافی البانک در مدیریت دارایی قیمت غلط
+// میداد»): LBank coins that are not on Binance were getting 0/«قیمت نامشخص»
+// (or a wrong same-name match). The exchange's own public ticker is exact:
+//   GET https://api.lbkex.com/v2/supplement/ticker/price.do
+//   → {result:true, data:[{symbol:"btc_usdt", price:"81631.36"}]}
+let lbankPriceCache: { at: number; map: Record<string, number> } | null = null;
+
+async function getLbankPriceMap(): Promise<Record<string, number>> {
+  if (lbankPriceCache && Date.now() - lbankPriceCache.at < 60_000) {
+    return lbankPriceCache.map;
+  }
+  const map: Record<string, number> = {};
+  try {
+    const res = await rawFetch('https://api.lbkex.com/v2/supplement/ticker/price.do');
+    if (res.ok) {
+      const body = parseJson(res.text);
+      const rows = (body?.data ?? body) as Array<{ symbol?: string; price?: string }>;
+      if (Array.isArray(rows)) {
+        for (const r of rows) {
+          if (!r?.symbol || !r?.price) continue;
+          const sym = r.symbol.toUpperCase(); // "BTC_USDT"
+          if (!sym.endsWith('_USDT')) continue;
+          const coin = sym.slice(0, -'_USDT'.length);
+          const px = parseFloat(r.price);
+          if (coin && px > 0) map[coin] = px;
+        }
+      }
+    }
+  } catch {}
+  lbankPriceCache = { at: Date.now(), map };
+  return map;
+}
+
+/**
+ * Fill valueUsd for rows that came back without a USD value.
+ * v1.5.3 — order per exchange:
+ *   1. stablecoins = $1
+ *   2. LBank's OWN ticker (for lbank wallets — exact LBank prices)
+ *   3. Binance SPOT ticker
+ *   4. Binance FUTURES ticker (futures-only coins)
+ */
+async function valueInUsd(balances: ForeignBalance[], exchangeId?: string): Promise<void> {
   const priceMap = await getUsdPriceMap();
+  const lbankMap = exchangeId === 'lbank' ? await getLbankPriceMap() : null;
+  let futuresMap: Record<string, number> | null = null;
   for (const b of balances) {
     if (b.valueUsd > 0) continue;
     const stable = stableValueUsd(b.asset, b.total);
     if (stable !== null) {
       b.valueUsd = stable;
-    } else {
-      const p = priceMap[`${b.asset}USDT`];
-      if (p) b.valueUsd = b.total * p;
+      continue;
     }
+    let p = lbankMap ? lbankMap[b.asset] : undefined;
+    if (!p) p = priceMap[`${b.asset}USDT`];
+    if (!p) {
+      // lazy futures fallback (only fetched if some coin misses spot)
+      if (!futuresMap) futuresMap = await getFuturesPriceMap();
+      p = futuresMap[`${b.asset}USDT`];
+    }
+    if (p) b.valueUsd = b.total * p;
   }
 }
 
@@ -1500,6 +1572,6 @@ export async function fetchForeignExchangeBalance(
     if (e instanceof Error) throw e;
     throw networkError(wallet.exchangeName, e);
   }
-  await valueInUsd(balances);
+  await valueInUsd(balances, exchangeId);
   return balances;
 }
