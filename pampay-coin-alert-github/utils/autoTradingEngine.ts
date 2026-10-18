@@ -286,6 +286,11 @@ const LAST_SIGNAL_AT_KEY = '@auto_trade_last_signal_at_v1';
 const LOG_KEY = '@auto_trade_engine_log_v1';
 const DAILY_KEY = '@auto_trade_daily_stats_v1';
 const EXCHANGE_CONFIGS_KEY = '@real_trade_exchange_configs';
+// v1.5.5 — بک‌فیل: شناسه سیگنال‌هایی که قبلاً برای پر کردن سقف پوزیشن‌های
+// همزمان باز شده‌اند (هر سیگنال فقط یک بار بک‌فیل می‌شود).
+const BACKFILL_SEEN_KEY = '@auto_trade_backfill_seen_v1';
+const BACKFILL_WINDOW_MS = 7 * 86_400_000;
+const BACKFILL_SEEN_CAP = 600;
 
 export const DEFAULT_AUTO_SETTINGS: AutoTradeSettings = {
   enabled: false,
@@ -303,7 +308,8 @@ export const DEFAULT_AUTO_SETTINGS: AutoTradeSettings = {
   aiCapital: { enabled: true, dailyLossLimitPercent: 3 },
   // v1.5.2 — سرمایه اولیه برای PnL/ROI (مثل فیوچرز بایننس) + تلگرام ۲۴/۷
   initialCapitalUsd: 1000,
-  server247: { enabled: true },
+  // v1.5.5 — سوییچ «اعلام تلگرام ۲۴/۷ (سرور)» حذف شد (فلگ همیشه خاموش).
+  server247: { enabled: false },
 };
 
 export async function loadAutoSettings(): Promise<AutoTradeSettings> {
@@ -318,7 +324,7 @@ export async function loadAutoSettings(): Promise<AutoTradeSettings> {
     const sel: IndicatorSelection[] =
       parsed.indicators?.selections ??
       (parsed.indicators?.indicatorIds ?? []).map((id) => ({ id, timeframes: [] }));
-    return {
+    const merged: AutoTradeSettings = {
       ...DEFAULT_AUTO_SETTINGS,
       ...parsed,
       whale: { ...DEFAULT_AUTO_SETTINGS.whale, ...parsed.whale },
@@ -328,6 +334,18 @@ export async function loadAutoSettings(): Promise<AutoTradeSettings> {
       initialCapitalUsd: typeof parsed.initialCapitalUsd === 'number' && parsed.initialCapitalUsd > 0 ? parsed.initialCapitalUsd : DEFAULT_AUTO_SETTINGS.initialCapitalUsd,
       server247: { ...DEFAULT_AUTO_SETTINGS.server247, ...parsed.server247 },
     };
+    // v1.5.5 — حذف کامل «اعلام تلگرام ۲۴/۷ (سرور)»: بازخورد کاربر — روشن
+    // کردنش چرخه محلی را قطع می‌کرد و نه در برنامه نه در تلگرام چیزی
+    // نمی‌آمد؛ خاموش هم برنامه و هم تلگرام کار می‌کردند. سوییچ حذف شد و
+    // فلگ همیشه خاموش است. اگر قبلاً روشن بوده و سرور فعال است، یک بار
+    // (fire-and-forget) کانفیگ خاموش به سرور می‌رود تا ربات سرور هم بی‌صدا
+    // متوقف شود — پیام «ربات متوقف شد» دیگر ارسال/ثبت نمی‌شود.
+    if (merged.server247.enabled) {
+      merged.server247 = { enabled: false };
+      void pushAutoTradeConfigToServer(merged).catch(() => {});
+      await saveAutoSettings(merged);
+    }
+    return merged;
   } catch {
     return DEFAULT_AUTO_SETTINGS;
   }
@@ -1096,6 +1114,178 @@ async function findUserIndicatorTimeframe(id: string): Promise<AutoTf | null> {
 }
 
 // ---------------------------------------------------------------------------
+// v1.5.5 — BACKFILL («تعداد بیشتری از معاملات را نشون بده چرا الان ۴ تا باز
+// است درحالی که تنظیمات روی ۲۰ گذاشتم»): وقتی پوزیشن بازِ دمو کمتر از سقف
+// تنظیم‌شده است، سیگنال‌های ذخیره‌شدهٔ ۷ روز اخیرِ اندیکاتورها (جدیدترین
+// اول) به‌صورت بک‌تست بازپخش می‌شوند تا کتاب پوزیشن‌ها تا سقف تنظیم‌شده
+// پر شود. هر سیگنال فقط یک بار بک‌فیل می‌شود (BACKFILL_SEEN_KEY) — تاریخچه
+// مصنوعیِ بی‌نهایت ساخته نمی‌شود. ورود با قیمت همان سیگنال و زمان همان
+// سیگنال ثبت می‌شود (بک‌تست واقعیِ «اگر آن موقع باز می‌شد»).
+// ---------------------------------------------------------------------------
+
+interface BackfillCandidate {
+  id: string;
+  symbol: string;
+  side: 'long' | 'short';
+  price: number;
+  detectedAt: number;
+  indicatorName: string;
+}
+
+async function loadBackfillSeen(): Promise<Record<string, true>> {
+  try {
+    const raw = await AsyncStorage.getItem(BACKFILL_SEEN_KEY);
+    if (raw) return JSON.parse(raw) as Record<string, true>;
+  } catch {}
+  return {};
+}
+
+async function saveBackfillSeen(map: Record<string, true>): Promise<void> {
+  const keys = Object.keys(map);
+  if (keys.length <= BACKFILL_SEEN_CAP) {
+    try {
+      await AsyncStorage.setItem(BACKFILL_SEEN_KEY, JSON.stringify(map));
+    } catch {}
+    return;
+  }
+  // keep the NEWEST entries (drop oldest ~20% to avoid unbounded growth)
+  const trimmed: Record<string, true> = {};
+  for (const k of keys.slice(Math.floor(keys.length * 0.2))) trimmed[k] = true;
+  try {
+    await AsyncStorage.setItem(BACKFILL_SEEN_KEY, JSON.stringify(trimmed));
+  } catch {}
+}
+
+async function openDemoBackfill(
+  settings: AutoTradeSettings,
+  c: BackfillCandidate,
+  sizeUsd: number,
+  strategyName: string
+): Promise<boolean> {
+  const positions = await loadDemoPositions();
+  if (positions.filter((p) => p.status === 'open').length >= settings.maxOpenPositions) return false;
+  if (positions.some((p) => p.status === 'open' && p.symbol === c.symbol && p.side === c.side)) return false;
+  const price = c.price > 0 ? c.price : 0;
+  if (!(price > 0)) return false;
+  const { stopPrice, takePrice } = computeStopTake(c.side, price, settings.maxLossPercent, settings.rewardRatio, settings.leverage);
+  const qty = (sizeUsd * settings.leverage) / price;
+  const pos: DemoAutoPosition = {
+    id: `d-bf-${c.id}-${Math.random().toString(36).slice(2, 6)}`,
+    symbol: c.symbol,
+    side: c.side,
+    entryPrice: price,
+    qty,
+    sizeUsd,
+    leverage: settings.leverage,
+    stopPrice,
+    takePrice,
+    // زمان ورود = زمان همان سیگنال (بک‌تست واقعی، نه الان)
+    openedAt: c.detectedAt,
+    source: 'indicator',
+    sourceLabel: `${c.indicatorName} (بک‌فیل)`,
+    status: 'open',
+    lastPrice: price,
+    initialStopPrice: stopPrice,
+    highWater: price,
+    lowWater: price,
+    trailArmed: false,
+    strategyName,
+    partialsDone: 0,
+  };
+  await saveDemoPositions([pos, ...positions]);
+  return true;
+}
+
+async function backfillDemoPositions(settings: AutoTradeSettings, prices: Record<string, number>): Promise<number> {
+  if (settings.mode !== 'demo' || !settings.enabled) return 0;
+  const positions = await loadDemoPositions();
+  const openCount = positions.filter((p) => p.status === 'open').length;
+  const free = settings.maxOpenPositions - openCount;
+  if (free <= 0) return 0;
+
+  // فقط اندیکاتورهای انتخاب‌شده‌ی خود کاربر بک‌فیل می‌شوند
+  const sel = settings.indicators.selections;
+  if (!settings.indicators.enabled || sel.length === 0) return 0;
+
+  const candidates: BackfillCandidate[] = [];
+  const now = Date.now();
+  const wants = (id: string) => sel.some((x) => x.id === id);
+
+  if (wants('builtin:hook')) {
+    try {
+      for (const s of await getStoredHookSignals()) {
+        if (now - s.detectedAt > BACKFILL_WINDOW_MS) continue;
+        candidates.push({
+          id: s.id,
+          symbol: s.symbol.replace(/USDT$/i, '').toUpperCase(),
+          side: s.action === 'buy' ? 'long' : 'short',
+          price: s.price,
+          detectedAt: s.detectedAt,
+          indicatorName: 'هوک ریورسال',
+        });
+      }
+    } catch {}
+  }
+  if (wants('builtin:gainz')) {
+    try {
+      for (const s of await getStoredGainzAlgoSignals()) {
+        if (now - s.detectedAt > BACKFILL_WINDOW_MS) continue;
+        candidates.push({
+          id: s.id,
+          symbol: s.symbol.replace(/USDT$/i, '').toUpperCase(),
+          side: s.action === 'buy' ? 'long' : 'short',
+          price: s.price,
+          detectedAt: s.detectedAt,
+          indicatorName: 'GainzAlgo Pro',
+        });
+      }
+    } catch {}
+  }
+  if (candidates.length === 0) return 0;
+
+  // جدیدترین اول؛ هر symbol+side فقط یک‌بار (بعد از انتخاب جدیدترین سیگنالش)
+  candidates.sort((a, b) => b.detectedAt - a.detectedAt);
+  const seen = await loadBackfillSeen();
+  const openSet = new Set(
+    positions.filter((p) => p.status === 'open').map((p) => `${p.symbol}|${p.side}`)
+  );
+  const usedSymbolSide = new Set<string>();
+  const picked: BackfillCandidate[] = [];
+  for (const c of candidates) {
+    if (picked.length >= free) break;
+    if (seen[c.id]) continue;
+    const key = `${c.symbol}|${c.side}`;
+    if (openSet.has(key) || usedSymbolSide.has(key)) continue;
+    const price = c.price > 0 ? c.price : prices[`${c.symbol}USDT`] ?? 0;
+    if (!(price > 0)) continue;
+    usedSymbolSide.add(key);
+    picked.push({ ...c, price });
+  }
+  if (picked.length === 0) return 0;
+
+  // دروازه سرمایه هوشمند یک بار برای کل دسته (نه per-position)
+  const gate = await aiCapitalGate(settings);
+  if (gate.pausedReason) {
+    await appendLog('info', `بک‌فیل انجام نشد: ${gate.pausedReason}`);
+    return 0;
+  }
+  const strategyName = await currentStrategyLabel();
+  let opened = 0;
+  for (const c of picked) {
+    seen[c.id] = true;
+    if (await openDemoBackfill(settings, c, gate.sizeUsd, strategyName)) opened++;
+  }
+  await saveBackfillSeen(seen);
+  if (opened > 0) {
+    await appendLog(
+      'info',
+      `بک‌فیل بک‌تست: ${opened} پوزیشن از سیگنال‌های ۷ روز اخیر باز شد (پوزیشن باز: ${openCount + opened}/${settings.maxOpenPositions}) — ورود‌ها با قیمت و زمان خود سیگنال`
+    );
+  }
+  return opened;
+}
+
+// ---------------------------------------------------------------------------
 // REAL execution (Binance futures — keys stay on the device)
 // ---------------------------------------------------------------------------
 
@@ -1409,6 +1599,13 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
     }
   }
 
+  // 4) v1.5.5 — بک‌فیل: پوزیشن بازِ دمو تا سقف تنظیم‌شده پر می‌شود
+  //    (بازپخش سیگنال‌های ۷ روز اخیر — هر سیگنال یک بار)
+  try {
+    const bf = await backfillDemoPositions(settings, prices);
+    result.opened += bf;
+  } catch {}
+
   return result;
 }
 
@@ -1470,15 +1667,11 @@ async function runGlobalCycle(): Promise<void> {
   try {
     const settings = await loadAutoSettings();
     if (!settings.enabled) return;
-    // v1.5.2 — سرور ۲۴/۷ فعال است؟ چرخه معاملاتی روی سرور اجرا می‌شود
-    // (اعلام تلگرام با برنامه بسته)؛ اینجا فقط state را sync می‌کنیم.
-    // v1.5.4 — اگر sync شکست بخورد (سرور خاموش/غیرقابل‌دسترس/deploy قدیم)
-    // چرخه «محلی» ادامه می‌دهد تا ربات هرگز ساکت نشود — بازخورد کاربر:
-    // «روشن کردن بکتست ربات تلگرام، همه معاملات و تاریخچه را قطع کرد».
-    if (settings.server247.enabled && (await isServerModeActive())) {
-      const synced = await syncAutoTradeStateFromServer();
-      if (synced) return;
-    }
+    // v1.5.5 — «اعلام تلگرام ۲۴/۷ (سرور)» حذف شد: چرخه همیشه «محلی» اجرا
+    // می‌شود. قبلاً وقتی سوییچ سرور روشن بود، sync موفق کل چرخه محلی را
+    // skip می‌کرد (return) و اگر سرور کاری نمی‌کرد، «نه در برنامه نه در
+    // تلگرام» چیزی نمی‌آمد — بازخورد کاربر. حالا ربات روی خود گوشی
+    // اجرا می‌شود و اعلام تلگرام از خود برنامه ارسال می‌شود.
     const realKeys = settings.mode === 'real' ? await loadRealKeys() : undefined;
     const res = await runAutoCycle({ settings, realKeys });
     for (const e of res.errors.slice(0, 2)) await appendLog('error', e);
@@ -1617,6 +1810,8 @@ export async function resetDemoBacktest(): Promise<{ local: boolean; server: { o
       DAILY_KEY,
       `${DAILY_KEY}:streak`,
       LAST_SIGNAL_AT_KEY,
+      // v1.5.5 — بک‌فیل هم از صفر شروع شود بعد از ریست کامل
+      BACKFILL_SEEN_KEY,
     ]);
   } catch {}
   await appendLog('info', 'ریست کامل بک‌تست دمو انجام شد — همه‌چیز از صفر شروع می‌شود (حتی تاریخچه پاک شد)');

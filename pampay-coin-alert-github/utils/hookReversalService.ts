@@ -50,7 +50,9 @@ export interface HookReversalSignal {
 const SIGNALS_KEY = '@hook_reversal_signals';
 const NOTIFY_KEY = '@hook_reversal_notify_keys';
 
-const SCAN_SYMBOL_COUNT = 40;
+// v1.5.5 — 40 → 80: پوشش وسیع‌تر = سیگنال بیشتر در روز = معاملات بیشتر
+// برای بک‌تست (بازخورد کاربر: «تعداد بیشتری از معاملات را نشون بده»).
+const SCAN_SYMBOL_COUNT = 80;
 const SIGNAL_CAP = 200;
 const NOTIFY_CAP = 700;
 

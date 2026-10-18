@@ -1171,11 +1171,127 @@ async function fetchLbank(w: ForeignWallet): Promise<ForeignBalance[]> {
         }
       }
     }
+    // v1.5.5 — فیوچرز LBank (best-effort): اگر LBank مسیرهای فیوچرز را برای
+    // کلید API باز کند، ردیف‌های بخش فیوچرز همین‌جا اضافه می‌شوند؛ در غیر
+    // این صورت بی‌صدا [] برمی‌گردد و ولت کارت توضیح محدودیت را نشان می‌دهد.
+    try {
+      const futures = await fetchLbankFuturesBestEffort(w);
+      for (const f of futures) out.push(f);
+    } catch {}
     return out;
   }
   const code = String(body.error_code ?? '');
   const msg = String(body.msg ?? '');
   throw lbankErrorMessage(code, msg);
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.5 — LBank فیوچرز (بک تستِ مسیر رسمی + best-effort):
+//   کاربر: «صرافی البانک موجودی بخش های دیگه مثل فیوچرزو نشون نمیده».
+//   بررسی تجربی (پروب با کلید ساختگی + کد ccxt + مستند رسمی):
+//   • API «باز» LBank فقط اسپات را می‌دهد (user_info.do کلید را چک می‌کند).
+//   • مسیرهای فیوچرز (lbkperp.lbank.com/cfd/user/v1/assetBalance — همان که
+//     وب‌اپ خود LBank صدا می‌زند) برای کلید API جواب «not open path» می‌دهند
+//     و فقط با نشستِ لاگین کار می‌کنند.
+//   بنابراین: هر بار این مسیرها با امضای همان کلید امتحان می‌شوند — اگر
+//   LBank روزی آنها را برای API-key باز کند، موجودی فیوچرز خودکار ظاهر
+//   می‌شود؛ تا آن موقع ولت کارت یک توضیح صریح فارسی نشان می‌دهد که این
+//   محدودیتِ خود صرافی است (نه باگ برنامه) و موجودی فیوچرز فقط داخل
+//   اپ/سایت خود LBank دیده می‌شود.
+// ---------------------------------------------------------------------------
+
+function lbankSignedQuery(
+  w: ForeignWallet,
+  extra: Record<string, string>
+): { qs: string; headers: Record<string, string> } {
+  const timestamp = Date.now().toString();
+  const echostr = lbankEchostr();
+  const useRsa = isRsaSecret(w.apiSecret);
+  const signatureMethod = useRsa ? 'RSA' : 'HmacSHA256';
+  const params: Record<string, string> = {
+    api_key: w.apiKey,
+    signature_method: signatureMethod,
+    timestamp,
+    echostr,
+    ...extra,
+  };
+  const raw = Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join('&');
+  const md5Upper = md5Hex(raw).toUpperCase();
+  let sign: string;
+  if (useRsa) {
+    const rsa = rsaSignSha256(md5Upper, w.apiSecret);
+    if (rsa) {
+      sign = rsa;
+    } else {
+      sign = '';
+    }
+  } else {
+    sign = CryptoJS.HmacSHA256(md5Upper, w.apiSecret).toString(CryptoJS.enc.Hex);
+  }
+  const all: Record<string, string> = { ...params, sign };
+  const qs = Object.keys(all)
+    .sort()
+    .map((k) => `${k}=${encodeURIComponent(all[k])}`)
+    .join('&');
+  return {
+    qs,
+    headers: { timestamp, signature_method: signatureMethod, echostr },
+  };
+}
+
+/** یک مسیر فیوچرز LBank را با کلید API امضا و صدا می‌زند — بی‌صدا best-effort. */
+async function lbankFuturesAttempt(
+  w: ForeignWallet,
+  path: string,
+  extra: Record<string, string>
+): Promise<ForeignBalance[] | null> {
+  try {
+    const { qs, headers } = lbankSignedQuery(w, extra);
+    const res = await rawFetch(`https://lbkperp.lbank.com${path}?${qs}`, {
+      headers,
+    });
+    if (res.status !== 200) return null;
+    const body = parseJson(res.text);
+    if (!body || String(body.result) !== 'true') return null;
+    const rows = Array.isArray(body.data)
+      ? (body.data as Array<Record<string, unknown>>)
+      : body.data && typeof body.data === 'object'
+        ? [body.data as Record<string, unknown>]
+        : [];
+    const out: ForeignBalance[] = [];
+    for (const r of rows) {
+      const coin = String(r.coin ?? r.asset ?? r.assetCode ?? r.currency ?? '');
+      if (!coin) continue;
+      const total = toNum(r.assetAmt ?? r.total ?? r.equity ?? r.amount);
+      const frozen = toNum(r.freezeAmt ?? r.frozen ?? r.freeze ?? r.frozenAmount);
+      const usable = toNum(r.usableAmt ?? r.available ?? r.availableAmount ?? r.availableAmt);
+      const avail = usable > 0 ? usable : Math.max(0, total - frozen);
+      if (total > 0 || avail > 0 || frozen > 0) {
+        pushBalance(out, coin.toUpperCase(), avail, Math.min(frozen, Math.max(0, total - avail)), 'futures');
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchLbankFuturesBestEffort(w: ForeignWallet): Promise<ForeignBalance[]> {
+  // ۱) همان مسیری که وب‌اپ رسمی LBank برای موجودی فیوچرز صدا می‌زند
+  let out = await lbankFuturesAttempt(w, '/cfd/user/v1/assetBalance', {
+    asset: 'USDT',
+    productGroup: 'SwapU',
+  });
+  if (out && out.length > 0) return out;
+  // ۲) مسیر مثالِ مستند امضای قراردادها (prv/account)
+  out = await lbankFuturesAttempt(w, '/cfd/prv/account', {
+    asset: 'USDT',
+    productGroup: 'SwapU',
+  });
+  return out ?? [];
 }
 
 // ---------------------------------------------------------------------------
