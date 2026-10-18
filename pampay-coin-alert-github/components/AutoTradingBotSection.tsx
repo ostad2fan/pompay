@@ -29,6 +29,16 @@
  *  • سرمایه اولیه برای PnL/ROI — خروجی دقیقاً مثل فیوچرز بایننس (دلاری + درصد).
  *  • عکس PnL: لوگوی برنامه در بک‌گراند + سود/زیان به درصد و دلاری.
  *  • اعلام تلگرام ۲۴/۷ از سرور (حتی وقتی برنامه بسته است) — دمو و واقعی.
+ *
+ * v1.5.3:
+ *  • حد ضرر با لوریج: «۳٪ با لوریج ۵ = دقیقاً ۱۵٪» — فاصله قیمت = ضرر÷لوریج.
+ *  • تریل استاپ در سود: ۱٪ اسپات → ریسک‌فری؛ استاپ روی نصفِ بیشترین سود.
+ *  • برداشت سود پله‌ای ۲۵٪/۵۰٪ (ربات خودش نصف حجم می‌بندد) + دکمه «بستن نصف».
+ *  • ریست کامل دمو (همه‌چیز حتی تاریخچه پاک می‌شود).
+ *  • هر پوزیشن: ساعت و تاریخ باز شدن + قیمت ورود دقیق (خط جدا).
+ *  • تاریخچه: نام استراتژی + نوع اندیکاتور کنار نام ارز.
+ *  • فیلتر پیش‌فرض تاریخچه و PnL = «امروز» + موجودی (سرمایه اولیه ± PnL).
+ *  • عکس PnL: لوگو با پس‌زمینه مشکی (بدون قاب) بهتر دیده می‌شود.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -66,6 +76,8 @@ import {
   ShieldCheck,
   Edit3,
   Send,
+  RotateCcw,
+  Scissors,
 } from 'lucide-react-native';
 import { captureRef } from 'react-native-view-shot';
 import * as Sharing from 'expo-sharing';
@@ -94,15 +106,18 @@ import {
   loadRealKeys,
   loadRealPositions,
   manualClosePosition,
+  manualPartialClosePosition,
   positionPnlPercent,
   pushAutoTradeConfigToServer,
+  resetDemoBacktest,
   runGlobalCycleNow,
   runLightMtm,
   saveAutoSettings,
   updatePositionTpsl,
 } from '@/utils/autoTradingEngine';
 
-const APP_LOGO = require('@/assets/images/icon.png');
+/** v1.5.3 — لوگوی مشکی‌پس‌زمینه (بدون قاب سفید) برای بک‌گراند عکس PnL. */
+const APP_LOGO = require('@/assets/images/icon-dark.png');
 
 /** v1.5.2 — رفرش پوزیشن‌های ربات هر ۳ ثانیه (طبق درخواست کاربر). */
 const UI_REFRESH_MS = 3_000;
@@ -132,12 +147,14 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [loaded, setLoaded] = useState(false);
   const [realKeys, setRealKeys] = useState<RealKeys | undefined>(realKeysProp);
   const [indDropdownOpen, setIndDropdownOpen] = useState(false);
-  const [pnlPeriod, setPnlPeriod] = useState<AutoPnlPeriod>('all');
+  const [pnlPeriod, setPnlPeriod] = useState<AutoPnlPeriod>('today');
   const [captureBusy, setCaptureBusy] = useState(false);
   /** v1.5.1 — پیش‌نمایش عکس PnL: اول عکس ساخته و نشان داده می‌شود، بعد ذخیره/اشتراک. */
   const [previewUri, setPreviewUri] = useState<string | null>(null);
-  /** v1.5.1 — فیلتر روزِ تاریخچه معاملات ربات. */
-  const [histPeriod, setHistPeriod] = useState<AutoPnlPeriod>('all');
+  /** v1.5.1 — فیلتر روزِ تاریخچه معاملات ربات (v1.5.3 — پیش‌فرض «امروز»). */
+  const [histPeriod, setHistPeriod] = useState<AutoPnlPeriod>('today');
+  /** v1.5.3 — ریست کامل دمو در حال انجام. */
+  const [resetBusy, setResetBusy] = useState(false);
   /** v1.5.2 — ویرایش دستی TP/SL پوزیشن باز. */
   const [editTpsl, setEditTpsl] = useState<EditTpslTarget | null>(null);
   const [editStopText, setEditStopText] = useState('');
@@ -455,6 +472,62 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const roiOf = (pnlUsd: number): number =>
     settings.initialCapitalUsd > 0 ? (pnlUsd / settings.initialCapitalUsd) * 100 : 0;
 
+  // v1.5.3 — «عدد ورود را دقیق نشون بده»: نمایش قیمت با حداکثر ۸ رقم مؤثر
+  // (بدون گرد کردن‌های toFixed(4) که قیمت‌های کوچک را خراب می‌کرد).
+  const fmtExact = (v: number): string => {
+    if (!Number.isFinite(v) || v <= 0) return '—';
+    const abs = Math.abs(v);
+    if (abs >= 1000) return v.toLocaleString('en-US', { maximumFractionDigits: 2 });
+    if (abs >= 1) return String(Number(v.toPrecision(8)));
+    return String(Number(v.toPrecision(8)));
+  };
+
+  // v1.5.3 — ساعت + تاریخ شمسی باز شدن معامله
+  const fmtOpenTime = (ms?: number): string => {
+    if (!ms) return '';
+    try {
+      const d = new Date(ms);
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const fa = d.toLocaleDateString('fa-IR');
+      return `${hh}:${mm} — ${fa}`;
+    } catch {
+      return '';
+    }
+  };
+
+  // v1.5.3 — «برای حالت دمو گزینه ریست بزار که همه چی از اول بتونم بک‌تست بگیرم»
+  const handleResetDemo = () => {
+    Alert.alert(
+      'ریست کامل بک‌تست دمو',
+      'همه پوزیشن‌های دمو، تاریخچه، آمار روزانه و لاگ‌ها پاک می‌شوند و از صفر شروع می‌کنید. (حالت واقعی دست‌نخورده می‌ماند.)',
+      [
+        { text: 'لغو', style: 'cancel' },
+        {
+          text: 'ریست کامل',
+          style: 'destructive',
+          onPress: () => {
+            if (resetBusy) return;
+            setResetBusy(true);
+            void (async () => {
+              try {
+                const r = await resetDemoBacktest();
+                await refreshPositions();
+                if (r.server.ok) {
+                  Alert.alert('ریست شد ✅', 'بک‌تست دمو از صفر شروع شد — سرور ۲۴/۷ هم ریست شد.');
+                } else if (settings.server247.enabled) {
+                  Alert.alert('ریست شد ✅', `بک‌تست دمو از صفر شروع شد.\n(ریست سرور ناموفق: ${r.server.error ?? 'خطا'})`);
+                }
+              } finally {
+                setResetBusy(false);
+              }
+            })();
+          },
+        },
+      ]
+    );
+  };
+
   return (
     <View style={styles.card}>
       <Pressable style={styles.header} onPress={() => setShowDetail((v) => !v)}>
@@ -507,6 +580,17 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               <Pressable style={styles.startBtn} onPress={startBot}>
                 <Play size={12} color={colors.dark.background} />
                 <Text style={styles.startBtnText}>شروع ربات</Text>
+              </Pressable>
+            )}
+            {/* v1.5.3 — ریست کامل بک‌تست دمو (همه‌چیز حتی تاریخچه پاک شود) */}
+            {settings.mode === 'demo' && (
+              <Pressable style={styles.resetBtn} onPress={handleResetDemo} disabled={resetBusy} testID="demo-reset-btn">
+                {resetBusy ? (
+                  <ActivityIndicator size="small" color={colors.dark.accent} />
+                ) : (
+                  <RotateCcw size={12} color={colors.dark.accent} />
+                )}
+                <Text style={styles.resetBtnText}>ریست کامل</Text>
               </Pressable>
             )}
           </View>
@@ -744,8 +828,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               </View>
             </View>
             <Text style={styles.sourceHint}>
-              استاپ‌لاس و تیک‌پرافیت اتوماتیک از نقطه ورود محاسبه می‌شوند: استاپ = {settings.maxLossPercent}٪ دورتر
-              از ورود؛ تیک‌پرافیت = فاصله استاپ × {settings.rewardRatio} (ریوارد به ریسک).
+              استاپ‌لاس با لوریج حساب می‌شود: حد ضرر {settings.maxLossPercent}٪ با لوریج {settings.leverage} = ضررِ حساب {Number(settings.maxLossPercent) * settings.leverage}٪ (فاصله قیمت = حد ضرر ÷ لوریج). تیک‌پرافیت = فاصله استاپ × {settings.rewardRatio} (R:R).
             </Text>
           </View>
 
@@ -757,9 +840,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             </View>
             <View style={styles.switchRow}>
               <View style={{ flex: 1 }}>
-                <Text style={styles.switchRowTitle}>تریلینگ استاپ همه معاملات</Text>
+                <Text style={styles.switchRowTitle}>تریلینگ استاپ (در سود حرکت می‌کند)</Text>
                 <Text style={styles.switchRowHint}>
-                  وقتی معامله در سود برود، استاپ تا سربه‌سر + کارمزد صرافی بالا کشیده می‌شود — هیچ معامله سودده‌ای با ضرر بسته نمی‌شود؛ ریسک‌فری = حداقل کارمزد در می‌آید.
+                  با ۱٪ حرکت قیمت به سود (با لوریج ۵ = ۵٪ سود) معامله ریسک‌فری می‌شود؛ بعدش استاپ روی نصفِ بیشترین سود می‌نشیند (مثلاً ۱۰٪ سود → استاپ روی ۵٪) تا با برگشت قیمت حداقل نصف سود از آب دربیاید. وقتی سود به ۲۵٪ یا ۵۰٪ برسد ربات خودش نصف حجم را می‌بندد تا سودی از دست نرود.
                 </Text>
               </View>
               <Switch
@@ -848,7 +931,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 <Text style={styles.sourceTitle}>PnL ربات (USDT) — مثل فیوچرز بایننس</Text>
               </View>
               <View ref={pnlCardRef} collapsable={false} style={styles.pnlShareCard}>
-                {/* v1.5.2 — لوگوی برنامه در بک‌گراند عکس */}
+                {/* v1.5.3 — لوگوی مشکی‌پس‌زمینه (بدون قاب) — دیده‌شدنی در عکس خروجی */}
                 <Image source={APP_LOGO} style={styles.pnlLogoBg} resizeMode="contain" />
                 <Text style={styles.pnlShareTitle}>🤖 بک‌تست — PNL (USDT)</Text>
                 {/* انتخاب بازه (همان چیپ‌های قبلی) */}
@@ -872,6 +955,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     <PnlRow label="PNL بسته‌شده" value={demoStats.realized} pct={roiOf(demoStats.realized)} />
                     <PnlRow label="PNL باز (لحظه‌ای)" value={demoStats.open} pct={roiOf(demoStats.open)} />
                     <PnlRow label="مجموع PNL" value={demoStats.realized + demoStats.open} pct={roiOf(demoStats.realized + demoStats.open)} bold />
+                    {/* v1.5.3 — «سرمایه اولیه هر چی میزنم سود و زیان به اون موجودی اضافه/کم بشه» */}
+                    <PnlRow label="موجودی فعلی (سرمایه اولیه + PNL)" value={settings.initialCapitalUsd + demoStats.realized + demoStats.open} pct={roiOf(demoStats.realized + demoStats.open)} bold />
                     <Text style={styles.pnlMetaText}>
                       {demoStats.trades.toLocaleString('fa-IR')} معامله • نرخ برد{' '}
                       {demoStats.trades > 0
@@ -887,6 +972,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     <PnlRow label="PNL بسته‌شده" value={realStats.realized} pct={roiOf(realStats.realized)} />
                     <PnlRow label="PNL باز (لحظه‌ای)" value={realStats.open} pct={roiOf(realStats.open)} />
                     <PnlRow label="مجموع PNL" value={realStats.realized + realStats.open} pct={roiOf(realStats.realized + realStats.open)} bold />
+                    {/* v1.5.3 — موجودی = سرمایه اولیه ± PnL */}
+                    <PnlRow label="موجودی فعلی (سرمایه اولیه + PNL)" value={settings.initialCapitalUsd + realStats.realized + realStats.open} pct={roiOf(realStats.realized + realStats.open)} bold />
                     <Text style={styles.pnlMetaText}>
                       {realStats.trades.toLocaleString('fa-IR')} معامله • نرخ برد{' '}
                       {realStats.trades > 0
@@ -981,9 +1068,14 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       keyboardType="decimal-pad"
                       testID="tpsl-take-input"
                     />
-                    <Pressable style={styles.shareBtn} onPress={() => void applyEditTpsl()} disabled={tpslBusy} testID="tpsl-apply">
-                      {tpslBusy ? <ActivityIndicator size="small" color={colors.dark.background} /> : <Edit3 size={13} color={colors.dark.background} />}
-                      <Text style={styles.shareBtnText}>ذخیره TP/SL</Text>
+                    <Pressable style={styles.tpslSaveBtn} onPress={() => void applyEditTpsl()} disabled={tpslBusy} testID="tpsl-apply">
+                      {tpslBusy ? (
+                        <ActivityIndicator size="small" color={colors.dark.background} />
+                      ) : (
+                        <Save size={14} color={colors.dark.background} />
+                      )}
+                      {/* v1.5.3 — «بنویس ذخیره که کاربر بدونه» + دکمه تمام‌عرض (قبلاً خیلی باریک بود) */}
+                      <Text style={styles.tpslSaveBtnText}>ذخیره</Text>
                     </Pressable>
                   </>
                 )}
@@ -1019,13 +1111,21 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       <Text style={styles.posSymbol}>
                         {p.side === 'long' ? '🟢' : '🔴'} {p.symbol} ×{p.leverage}
                         {p.trailArmed ? ' 🛡' : ''}
+                        {/* v1.5.3 — نام استراتژی کنار ارز */}
+                        {p.strategyName ? <Text style={styles.posStrategy}> • {p.strategyName}</Text> : null}
                       </Text>
                       <Text style={styles.posSource} numberOfLines={1}>
                         {p.source === 'whale' ? '🐋 ' : '📈 '}{p.sourceLabel}
                       </Text>
+                      {/* v1.5.3 — قیمت ورود دقیق در خط جدا + قیمت فعلی/SL/TP در خط بعد */}
                       <Text style={styles.posPrices}>
-                        ورود {p.entryPrice.toFixed(4)} → {p.lastPrice.toFixed(4)} • SL {p.stopPrice.toFixed(3)} / TP {p.takePrice.toFixed(3)}
+                        ورود: {fmtExact(p.entryPrice)} → فعلی: {fmtExact(p.lastPrice)}
                       </Text>
+                      <Text style={styles.posPrices}>
+                        SL {fmtExact(p.stopPrice)} / TP {fmtExact(p.takePrice)}
+                      </Text>
+                      {/* v1.5.3 — ساعت و تاریخ باز شدن معامله */}
+                      <Text style={styles.posTime}>باز شد: {fmtOpenTime(p.openedAt)}</Text>
                     </View>
                     <View style={styles.posSide}>
                       <Text style={[styles.posPnl, { color: pnl >= 0 ? colors.dark.green : colors.dark.red }]}>
@@ -1034,7 +1134,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       <Text style={[styles.posPnlPct, { color: pnlPct >= 0 ? colors.dark.green : colors.dark.red }]}>
                         {pnlPct >= 0 ? '+' : '−'}{Math.abs(pnlPct).toFixed(2)}٪
                       </Text>
-                      {/* v1.5.2 — ویرایش دستی TP/SL این معامله */}
+                      {/* v1.5.3 — ویرایش دستی TP/SL این معامله */}
                       <Pressable
                         style={styles.posEditBtn}
                         hitSlop={6}
@@ -1053,6 +1153,22 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                         testID={`pos-edit-tpsl-${p.id}`}
                       >
                         <Edit3 size={11} color={colors.dark.accent} />
+                      </Pressable>
+                      {/* v1.5.3 — «بصورت دستی هم بشه بخشی از حجم را ببندم» */}
+                      <Pressable
+                        style={styles.posHalfBtn}
+                        hitSlop={6}
+                        onPress={() =>
+                          void manualPartialClosePosition(settings, realKeys, {
+                            id: p.id,
+                            symbol: p.symbol,
+                            side: p.side,
+                            lastPrice: p.lastPrice,
+                          }).then(refreshPositions)
+                        }
+                        testID={`pos-half-${p.id}`}
+                      >
+                        <Scissors size={11} color={colors.dark.blue} />
                       </Pressable>
                       <Pressable style={styles.posCloseBtn} onPress={() => void manualClosePosition(settings, realKeys, p).then(refreshPositions)}>
                         <X size={11} color={colors.dark.red} />
@@ -1093,8 +1209,12 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   })()}
                   {closedPositions.map((p) => (
                     <View key={p.id} style={styles.closedRow}>
-                      <Text style={styles.closedText} numberOfLines={1}>
-                        {p.symbol} ({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'تیک‌پرافیت' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : 'دستی'})
+                      <Text style={styles.closedText} numberOfLines={2}>
+                        {/* v1.5.3 — نام استراتژی + نوع اندیکاتور کنار نام ارز */}
+                        {p.symbol}
+                        {p.strategyName ? ` • ${p.strategyName}` : ''}
+                        {p.sourceLabel ? ` • ${p.sourceLabel}` : ''}
+                        {' '}({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'تیک‌پرافیت' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : p.closeReason === 'partial' ? 'برداشت سود (نصف حجم)' : p.closeReason === 'partial-manual' ? 'نصف دستی' : 'دستی'})
                       </Text>
                       <Text style={[styles.posPnl, { color: (p.realizedPnl ?? 0) >= 0 ? colors.dark.green : colors.dark.red }]}>
                         {(p.realizedPnl ?? 0) >= 0 ? '+' : '−'}${Math.abs(p.realizedPnl ?? 0).toFixed(2)}
@@ -1135,13 +1255,21 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       <Text style={styles.posSymbol}>
                         {p.side === 'long' ? '🟢' : '🔴'} {p.symbol} ×{p.leverage}
                         {p.trailArmed ? ' 🛡' : ''}
+                        {/* v1.5.3 — نام استراتژی کنار ارز */}
+                        {p.strategyName ? <Text style={styles.posStrategy}> • {p.strategyName}</Text> : null}
                       </Text>
                       <Text style={styles.posSource} numberOfLines={1}>
                         {p.source === 'whale' ? '🐋 ' : '📈 '}{p.sourceLabel}
                       </Text>
+                      {/* v1.5.3 — قیمت ورود دقیق در خط جدا + قیمت فعلی/SL/TP */}
                       <Text style={styles.posPrices}>
-                        ورود {p.entryPrice.toFixed(4)} → {p.lastPrice.toFixed(4)} • SL {p.stopPrice.toFixed(3)} / TP {p.takePrice.toFixed(3)}
+                        ورود: {fmtExact(p.entryPrice)} → فعلی: {fmtExact(p.lastPrice)}
                       </Text>
+                      <Text style={styles.posPrices}>
+                        SL {fmtExact(p.stopPrice)} / TP {fmtExact(p.takePrice)}
+                      </Text>
+                      {/* v1.5.3 — ساعت و تاریخ باز شدن معامله */}
+                      <Text style={styles.posTime}>باز شد: {fmtOpenTime(p.openedAt)}</Text>
                     </View>
                     <View style={styles.posSide}>
                       <Text style={[styles.posPnl, { color: pnl >= 0 ? colors.dark.green : colors.dark.red }]}>
@@ -1168,6 +1296,21 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                         }
                       >
                         <Edit3 size={11} color={colors.dark.accent} />
+                      </Pressable>
+                      {/* v1.5.3 — بستن دستی نصف حجم (واقعی) */}
+                      <Pressable
+                        style={styles.posHalfBtn}
+                        hitSlop={6}
+                        onPress={() =>
+                          void manualPartialClosePosition(settings, realKeys, {
+                            id: p.id,
+                            symbol: p.symbol,
+                            side: p.side,
+                            lastPrice: p.lastPrice,
+                          }).then(refreshPositions)
+                        }
+                      >
+                        <Scissors size={11} color={colors.dark.blue} />
                       </Pressable>
                       <Pressable
                         style={styles.posCloseBtn}
@@ -1217,8 +1360,12 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   })()}
                   {realClosed.map((p) => (
                     <View key={p.id} style={styles.closedRow}>
-                      <Text style={styles.closedText} numberOfLines={1}>
-                        {p.symbol} ({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'روی صرافی' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : 'دستی'})
+                      <Text style={styles.closedText} numberOfLines={2}>
+                        {/* v1.5.3 — نام استراتژی + نوع اندیکاتور کنار نام ارز */}
+                        {p.symbol}
+                        {p.strategyName ? ` • ${p.strategyName}` : ''}
+                        {p.sourceLabel ? ` • ${p.sourceLabel}` : ''}
+                        {' '}({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'روی صرافی' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : p.closeReason === 'partial' ? 'برداشت سود (نصف حجم)' : p.closeReason === 'partial-manual' ? 'نصف دستی' : 'دستی'})
                       </Text>
                       <Text style={[styles.posPnl, { color: (p.realizedPnl ?? 0) >= 0 ? colors.dark.green : colors.dark.red }]}>
                         {(p.realizedPnl ?? 0) >= 0 ? '+' : '−'}${Math.abs(p.realizedPnl ?? 0).toFixed(2)}
@@ -1708,6 +1855,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  /* v1.5.3 — دکمه «بستن نصف حجم» روی هر پوزیشن */
+  posHalfBtn: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    backgroundColor: colors.dark.blue + '1C',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   posCloseBtn: {
     width: 22,
     height: 22,
@@ -1715,6 +1871,35 @@ const styles = StyleSheet.create({
     backgroundColor: colors.dark.red + '1C',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  /* v1.5.3 — ساعت و تاریخ باز شدن معامله */
+  posTime: {
+    fontSize: 8.5,
+    color: colors.dark.textMuted,
+    marginTop: 2,
+  },
+  /* v1.5.3 — برچسب استراتژی کنار نماد ارز */
+  posStrategy: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: colors.dark.accent,
+  },
+  /* v1.5.3 — دکمه ریست کامل دمو */
+  resetBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: colors.dark.accent + '14',
+    borderWidth: 1,
+    borderColor: colors.dark.accent + '55',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  resetBtnText: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: colors.dark.accent,
   },
   closedBox: {
     marginTop: 4,
@@ -1795,6 +1980,23 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.dark.border,
     padding: 14,
+  },
+  /* v1.5.3 — دکمه ذخیره TP/SL: تمام‌عرض و درشت (قبلاً flex:1 داخل ستون = باریک) */
+  tpslSaveBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    alignSelf: 'stretch',
+    backgroundColor: colors.dark.green,
+    borderRadius: 10,
+    paddingVertical: 12,
+    marginTop: 8,
+  },
+  tpslSaveBtnText: {
+    fontSize: 13,
+    fontWeight: '900',
+    color: colors.dark.background,
   },
   tpslHint: {
     fontSize: 9,
@@ -1970,14 +2172,15 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     direction: 'ltr',
   },
-  /* v1.5.2 — لوگوی برنامه در بک‌گراند عکس PnL */
+  /* v1.5.2 — لوگوی برنامه در بک‌گراند عکس PnL (v1.5.3: مشکی‌پس‌زمینه + واضح‌تر) */
   pnlLogoBg: {
     position: 'absolute',
     alignSelf: 'center',
     top: 0,
     bottom: 0,
-    width: 220,
-    opacity: 0.08,
+    width: 200,
+    height: 200,
+    opacity: 0.22,
   },
   pnlMetaText: {
     fontSize: 9,
