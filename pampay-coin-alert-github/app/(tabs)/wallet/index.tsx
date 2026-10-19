@@ -2750,18 +2750,11 @@ export default function WalletScreen() {
         }
       />
 
-      {/* ── v1.4.14: تب‌های بالای صفحه مدیریت دارایی + v1.4.16: تب چهارم ── */}
+      {/* ── v1.5.6 (بازیابی ترتیب v1.5.4) — ترتیب تب‌ها از سمت راست:
+          دارایی و فلزات، پیش‌بینی، کیف پول، ارز دیجیتال (در RTL اولین آیتم
+          در سمت راست قرار می‌گیرد).
+          v1.4.14: تب‌های بالای صفحه + v1.4.16: تب چهارم ── */}
       <View style={styles.mainTabBar}>
-        <Pressable
-          style={[styles.mainTab, activeMainTab === 'crypto' && styles.mainTabActive]}
-          onPress={() => switchMainTab('crypto')}
-          testID="main-tab-crypto"
-        >
-          <Bitcoin size={12} color={activeMainTab === 'crypto' ? colors.dark.accent : colors.dark.textSecondary} />
-          <Text style={[styles.mainTabText, activeMainTab === 'crypto' && styles.mainTabTextActive]}>
-            ارز دیجیتال
-          </Text>
-        </Pressable>
         <Pressable
           style={[styles.mainTab, activeMainTab === 'rial' && styles.mainTabActive]}
           onPress={() => switchMainTab('rial')}
@@ -2791,6 +2784,16 @@ export default function WalletScreen() {
           <LinkIcon size={12} color={activeMainTab === 'blockchain' ? colors.dark.accent : colors.dark.textSecondary} />
           <Text style={[styles.mainTabText, activeMainTab === 'blockchain' && styles.mainTabTextActive]}>
             کیف پول بلاکچین
+          </Text>
+        </Pressable>
+        <Pressable
+          style={[styles.mainTab, activeMainTab === 'crypto' && styles.mainTabActive]}
+          onPress={() => switchMainTab('crypto')}
+          testID="main-tab-crypto"
+        >
+          <Bitcoin size={12} color={activeMainTab === 'crypto' ? colors.dark.accent : colors.dark.textSecondary} />
+          <Text style={[styles.mainTabText, activeMainTab === 'crypto' && styles.mainTabTextActive]}>
+            ارز دیجیتال
           </Text>
         </Pressable>
       </View>
