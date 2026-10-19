@@ -32,6 +32,8 @@ import colors from '@/constants/colors';
 import { createThemedStyles } from '@/utils/themeStyles';
 import {
   fetchFullWalletData,
+  fetchWhalePnl,
+  WhalePnl,
   ParsedPosition,
   ParsedSpotBalance,
   ParsedFill,
@@ -39,6 +41,98 @@ import {
 } from '@/utils/hyperliquidApi';
 
 type SectionTab = 'positions' | 'spot' | 'activity';
+
+// v1.5.3 — «pnl نهنگ‌ها را وقتی روش میزنم وارد اطلاعاتشون بشم نشون بده، نه
+// در همون بخش» — PnL چیپ‌های چندبازه (۷/۳۰/۹۰/۱۸۰ روز + باز) از کارت لیست
+// نهنگ‌ها به همین صفحه جزئیات منتقل شد.
+function WhalePnlChips({ address }: { address: string }) {
+  const q = useQuery({
+    queryKey: ['whale-pnl', address],
+    queryFn: () => fetchWhalePnl(address),
+    staleTime: 5 * 60_000,
+    retry: 1,
+  });
+  if (q.isLoading) {
+    return <Text style={whalePnlStyles.loading}>در حال دریافت سود/زیان نهنگ…</Text>;
+  }
+  if (q.isError || !q.data) {
+    return <Text style={whalePnlStyles.err}>سود/زیان این نهنگ موقتاً در دسترس نیست (Hyperliquid)</Text>;
+  }
+  const d: WhalePnl = q.data;
+  const rows: { label: string; v: number; t: number }[] = [
+    { label: '۷ روزه', v: d.d7.realized, t: d.d7.trades },
+    { label: '۳۰ روزه', v: d.d30.realized, t: d.d30.trades },
+    { label: '۹۰ روزه', v: d.d90.realized, t: d.d90.trades },
+    { label: '۱۸۰ روزه', v: d.d180.realized, t: d.d180.trades },
+    { label: 'باز', v: d.unrealized, t: d.openPositions },
+  ];
+  return (
+    <View style={whalePnlStyles.box}>
+      {rows.map((r) => (
+        <View key={r.label} style={whalePnlStyles.chip}>
+          <Text style={whalePnlStyles.chipLabel}>
+            {r.label} {r.t > 0 ? `(${r.t.toLocaleString('fa-IR')})` : ''}
+          </Text>
+          <Text
+            style={[whalePnlStyles.chipValue, { color: r.v >= 0 ? colors.dark.green : colors.dark.red }]}
+          >
+            {r.v >= 0 ? '+' : '−'} ${Math.abs(r.v).toLocaleString('en-US', { maximumFractionDigits: 0 })}
+          </Text>
+        </View>
+      ))}
+      <Text style={whalePnlStyles.note}>
+        سود/زیان تحقق‌یافته پوزیشن‌های بسته‌شده در هر بازه + «باز» = سود شناور پوزیشن‌های فعلی
+        ({d.openPositions.toLocaleString('fa-IR')} پوزیشن) — منبع: Hyperliquid
+      </Text>
+    </View>
+  );
+}
+
+const whalePnlStyles = StyleSheet.create({
+  box: {
+    marginTop: 8,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 4,
+    alignItems: 'center',
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    paddingHorizontal: 7,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+  },
+  chipLabel: {
+    fontSize: 8.5,
+    color: colors.dark.textMuted,
+  },
+  chipValue: {
+    fontSize: 9.5,
+    fontWeight: '700',
+  },
+  loading: {
+    fontSize: 9,
+    color: colors.dark.textMuted,
+    marginTop: 4,
+  },
+  err: {
+    fontSize: 9,
+    color: colors.dark.textMuted,
+    marginTop: 4,
+  },
+  note: {
+    fontSize: 8,
+    color: colors.dark.textMuted,
+    width: '100%',
+    marginTop: 2,
+    lineHeight: 12,
+  },
+});
 
 export default function WalletDetailScreen() {
   const router = useRouter();
@@ -159,6 +253,10 @@ export default function WalletDetailScreen() {
             <Text style={styles.summaryValue}>${formatNumber(spotValue)}</Text>
           </View>
         </View>
+
+        {/* v1.5.3 — PnL چندبازه نهنگ (۷/۳۰/۹۰/۱۸۰ روز + باز) — از لیست به
+            صفحه جزئیات منتقل شد؛ لمس کارت نهنگ در لیست به اینجا می‌آید */}
+        {address && <WhalePnlChips address={address} />}
       </View>
 
       {walletQuery.isLoading && (
