@@ -749,7 +749,10 @@ class ScanEngine {
       gainzAlgoEnabled: b.gainzAlgoEnabled !== undefined ? b.gainzAlgoEnabled !== false : (existing?.gainzAlgoEnabled ?? true),
       gainzTimeframes: gainzTimeframes.length > 0 ? gainzTimeframes : (existing?.gainzTimeframes ?? ["1d"]),
       indicators,
-      hookEnabled: b.hookEnabled !== undefined ? b.hookEnabled : (existing?.hookEnabled ?? false),
+      // v1.5.6 (بازیابی از v1.5.4) — پیش‌فرض روشن: «اعلان‌های اندیکاتورها با
+      // برنامه بسته باید در تلگرام بیاید (حیاتی است)» — اگر کانفیگی هرگز sync
+      // نشده بود، هوک ریورسال هم مثل GainzAlgo به‌طور پیش‌فرض اعلام می‌شود.
+      hookEnabled: b.hookEnabled !== undefined ? b.hookEnabled !== false : (existing?.hookEnabled ?? true),
       hookTimeframes: hookTimeframes.length > 0 ? hookTimeframes : (existing?.hookTimeframes ?? ["1d"]),
       scannerEnabled: b.scannerEnabled !== undefined ? b.scannerEnabled : (existing?.scannerEnabled ?? true),
       memeEnabled: b.memeEnabled !== undefined ? b.memeEnabled : (existing?.memeEnabled ?? true),
