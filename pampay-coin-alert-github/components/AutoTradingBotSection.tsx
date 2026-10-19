@@ -39,6 +39,15 @@
  *  • تاریخچه: نام استراتژی + نوع اندیکاتور کنار نام ارز.
  *  • فیلتر پیش‌فرض تاریخچه و PnL = «امروز» + موجودی (سرمایه اولیه ± PnL).
  *  • عکس PnL: لوگو با پس‌زمینه مشکی (بدون قاب) بهتر دیده می‌شود.
+ *
+ * v1.5.6 — نسخه تجمیعی (ادغام کامل v1.5.4 + v1.5.5):
+ *  • بازیابی همه قابلیت‌های v1.5.4 که در v1.5.5 از قلم افتاده بود: خروجی PDF
+ *    تاریخچه (utils/backtestPdf.ts + expo-print)، فیلتر سودها/ضررها + نوع بستن،
+ *    صفحه‌بندی ۱۰۰تایی (قبلی/بعدی)، پیغام تایید قبل از بستن کامل، رفرش ۵
+ *    ثانیه‌ای، قیمت با دقت بایننس (formatBinancePrice)، مارجین درگیر/آزاد.
+ *  • حفظ همه بهبودهای v1.5.5: بک‌فیل ۷ روزه (تا سقف تنظیم‌شده)، سقف ۱۰۰ معامله
+ *    تاریخچه، سربرگ «X از Y پوزیشن»، امضای RSA البانک (10203)، merge ایمن sync،
+ *    حذف کامل موتور سروری ۲۴/۷ (ربات فقط روی گوشی) و اسکن هوک ۸۰ ارزی.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -77,11 +86,19 @@ import {
   Edit3,
   RotateCcw,
   Scissors,
+  FileText,
+  ChevronRight,
+  ChevronLeft,
 } from 'lucide-react-native';
 import { captureRef } from 'react-native-view-shot';
 import * as Sharing from 'expo-sharing';
 import * as MediaLibrary from 'expo-media-library';
+// v1.5.6 — بازیابی خروجی PDF تاریخچه (expo-print + utils/backtestPdf.ts)
+import * as Print from 'expo-print';
 import colors from '@/constants/colors';
+// v1.5.6 — بازیابی دقت قیمت بایننس (getFuturesPricePrecisionMap از v1.5.4)
+import { formatBinancePrice, getFuturesPricePrecisionMap } from '@/utils/binanceFuturesTrading';
+import { BacktestPdfRow, buildBacktestPdfHtml } from '@/utils/backtestPdf';
 import {
   AutoPnlPeriod,
   AutoTf,
@@ -117,8 +134,60 @@ import {
 /** v1.5.3 — لوگوی مشکی‌پس‌زمینه (بدون قاب سفید) برای بک‌گراند عکس PnL. */
 const APP_LOGO = require('@/assets/images/icon-dark.png');
 
-/** v1.5.2 — رفرش پوزیشن‌های ربات هر ۳ ثانیه (طبق درخواست کاربر). */
-const UI_REFRESH_MS = 3_000;
+/** v1.5.4 (بازیابی‌شده در v1.5.6) — رفرش پوزیشن‌های باز هر ۵ ثانیه. */
+const UI_REFRESH_MS = 5_000;
+
+/** v1.5.4 (بازیابی‌شده در v1.5.6) — صفحه‌بندی تاریخچه: ۱۰۰ معامله در هر صفحه
+ * («بالای ۱۰۰ بره صفحه دو و بشه دید در صفحات بعدی»). */
+const HIST_PAGE_SIZE = 100;
+
+/** v1.5.4 (بازیابی‌شده در v1.5.6) — فیلتر نوع تاریخچه: همه / فقط سودها /
+ *  فقط ضررها / استاپ / تیک‌پرافیت / بستن دستی / بستن حجمی. */
+type HistTypeFilter = 'all' | 'wins' | 'losses' | 'stop' | 'take' | 'manual' | 'partial';
+const HIST_TYPE_FILTERS: { key: HistTypeFilter; label: string }[] = [
+  { key: 'all', label: 'همه' },
+  { key: 'wins', label: 'سودها' },
+  { key: 'losses', label: 'ضررها' },
+  { key: 'stop', label: 'استاپ' },
+  { key: 'take', label: 'تیک‌پرافیت' },
+  { key: 'manual', label: 'دستی' },
+  { key: 'partial', label: 'بستن حجمی' },
+];
+const HIST_TYPE_FILTER_LABEL: Record<HistTypeFilter, string> = {
+  all: 'همه',
+  wins: 'فقط سودها',
+  losses: 'فقط ضررها',
+  stop: 'استاپ',
+  take: 'تیک‌پرافیت',
+  manual: 'بستن دستی',
+  partial: 'بستن حجمی',
+};
+
+/** v1.5.4 (بازیابی‌شده در v1.5.6) — تطبیق لیست تاریخچه با فیلتر نوع. */
+function matchHistType<T extends { realizedPnl?: number; closeReason?: string }>(list: T[], f: HistTypeFilter): T[] {
+  switch (f) {
+    case 'wins':
+      return list.filter((p) => (p.realizedPnl ?? 0) >= 0);
+    case 'losses':
+      return list.filter((p) => (p.realizedPnl ?? 0) < 0);
+    case 'stop':
+      return list.filter((p) => p.closeReason === 'stop');
+    case 'take':
+      return list.filter((p) => p.closeReason === 'take');
+    case 'manual':
+      return list.filter((p) => p.closeReason === 'manual');
+    case 'partial':
+      return list.filter((p) => p.closeReason === 'partial' || p.closeReason === 'partial-manual');
+    default:
+      return list;
+  }
+}
+
+/** v1.5.4 (بازیابی‌شده در v1.5.6) — مارجین ورودی پوزیشن: حجم × قیمت ورود ÷ لوریج. */
+function marginOfPosition(p: { qty: number; entryPrice: number; leverage?: number; sizeUsd?: number }): number {
+  const lev = p.leverage ?? 0;
+  return lev > 0 ? (p.qty * p.entryPrice) / lev : (p.sizeUsd ?? 0);
+}
 
 /** پوزیشن در حال ویرایش TP/SL (دمو یا واقعی). */
 interface EditTpslTarget {
@@ -188,6 +257,13 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [partialPctText, setPartialPctText] = useState('50');
   const [partialBusy, setPartialBusy] = useState(false);
   const [partialHint, setPartialHint] = useState('');
+  /** v1.5.4 (بازیابی‌شده در v1.5.6) — فیلتر نوع تاریخچه + صفحه‌بندی دمو/واقعی + PDF. */
+  const [histTypeFilter, setHistTypeFilter] = useState<HistTypeFilter>('all');
+  const [histPage, setHistPage] = useState(1);
+  const [realHistPage, setRealHistPage] = useState(1);
+  const [pdfBusy, setPdfBusy] = useState(false);
+  /** v1.5.4 (بازیابی‌شده در v1.5.6) — دقت قیمت بایننس (symbol → pricePrecision). */
+  const [pricePrecision, setPricePrecision] = useState<Record<string, number>>({});
   const pnlCardRef = useRef<View>(null);
 
   // load everything on mount
@@ -254,6 +330,22 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     setCycleBusy(false);
   }, [cycleBusy, refreshPositions]);
 
+  // v1.5.4 (بازیابی‌شده در v1.5.6) — «قیمت را طبق بایننس تا هر چند رقم اعشار
+  // داره نشون بده»: نقشه دقت قیمت‌ها از exchangeInfo فیوچرز بایننس (کش ۱
+  // ساعته در خود ماژول).
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const m = await getFuturesPricePrecisionMap();
+        if (!cancelled && Object.keys(m).length > 0) setPricePrecision(m);
+      } catch {}
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // v1.5.1 — فیلتر روز تاریخچه معاملات (امروز/۷/۳۰/همه)
   const histWindowMs = useCallback(
     (p: AutoPnlPeriod): number =>
@@ -262,25 +354,39 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   );
 
   const openPositions = useMemo(() => positions.filter((p) => p.status === 'open'), [positions]);
+  // v1.5.6 — ادغام v1.5.4 با v1.5.5: فیلتر بازه روز + فیلتر نوع (سود/ضرر/نوع بستن)
+  // + مرتب‌سازی «جدیدترین بسته‌شده اول» + سقف ۱۰۰ معامله (v1.5.5) + صفحه‌بندی ۱۰۰تایی (v1.5.4).
+  const closedFiltered = useMemo(() => {
+    const win = histWindowMs(histPeriod);
+    const now = Date.now();
+    return matchHistType(
+      positions.filter((p) => p.status === 'closed' && (win === Infinity || (!!p.closedAt && now - p.closedAt <= win))),
+      histTypeFilter
+    )
+      .sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0))
+      .slice(0, 100);
+  }, [positions, histPeriod, histWindowMs, histTypeFilter]);
+  const closedTotalPages = Math.max(1, Math.ceil(closedFiltered.length / HIST_PAGE_SIZE));
   const closedPositions = useMemo(() => {
-    const win = histWindowMs(histPeriod);
-    const now = Date.now();
-    return positions
-      .filter((p) => p.status === 'closed' && (win === Infinity || (!!p.closedAt && now - p.closedAt <= win)))
-      .slice()
-      .reverse()
-      .slice(0, 100);
-  }, [positions, histPeriod, histWindowMs]);
+    const page = Math.min(histPage, closedTotalPages);
+    return closedFiltered.slice((page - 1) * HIST_PAGE_SIZE, page * HIST_PAGE_SIZE);
+  }, [closedFiltered, histPage, closedTotalPages]);
   const realOpen = useMemo(() => realPositions.filter((p) => p.status === 'open'), [realPositions]);
-  const realClosed = useMemo(() => {
+  const realClosedFiltered = useMemo(() => {
     const win = histWindowMs(histPeriod);
     const now = Date.now();
-    return realPositions
-      .filter((p) => p.status === 'closed' && (win === Infinity || (!!p.closedAt && now - p.closedAt <= win)))
-      .slice()
-      .reverse()
+    return matchHistType(
+      realPositions.filter((p) => p.status === 'closed' && (win === Infinity || (!!p.closedAt && now - p.closedAt <= win))),
+      histTypeFilter
+    )
+      .sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0))
       .slice(0, 100);
-  }, [realPositions, histPeriod, histWindowMs]);
+  }, [realPositions, histPeriod, histWindowMs, histTypeFilter]);
+  const realClosedTotalPages = Math.max(1, Math.ceil(realClosedFiltered.length / HIST_PAGE_SIZE));
+  const realClosed = useMemo(() => {
+    const page = Math.min(realHistPage, realClosedTotalPages);
+    return realClosedFiltered.slice((page - 1) * HIST_PAGE_SIZE, page * HIST_PAGE_SIZE);
+  }, [realClosedFiltered, realHistPage, realClosedTotalPages]);
 
   const totalPnl = openPositions.reduce((s, p) => {
     const dir = p.side === 'long' ? 1 : -1;
@@ -290,6 +396,13 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     const dir = p.side === 'long' ? 1 : -1;
     return s + (p.lastPrice - p.entryPrice) * dir * p.qty;
   }, 0);
+
+  // v1.5.4 (بازیابی‌شده در v1.5.6) — مارجین درگیر پوزیشن‌های باز حالت فعال
+  // (حجم ÷ لوریج) — «حجم مارجین درگیر را هم نشون بده تا بدونم چقد آزاد دارم».
+  const engagedMarginUsd = useMemo(() => {
+    const list = settings.mode === 'demo' ? openPositions : realOpen;
+    return list.reduce((s, p) => s + marginOfPosition(p), 0);
+  }, [settings.mode, openPositions, realOpen]);
 
   // ── PnL stats per period (demo + real) ──
   const demoStats = useMemo(
@@ -535,6 +648,87 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     if (abs >= 1000) return v.toLocaleString('en-US', { maximumFractionDigits: 2 });
     if (abs >= 1) return String(Number(v.toPrecision(8)));
     return String(Number(v.toPrecision(8)));
+  };
+
+  // v1.5.4 (بازیابی‌شده در v1.5.6) — قیمت با دقتِ خود بایننس (مثلاً BTC دو رقم
+  // اعشار — نه ۵–۸ رقم). (plain function, not a hook — after early return)
+  const fmtPrice = (symbol: string, price: number): string => formatBinancePrice(symbol, price, pricePrecision);
+
+  // v1.5.4 (بازیابی‌شده در v1.5.6) — «بستن هر معامله با پیغام تایید»: قبل از
+  // بسته شدن کامل، تایید می‌گیرد.
+  const confirmClosePosition = (t: { id: string; symbol: string; side: 'long' | 'short'; lastPrice: number }) => {
+    Alert.alert(
+      'بستن معامله',
+      `معامله ${t.symbol} (${t.side === 'long' ? 'لانگ 🟢' : 'شورت 🔴'}) کامل بسته شود؟`,
+      [
+        { text: 'لغو', style: 'cancel' },
+        {
+          text: 'بله، بسته شود',
+          style: 'destructive',
+          onPress: () => {
+            void manualClosePosition(settings, realKeys, t).then(refreshPositions);
+          },
+        },
+      ]
+    );
+  };
+
+  // v1.5.4 (بازیابی‌شده در v1.5.6) — خروجی PDF کل تاریخچه‌ی فیلتر فعلی (بازه
+  // روز + فیلتر نوع) با تمام مشخصات هر پوزیشن.
+  const handleExportHistoryPdf = async () => {
+    if (pdfBusy) return;
+    setPdfBusy(true);
+    try {
+      if (Platform.OS === 'web') {
+        Alert.alert('وب', 'خروجی PDF فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
+        return;
+      }
+      const isDemo = settings.mode === 'demo';
+      const source = isDemo ? closedFiltered : realClosedFiltered;
+      if (source.length === 0) {
+        Alert.alert('تاریخچه خالی', 'در این بازه/فیلتر معامله‌ای برای PDF نیست.');
+        return;
+      }
+      const rows: BacktestPdfRow[] = source.map((p) => ({
+        symbol: p.symbol,
+        side: p.side,
+        strategyName: p.strategyName,
+        sourceLabel: p.sourceLabel,
+        entryPrice: p.entryPrice,
+        stopPrice: p.stopPrice,
+        takePrice: p.takePrice,
+        marginUsd: marginOfPosition(p),
+        qty: p.qty,
+        leverage: p.leverage,
+        openedAt: p.openedAt,
+        closedAt: p.closedAt,
+        closeReason: p.closeReason,
+        realizedPnl: p.realizedPnl,
+        entryText: fmtPrice(p.symbol, p.entryPrice),
+        stopText: fmtPrice(p.symbol, p.stopPrice),
+        takeText: fmtPrice(p.symbol, p.takePrice),
+      }));
+      const html = buildBacktestPdfHtml(rows, {
+        mode: settings.mode,
+        periodLabel: AUTO_PNL_PERIOD_LABEL[histPeriod],
+        filterLabel: HIST_TYPE_FILTER_LABEL[histTypeFilter],
+        initialCapitalUsd: settings.initialCapitalUsd,
+        engagedMarginUsd,
+        openPnlUsd: isDemo ? totalPnl : realTotalPnl,
+        generatedAt: Date.now(),
+      });
+      const { uri } = await Print.printToFileAsync({ html });
+      const available = await Sharing.isAvailableAsync().catch(() => false);
+      if (!available) {
+        Alert.alert('PDF ساخته شد', 'فایل ساخته شد اما اشتراک‌گذاری روی این دستگاه در دسترس نیست.');
+        return;
+      }
+      await Sharing.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: 'گزارش تاریخچه بک‌تست (PDF)' });
+    } catch {
+      Alert.alert('خطا', 'ساخت PDF انجام نشد — دوباره تلاش کنید.');
+    } finally {
+      setPdfBusy(false);
+    }
   };
 
   // v1.5.3 — ساعت + تاریخ شمسی باز شدن معامله
@@ -980,6 +1174,14 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     <PnlRow label="مجموع PNL" value={demoStats.realized + demoStats.open} pct={roiOf(demoStats.realized + demoStats.open)} bold />
                     {/* v1.5.3 — «سرمایه اولیه هر چی میزنم سود و زیان به اون موجودی اضافه/کم بشه» */}
                     <PnlRow label="موجودی فعلی (سرمایه اولیه + PNL)" value={settings.initialCapitalUsd + demoStats.realized + demoStats.open} pct={roiOf(demoStats.realized + demoStats.open)} bold />
+                    {/* v1.5.6 — مارجین درگیر/آزاد (بازیابی از v1.5.4): «حجم مارجین
+                        درگیر را هم نشون بده تا بدونم چقد آزاد دارم» */}
+                    <PnlRow label="مارجین درگیر (پوزیشن‌های باز)" value={engagedMarginUsd} neutral />
+                    <PnlRow
+                      label="مارجین آزاد (قابل معامله)"
+                      value={Math.max(0, settings.initialCapitalUsd + demoStats.realized - engagedMarginUsd)}
+                      neutral
+                    />
                     <Text style={styles.pnlMetaText}>
                       {demoStats.trades.toLocaleString('fa-IR')} معامله • نرخ برد{' '}
                       {demoStats.trades > 0
@@ -997,6 +1199,13 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     <PnlRow label="مجموع PNL" value={realStats.realized + realStats.open} pct={roiOf(realStats.realized + realStats.open)} bold />
                     {/* v1.5.3 — موجودی = سرمایه اولیه ± PnL */}
                     <PnlRow label="موجودی فعلی (سرمایه اولیه + PNL)" value={settings.initialCapitalUsd + realStats.realized + realStats.open} pct={roiOf(realStats.realized + realStats.open)} bold />
+                    {/* v1.5.6 — مارجین درگیر/آزاد در حالت واقعی (بازیابی از v1.5.4) */}
+                    <PnlRow label="مارجین درگیر (پوزیشن‌های باز)" value={engagedMarginUsd} neutral />
+                    <PnlRow
+                      label="مارجین آزاد (قابل معامله)"
+                      value={Math.max(0, settings.initialCapitalUsd + realStats.realized - engagedMarginUsd)}
+                      neutral
+                    />
                     <Text style={styles.pnlMetaText}>
                       {realStats.trades.toLocaleString('fa-IR')} معامله • نرخ برد{' '}
                       {realStats.trades > 0
@@ -1220,11 +1429,12 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                         {p.source === 'whale' ? '🐋 ' : '📈 '}{p.sourceLabel}
                       </Text>
                       {/* v1.5.3 — قیمت ورود دقیق در خط جدا + قیمت فعلی/SL/TP در خط بعد */}
+                      {/* v1.5.6 — قیمت با دقت بایننس (BTC دو رقم — نه ۵–۸ رقم) */}
                       <Text style={styles.posPrices}>
-                        ورود: {fmtExact(p.entryPrice)} → فعلی: {fmtExact(p.lastPrice)}
+                        ورود: {fmtPrice(p.symbol, p.entryPrice)} → فعلی: {fmtPrice(p.symbol, p.lastPrice)}
                       </Text>
                       <Text style={styles.posPrices}>
-                        SL {fmtExact(p.stopPrice)} / TP {fmtExact(p.takePrice)}
+                        SL {fmtPrice(p.symbol, p.stopPrice)} / TP {fmtPrice(p.symbol, p.takePrice)}
                       </Text>
                       {/* v1.5.4 — مارجین ورودی + ارزش فعلی پوزیشن */}
                       <Text style={styles.posMargin}>
@@ -1280,22 +1490,45 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       >
                         <Scissors size={11} color={colors.dark.blue} />
                       </Pressable>
-                      <Pressable style={styles.posCloseBtn} onPress={() => void manualClosePosition(settings, realKeys, p).then(refreshPositions)}>
+                      {/* v1.5.6 — بستن کامل فقط با پیغام تایید (بازیابی از v1.5.4) */}
+                      <Pressable
+                        style={styles.posCloseBtn}
+                        onPress={() =>
+                          confirmClosePosition({ id: p.id, symbol: p.symbol, side: p.side, lastPrice: p.lastPrice })
+                        }
+                        testID={`pos-close-${p.id}`}
+                      >
                         <X size={11} color={colors.dark.red} />
                       </Pressable>
                     </View>
                   </View>
                 );
               })}
-              {closedPositions.length > 0 && (
+              {closedFiltered.length > 0 || histTypeFilter !== 'all' ? (
                 <View style={styles.closedBox}>
-                  <Text style={styles.closedTitle}>تاریخچه معاملات:</Text>
+                  {/* v1.5.6 — سرتیتر + دکمه PDF کل تاریخچه‌ی فیلتر فعلی (بازیابی از v1.5.4) */}
+                  <View style={styles.closedTitleRow}>
+                    <Text style={styles.closedTitle}>تاریخچه معاملات:</Text>
+                    <Pressable
+                      style={styles.histPdfBtn}
+                      onPress={() => void handleExportHistoryPdf()}
+                      disabled={pdfBusy}
+                      testID="hist-pdf-btn"
+                    >
+                      {pdfBusy ? (
+                        <ActivityIndicator size="small" color={colors.dark.background} />
+                      ) : (
+                        <FileText size={11} color={colors.dark.background} />
+                      )}
+                      <Text style={styles.histPdfBtnText}>PDF</Text>
+                    </Pressable>
+                  </View>
                   <View style={styles.histPeriodRow}>
                     {AUTO_PNL_PERIODS.map((p) => (
                       <Pressable
                         key={p}
                         style={[styles.histPeriodChip, histPeriod === p && styles.histPeriodChipActive]}
-                        onPress={() => setHistPeriod(p)}
+                        onPress={() => { setHistPeriod(p); setHistPage(1); }}
                         testID={`auto-hist-${p}`}
                       >
                         <Text style={[styles.histPeriodText, histPeriod === p && styles.histPeriodTextActive]}>
@@ -1304,12 +1537,27 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       </Pressable>
                     ))}
                   </View>
+                  {/* v1.5.6 — فیلتر جداگانه سودها/ضررها + نوع بستن (بازیابی از v1.5.4) */}
+                  <View style={styles.histTypeRow}>
+                    {HIST_TYPE_FILTERS.map((f) => (
+                      <Pressable
+                        key={f.key}
+                        style={[styles.histTypeChip, histTypeFilter === f.key && styles.histTypeChipActive]}
+                        onPress={() => { setHistTypeFilter(f.key); setHistPage(1); }}
+                        testID={`auto-hist-type-${f.key}`}
+                      >
+                        <Text style={[styles.histPeriodText, histTypeFilter === f.key && styles.histPeriodTextActive]}>
+                          {f.label}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
                   {(() => {
-                    const sum = closedPositions.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
+                    const sum = closedFiltered.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
                     return (
                       <View style={styles.histSummary}>
                         <Text style={styles.histSummaryText}>
-                          {closedPositions.length.toLocaleString('fa-IR')} معامله در این بازه
+                          {closedFiltered.length.toLocaleString('fa-IR')} معامله در این بازه
                         </Text>
                         <Text style={[styles.histSummaryPnl, { color: sum >= 0 ? colors.dark.green : colors.dark.red }]}>
                           {sum >= 0 ? '+' : '−'}${Math.abs(sum).toFixed(2)}
@@ -1317,22 +1565,51 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       </View>
                     );
                   })()}
+                  {closedPositions.length === 0 && (
+                    <Text style={styles.sourceHint}>در این فیلتر معامله‌ای نیست — فیلتر دیگری را انتخاب کنید.</Text>
+                  )}
                   {closedPositions.map((p) => (
                     <View key={p.id} style={styles.closedRow}>
                       <Text style={styles.closedText} numberOfLines={2}>
                         {/* v1.5.3 — نام استراتژی + نوع اندیکاتور کنار نام ارز */}
+                        {/* v1.5.6 — جدیدترین بسته‌شده اول + زمان بسته شدن (بازیابی از v1.5.4) */}
                         {p.symbol}
                         {p.strategyName ? ` • ${p.strategyName}` : ''}
                         {p.sourceLabel ? ` • ${p.sourceLabel}` : ''}
-                        {' '}({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'تیک‌پرافیت' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : p.closeReason === 'partial' ? 'برداشت سود (نصف حجم)' : p.closeReason === 'partial-manual' ? 'نصف دستی' : 'دستی'})
+                        {' '}({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'تیک‌پرافیت' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : p.closeReason === 'partial' ? 'برداشت سود (نصف حجم)' : p.closeReason === 'partial-manual' ? 'بستن حجمی' : 'دستی'})
+                        {p.closedAt ? ` • ${fmtOpenTime(p.closedAt)}` : ''}
                       </Text>
                       <Text style={[styles.posPnl, { color: (p.realizedPnl ?? 0) >= 0 ? colors.dark.green : colors.dark.red }]}>
                         {(p.realizedPnl ?? 0) >= 0 ? '+' : '−'}${Math.abs(p.realizedPnl ?? 0).toFixed(2)}
                       </Text>
                     </View>
                   ))}
+                  {/* v1.5.6 — صفحه‌بندی ۱۰۰تایی: معاملات بالای ۱۰۰ → صفحه بعد (بازیابی از v1.5.4) */}
+                  {closedTotalPages > 1 && (
+                    <View style={styles.histPagerRow}>
+                      <Pressable
+                        style={[styles.histPagerBtn, histPage <= 1 && styles.histPagerBtnDisabled]}
+                        disabled={histPage <= 1}
+                        onPress={() => setHistPage((v) => Math.max(1, v - 1))}
+                      >
+                        <ChevronRight size={13} color={colors.dark.accent} />
+                        <Text style={styles.histPagerBtnText}>قبلی</Text>
+                      </Pressable>
+                      <Text style={styles.histPagerText}>
+                        صفحه {histPage.toLocaleString('fa-IR')} از {closedTotalPages.toLocaleString('fa-IR')}
+                      </Text>
+                      <Pressable
+                        style={[styles.histPagerBtn, histPage >= closedTotalPages && styles.histPagerBtnDisabled]}
+                        disabled={histPage >= closedTotalPages}
+                        onPress={() => setHistPage((v) => Math.min(closedTotalPages, v + 1))}
+                      >
+                        <Text style={styles.histPagerBtnText}>بعدی</Text>
+                        <ChevronLeft size={13} color={colors.dark.accent} />
+                      </Pressable>
+                    </View>
+                  )}
                 </View>
-              )}
+              ) : null}
             </View>
           )}
 
@@ -1374,11 +1651,12 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                         {p.source === 'whale' ? '🐋 ' : '📈 '}{p.sourceLabel}
                       </Text>
                       {/* v1.5.3 — قیمت ورود دقیق در خط جدا + قیمت فعلی/SL/TP */}
+                      {/* v1.5.6 — قیمت با دقت بایننس (BTC دو رقم — نه ۵–۸ رقم) */}
                       <Text style={styles.posPrices}>
-                        ورود: {fmtExact(p.entryPrice)} → فعلی: {fmtExact(p.lastPrice)}
+                        ورود: {fmtPrice(p.symbol, p.entryPrice)} → فعلی: {fmtPrice(p.symbol, p.lastPrice)}
                       </Text>
                       <Text style={styles.posPrices}>
-                        SL {fmtExact(p.stopPrice)} / TP {fmtExact(p.takePrice)}
+                        SL {fmtPrice(p.symbol, p.stopPrice)} / TP {fmtPrice(p.symbol, p.takePrice)}
                       </Text>
                       {/* v1.5.4 — مارجین ورودی + ارزش فعلی پوزیشن */}
                       <Text style={styles.posMargin}>
@@ -1433,16 +1711,13 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       >
                         <Scissors size={11} color={colors.dark.blue} />
                       </Pressable>
+                      {/* v1.5.6 — بستن کامل فقط با پیغام تایید (بازیابی از v1.5.4) */}
                       <Pressable
                         style={styles.posCloseBtn}
                         onPress={() =>
-                          void manualClosePosition(settings, realKeys, {
-                            id: p.id,
-                            symbol: p.symbol,
-                            side: p.side,
-                            lastPrice: p.lastPrice,
-                          }).then(refreshPositions)
+                          confirmClosePosition({ id: p.id, symbol: p.symbol, side: p.side, lastPrice: p.lastPrice })
                         }
+                        testID={`pos-close-real-${p.id}`}
                       >
                         <X size={11} color={colors.dark.red} />
                       </Pressable>
@@ -1450,15 +1725,31 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   </View>
                 );
               })}
-              {realClosed.length > 0 && (
+              {realClosedFiltered.length > 0 || histTypeFilter !== 'all' ? (
                 <View style={styles.closedBox}>
-                  <Text style={styles.closedTitle}>تاریخچه معاملات (واقعی):</Text>
+                  {/* v1.5.6 — سرتیتر + دکمه PDF (بازیابی از v1.5.4) */}
+                  <View style={styles.closedTitleRow}>
+                    <Text style={styles.closedTitle}>تاریخچه معاملات (واقعی):</Text>
+                    <Pressable
+                      style={styles.histPdfBtn}
+                      onPress={() => void handleExportHistoryPdf()}
+                      disabled={pdfBusy}
+                      testID="hist-pdf-btn-real"
+                    >
+                      {pdfBusy ? (
+                        <ActivityIndicator size="small" color={colors.dark.background} />
+                      ) : (
+                        <FileText size={11} color={colors.dark.background} />
+                      )}
+                      <Text style={styles.histPdfBtnText}>PDF</Text>
+                    </Pressable>
+                  </View>
                   <View style={styles.histPeriodRow}>
                     {AUTO_PNL_PERIODS.map((p) => (
                       <Pressable
                         key={p}
                         style={[styles.histPeriodChip, histPeriod === p && styles.histPeriodChipActive]}
-                        onPress={() => setHistPeriod(p)}
+                        onPress={() => { setHistPeriod(p); setRealHistPage(1); }}
                       >
                         <Text style={[styles.histPeriodText, histPeriod === p && styles.histPeriodTextActive]}>
                           {AUTO_PNL_PERIOD_LABEL[p]}
@@ -1466,12 +1757,27 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       </Pressable>
                     ))}
                   </View>
+                  {/* v1.5.6 — فیلتر جداگانه سودها/ضررها + نوع بستن (بازیابی از v1.5.4) */}
+                  <View style={styles.histTypeRow}>
+                    {HIST_TYPE_FILTERS.map((f) => (
+                      <Pressable
+                        key={f.key}
+                        style={[styles.histTypeChip, histTypeFilter === f.key && styles.histTypeChipActive]}
+                        onPress={() => { setHistTypeFilter(f.key); setRealHistPage(1); }}
+                        testID={`auto-hist-type-real-${f.key}`}
+                      >
+                        <Text style={[styles.histPeriodText, histTypeFilter === f.key && styles.histPeriodTextActive]}>
+                          {f.label}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
                   {(() => {
-                    const sum = realClosed.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
+                    const sum = realClosedFiltered.reduce((s, p) => s + (p.realizedPnl ?? 0), 0);
                     return (
                       <View style={styles.histSummary}>
                         <Text style={styles.histSummaryText}>
-                          {realClosed.length.toLocaleString('fa-IR')} معامله در این بازه
+                          {realClosedFiltered.length.toLocaleString('fa-IR')} معامله در این بازه
                         </Text>
                         <Text style={[styles.histSummaryPnl, { color: sum >= 0 ? colors.dark.green : colors.dark.red }]}>
                           {sum >= 0 ? '+' : '−'}${Math.abs(sum).toFixed(2)}
@@ -1479,22 +1785,51 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       </View>
                     );
                   })()}
+                  {realClosed.length === 0 && (
+                    <Text style={styles.sourceHint}>در این فیلتر معامله‌ای نیست — فیلتر دیگری را انتخاب کنید.</Text>
+                  )}
                   {realClosed.map((p) => (
                     <View key={p.id} style={styles.closedRow}>
                       <Text style={styles.closedText} numberOfLines={2}>
                         {/* v1.5.3 — نام استراتژی + نوع اندیکاتور کنار نام ارز */}
+                        {/* v1.5.6 — جدیدترین بسته‌شده اول + زمان بسته شدن (بازیابی از v1.5.4) */}
                         {p.symbol}
                         {p.strategyName ? ` • ${p.strategyName}` : ''}
                         {p.sourceLabel ? ` • ${p.sourceLabel}` : ''}
-                        {' '}({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'روی صرافی' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : p.closeReason === 'partial' ? 'برداشت سود (نصف حجم)' : p.closeReason === 'partial-manual' ? 'نصف دستی' : 'دستی'})
+                        {' '}({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'روی صرافی' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : p.closeReason === 'partial' ? 'برداشت سود (نصف حجم)' : p.closeReason === 'partial-manual' ? 'بستن حجمی' : 'دستی'})
+                        {p.closedAt ? ` • ${fmtOpenTime(p.closedAt)}` : ''}
                       </Text>
                       <Text style={[styles.posPnl, { color: (p.realizedPnl ?? 0) >= 0 ? colors.dark.green : colors.dark.red }]}>
                         {(p.realizedPnl ?? 0) >= 0 ? '+' : '−'}${Math.abs(p.realizedPnl ?? 0).toFixed(2)}
                       </Text>
                     </View>
                   ))}
+                  {/* v1.5.6 — صفحه‌بندی ۱۰۰تایی (بازیابی از v1.5.4) */}
+                  {realClosedTotalPages > 1 && (
+                    <View style={styles.histPagerRow}>
+                      <Pressable
+                        style={[styles.histPagerBtn, realHistPage <= 1 && styles.histPagerBtnDisabled]}
+                        disabled={realHistPage <= 1}
+                        onPress={() => setRealHistPage((v) => Math.max(1, v - 1))}
+                      >
+                        <ChevronRight size={13} color={colors.dark.accent} />
+                        <Text style={styles.histPagerBtnText}>قبلی</Text>
+                      </Pressable>
+                      <Text style={styles.histPagerText}>
+                        صفحه {realHistPage.toLocaleString('fa-IR')} از {realClosedTotalPages.toLocaleString('fa-IR')}
+                      </Text>
+                      <Pressable
+                        style={[styles.histPagerBtn, realHistPage >= realClosedTotalPages && styles.histPagerBtnDisabled]}
+                        disabled={realHistPage >= realClosedTotalPages}
+                        onPress={() => setRealHistPage((v) => Math.min(realClosedTotalPages, v + 1))}
+                      >
+                        <Text style={styles.histPagerBtnText}>بعدی</Text>
+                        <ChevronLeft size={13} color={colors.dark.accent} />
+                      </Pressable>
+                    </View>
+                  )}
                 </View>
-              )}
+              ) : null}
             </View>
           )}
 
@@ -1519,17 +1854,20 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   );
 }
 
-function PnlRow({ label, value, pct, bold }: { label: string; value: number; pct?: number; bold?: boolean }) {
+function PnlRow({ label, value, pct, bold, neutral }: { label: string; value: number; pct?: number; bold?: boolean; neutral?: boolean }) {
+  // v1.5.6 — neutral (بازیابی از v1.5.4): ردیف‌های مارجین درگیر/آزاد بدون رنگ سود/زیان
+  const color = neutral ? colors.dark.text : value >= 0 ? colors.dark.green : colors.dark.red;
+  const pctColor = neutral ? colors.dark.textSecondary : pct !== undefined && pct >= 0 ? colors.dark.green : colors.dark.red;
   return (
     <View style={styles.pnlShareRow}>
       <Text style={[styles.pnlShareRowLabel, bold && { fontWeight: '800' }]}>{label}</Text>
       {/* v1.5.2 — سود/زیان هم دلاری هم درصدی (مثل بایننس) */}
       <View style={styles.pnlShareRowRight}>
-        <Text style={[styles.pnlShareRowValue, { color: value >= 0 ? colors.dark.green : colors.dark.red }, bold && { fontWeight: '800' }]}>
-          {value >= 0 ? '+' : '−'} ${Math.abs(value).toFixed(2)}
+        <Text style={[styles.pnlShareRowValue, { color }, bold && { fontWeight: '800' }]}>
+          {neutral ? '' : value >= 0 ? '+' : '−'} ${Math.abs(value).toFixed(2)}
         </Text>
         {typeof pct === 'number' && (
-          <Text style={[styles.pnlShareRowPct, { color: pct >= 0 ? colors.dark.green : colors.dark.red }, bold && { fontWeight: '800' }]}>
+          <Text style={[styles.pnlShareRowPct, { color: pctColor }, bold && { fontWeight: '800' }]}>
             {pct >= 0 ? '+' : '−'}{Math.abs(pct).toFixed(2)}٪
           </Text>
         )}
@@ -2392,5 +2730,79 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '800',
     color: colors.dark.background,
+  },
+  /* v1.5.6 (بازیابی از v1.5.4) — فیلتر نوع تاریخچه (سودها/ضررها/نوع بستن) */
+  histTypeRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 4,
+    marginBottom: 6,
+    marginTop: 2,
+  },
+  histTypeChip: {
+    alignItems: 'center',
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    borderRadius: 7,
+    backgroundColor: colors.dark.surface,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+  },
+  histTypeChipActive: {
+    backgroundColor: colors.dark.accent,
+    borderColor: colors.dark.accent,
+  },
+  /* v1.5.6 — سرتیتر تاریخچه + دکمه PDF کنار هم */
+  closedTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
+  histPdfBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: colors.dark.accent,
+    borderRadius: 7,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  histPdfBtnText: {
+    fontSize: 9.5,
+    fontWeight: '800',
+    color: colors.dark.background,
+  },
+  /* v1.5.6 — صفحه‌بندی ۱۰۰تایی تاریخچه */
+  histPagerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginTop: 6,
+  },
+  histPagerBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    backgroundColor: colors.dark.surface,
+    borderWidth: 1,
+    borderColor: colors.dark.accent + '55',
+    borderRadius: 7,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  histPagerBtnDisabled: {
+    opacity: 0.35,
+  },
+  histPagerBtnText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: colors.dark.accent,
+  },
+  histPagerText: {
+    fontSize: 9.5,
+    fontWeight: '700',
+    color: colors.dark.textSecondary,
   },
 });
