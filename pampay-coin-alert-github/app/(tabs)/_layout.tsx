@@ -1,15 +1,43 @@
-import { Tabs, useRouter } from 'expo-router';
+import { Tabs, useRouter, useRootNavigationState } from 'expo-router';
 import { Radar, Settings, Fish, Wallet, Brain, Skull, Rocket, TrendingUp } from 'lucide-react-native';
 import { useEffect, useRef } from 'react';
 import { AppState } from 'react-native';
 import colors from '@/constants/colors';
 
+/**
+ * v1.5.4 — «وقتی برنامه باز میشه صفحه پیش فرض همیشه روی تب تنظیمات باشه».
+ * سه لایه محکم (کاربر هنوز گاهی روی اسکنر دامپ‌وپامپ فرود می‌آمد):
+ *   ۱) initialRouteName="settings" (شروع معمول)
+ *   ۲) app/+native-intent.tsx مسیر «/» را به «/settings» هدایت می‌کند
+ *   ۳) پس از آماده شدن ناوبری ریشه، یک‌بار در هر اجرای برنامه اگر چراغ
+ *      روی صفحه‌ای جز تنظیمات روشن باشد (بازگردانی state اندروید)، به
+ *      تنظیمات برگردانده می‌شود (ماژول-level flag تا با تعویض تم دوباره
+ *      اجرا نشود).
+ * برگشتن از بک‌گراند: از هر مدتی خارج از برنامه (حتی چند ثانیه — قبلاً ۱۵
+ * دقیقه بود) دوباره روی تنظیمات باز می‌شود.
+ */
+
 /** After this long in the background, re-opening the app returns to settings. */
-const RETURN_TO_SETTINGS_AFTER_MS = 15 * 60_000;
+const RETURN_TO_SETTINGS_AFTER_MS = 5 * 1_000;
+
+/** v1.5.4 — only ONE boot redirect per app run (survives theme remounts). */
+let bootRedirectDone = false;
 
 export default function TabLayout() {
   const router = useRouter();
+  const rootNav = useRootNavigationState();
   const backgroundedAt = useRef<number | null>(null);
+
+  // v1.5.4 — boot belt: after the root navigator is mounted, land on settings
+  // exactly once per app run (covers Android activity-state restoration that
+  // can override initialRouteName and drop the user on the scanner tab).
+  useEffect(() => {
+    if (bootRedirectDone || !rootNav?.key) return;
+    bootRedirectDone = true;
+    try {
+      router.replace('/settings');
+    } catch {}
+  }, [rootNav?.key, router]);
 
   // v1.4.11 — «باز شدن برنامه = صفحه تنظیمات».
   // v1.4.10 این را با router.replace بعد از اولین mount می‌کرد؛ اما در همان
@@ -20,8 +48,8 @@ export default function TabLayout() {
   // حالا شروع روی تنظیمات بدون هیچ navigate برنامه‌ای انجام می‌شود:
   //   • app/+native-intent.tsx مسیر «/» را به «/settings» هدایت می‌کند
   //   • initialRouteName="settings" روی خود تب‌ها (فول‌بک)
-  // فقط «برگشتن به تنظیمات بعد از ۱۵ دقیقه در بک‌گراند» همچنان با
-  // router.replace انجام می‌شود — آن موقع برنامه کاملاً mount و stable است.
+  // «برگشتن به تنظیمات بعد از بک‌گراند» (v1.5.4: از ۵ ثانیه به بعد = همیشه)
+  // با router.replace انجام می‌شود — آن موقع برنامه کاملاً mount و stable است.
   useEffect(() => {
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'background' || state === 'inactive') {
@@ -30,7 +58,7 @@ export default function TabLayout() {
         const awayMs = Date.now() - backgroundedAt.current;
         backgroundedAt.current = null;
         if (awayMs >= RETURN_TO_SETTINGS_AFTER_MS) {
-          // Opening the app again after a long absence → back to settings.
+          // Opening the app again → back to settings.
           // v1.4.11 — مسیر بدون گروه؛ مسیر گروه‌دار کرش استارتاپ ۱.۴.۱۰ بود.
           router.replace('/settings');
         }
