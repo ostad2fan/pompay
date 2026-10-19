@@ -338,6 +338,53 @@ export async function getSymbolInfo(symbol: string): Promise<{ pricePrecision: n
   };
 }
 
+// ---------------------------------------------------------------------------
+// v1.5.4 — دقت قیمت بایننس برای نمایش («قیمت را طبق بایننس تا هر چند رقم
+// اعشار داره نشون بده»): نقشه‌ی symbol → pricePrecision از exchangeInfo
+// فیوچرز بایننس، یک‌بار در ساعت fetch و کش می‌شود.
+// ---------------------------------------------------------------------------
+
+let pricePrecisionCache: { at: number; map: Record<string, number> } | null = null;
+
+/** دقت قیمت هر نماد از فیوچرز بایننس (فقط خواندنی، بدون کلید) — کش ۱ ساعته. */
+export async function getFuturesPricePrecisionMap(): Promise<Record<string, number>> {
+  if (pricePrecisionCache && Date.now() - pricePrecisionCache.at < 3600_000) {
+    return pricePrecisionCache.map;
+  }
+  try {
+    const res = await fetch(`${FUTURES_BASE}/fapi/v1/exchangeInfo`);
+    const data = (await res.json()) as { symbols?: Array<{ symbol: string; pricePrecision: number }> };
+    const map: Record<string, number> = {};
+    for (const s of data.symbols ?? []) {
+      if (s?.symbol && Number.isFinite(s.pricePrecision)) map[s.symbol] = s.pricePrecision;
+    }
+    pricePrecisionCache = { at: Date.now(), map };
+    return map;
+  } catch {
+    return pricePrecisionCache?.map ?? {};
+  }
+}
+
+/**
+ * قالب‌بندی قیمت دقیقاً مثل بایننس — با دقتِ خود نماد (مثلاً BTCUSDT=۲ رقم).
+ * اگر دقت نماد در دسترس نبود، بر اساس بزرگی عدد (مثل خود بایننس) حدس زده می‌شود.
+ */
+export function formatBinancePrice(symbol: string, price: number, precisionMap: Record<string, number>): string {
+  if (!Number.isFinite(price) || price <= 0) return '—';
+  const sym = `${symbol.replace(/USDT$/i, '')}USDT`;
+  const prec = precisionMap[sym];
+  if (typeof prec === 'number' && prec >= 0 && prec <= 10) {
+    return price.toFixed(prec);
+  }
+  const abs = Math.abs(price);
+  if (abs >= 1000) return price.toFixed(2);
+  if (abs >= 100) return price.toFixed(2);
+  if (abs >= 1) return price.toFixed(3);
+  if (abs >= 0.01) return price.toFixed(5);
+  if (abs >= 0.0001) return price.toFixed(6);
+  return String(Number(price.toPrecision(6)));
+}
+
 export function calculateQuantity(
   usdtAmount: number,
   price: number,
