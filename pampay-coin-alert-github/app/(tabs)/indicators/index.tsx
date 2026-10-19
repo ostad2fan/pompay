@@ -121,6 +121,28 @@ export default function IndicatorsScreen() {
   const visibleCustomSignals = filterByDays(mergedCustomSignals);
   const visibleHookSignals = filterByDays(mergedHookSignals);
 
+  // v1.5.4 — وضعیت اعلان تلگرامِ سرور (حتی وقتی برنامه بسته است — درخواست
+  // حیاتی کاربر): هر دو بخش اندیکاتور وضعیتش را کنار سوییچ خود نشان می‌دهند.
+  const telegramReady = !!(settings.telegramEnabled && settings.telegramBotToken && settings.telegramChatId);
+  const serverTgStatus = (sectionOn: boolean): { text: string; ok: boolean } => {
+    if (!telegramReady) {
+      return {
+        text: '⚠ توکن ربات و چت‌آیدی تلگرام در تنظیمات ثبت نشده — بدون آن‌ها اعلان‌ها حتی با برنامه بسته به تلگرام نمی‌آید. از تب تنظیمات وارد کنید.',
+        ok: false,
+      };
+    }
+    if (!sectionOn) {
+      return {
+        text: '⚠ اعلان این بخش خاموش است — سوییچ بالا را روشن کنید تا سیگنال‌هایش به تلگرام بیاید (حتی وقتی برنامه بسته است).',
+        ok: false,
+      };
+    }
+    return {
+      text: '✓ اعلان تلگرام فعال: سیگنال‌های این بخش توسط سرور ۲۴ ساعته اسکن و به تلگرام شما اعلام می‌شود — حتی وقتی برنامه بسته است.',
+      ok: true,
+    };
+  };
+
   const loadCustomData = useCallback(async () => {
     try {
       const [list, signals, errors, server] = await Promise.all([
@@ -403,6 +425,15 @@ export default function IndicatorsScreen() {
                 />
                 <Text style={styles.switchLabel}>دریافت سیگنال‌ها از این اندیکاتور</Text>
               </View>
+              {/* v1.5.4 — وضعیت اعلان تلگرام سرور (حتی با برنامه بسته) */}
+              {(() => {
+                const st = serverTgStatus(settings.gainzAlgoNotifications !== false);
+                return (
+                  <Text style={[styles.serverTgHint, st.ok ? styles.serverTgHintOk : styles.serverTgHintWarn]}>
+                    {st.text}
+                  </Text>
+                );
+              })()}
               <Text style={styles.tfSelectLabel}>تایم‌فریم اسکن سرور:</Text>
               <View style={styles.tfSelectChips}>
                 {([
@@ -494,6 +525,15 @@ export default function IndicatorsScreen() {
                 />
                 <Text style={styles.switchLabel}>دریافت سیگنال‌های هوک ریورسال</Text>
               </View>
+              {/* v1.5.4 — وضعیت اعلان تلگرام سرور (حتی با برنامه بسته) */}
+              {(() => {
+                const st = serverTgStatus(settings.hookReversalNotifications !== false);
+                return (
+                  <Text style={[styles.serverTgHint, st.ok ? styles.serverTgHintOk : styles.serverTgHintWarn]}>
+                    {st.text}
+                  </Text>
+                );
+              })()}
               <Text style={styles.tfSelectLabel}>تایم‌فریم اسکن سرور:</Text>
               <View style={styles.tfSelectChips}>
                 {([
@@ -892,6 +932,20 @@ const styles = createThemedStyles(() => StyleSheet.create({
     marginTop: 12,
     marginBottom: 8,
     textAlign: 'right',
+  },
+  /* v1.5.4 — وضعیت اعلان تلگرام سرور (حتی با برنامه بسته) روی هر بخش */
+  serverTgHint: {
+    fontSize: 10.5,
+    lineHeight: 16,
+    marginTop: 6,
+    marginBottom: 2,
+    textAlign: 'right',
+  },
+  serverTgHintOk: {
+    color: colors.dark.green,
+  },
+  serverTgHintWarn: {
+    color: colors.dark.red,
   },
   tfSelectChips: {
     flexDirection: 'row-reverse',
