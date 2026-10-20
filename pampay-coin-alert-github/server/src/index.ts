@@ -27,6 +27,8 @@ import { runFastScanCycle, pumpDumpResponse } from "./fastScan";
 import { registerPushToken, unregisterPushToken, pushStatus } from "./push";
 import { sendTelegram, getLastTelegramError } from "./telegram";
 import { runWhaleWatch } from "./whaleWatch";
+// v1.5.8 — R4: پیام سلامت روزانه (تشخیص «سکوت طبیعی» از «مسیر قطع»)
+import { runDailyHeartbeat } from "./heartbeat";
 import { startBacktestEngine, handleAutoTradeConfig, getAutoTradeStateFor } from "./backtestEngine";
 import {
   startBotCommandPoller,
@@ -178,6 +180,26 @@ const server = http.createServer(async (req, res) => {
         store.get<number>("lastTelegramSuccessAt"),
         store.get<number>("whaleWatchLastRun"),
       ]);
+      // v1.5.8 — R4: وضعیت هر بخش (برای «بررسی سلامت اعلان‌های ۲۴/۷» در
+      // تنظیمات) — فقط پرچم‌ها/شمارنده‌ها؛ هیچ راز/توکنی لو نمی‌رود.
+      const fullCfg = config as
+        | {
+            scannerEnabled?: boolean;
+            memeEnabled?: boolean;
+            preListingEnabled?: boolean;
+            gainzAlgoEnabled?: boolean;
+            hookEnabled?: boolean;
+            whaleNotifications?: boolean;
+            indicators?: { receiveSignals?: boolean }[];
+          }
+        | null;
+      const indicatorsAll = fullCfg?.indicators ?? [];
+      const indicatorsReceive = indicatorsAll.filter((i) => i.receiveSignals).length;
+      const customErrors = (await store.get<Record<string, string>>("customErrors")) ?? {};
+      const lastQuickScanAt = await store.get<number>("lastQuickScanAt");
+      const heartbeatAt = await store.get<number>("heartbeatAt");
+      const autoDoc = await store.get<{ cfg?: { enabled?: boolean; mode?: string } }>("autoTradeConfig");
+      const autoState = await store.get<{ lastCycleAt?: number | null }>("autoTradeState");
       return json(res, 200, {
         ok: true,
         hasConfig: Boolean(config),
@@ -188,10 +210,29 @@ const server = http.createServer(async (req, res) => {
         lastScanDate: lastScanDate ?? null,
         lastScanAt: lastScanAt ?? null,
         lastFastScanAt: lastFastScanAt ?? null,
+        lastQuickScanAt: lastQuickScanAt ?? null,
         telegram: {
           lastSuccessAt: lastTelegramSuccessAt ?? null,
           lastError: lastTelegramError ?? null,
         },
+        // v1.5.8 — R4
+        sections: {
+          scanner: fullCfg?.scannerEnabled !== false,
+          meme: fullCfg?.memeEnabled !== false,
+          preListing: fullCfg?.preListingEnabled !== false,
+          gainz: fullCfg?.gainzAlgoEnabled !== false,
+          hook: fullCfg?.hookEnabled !== false,
+          whaleNotifications: fullCfg?.whaleNotifications !== false,
+          indicators: indicatorsAll.length,
+          indicatorsReceive,
+          indicatorErrors: Object.keys(customErrors).length,
+        },
+        autotrade: {
+          enabled: !!autoDoc?.cfg?.enabled,
+          mode: autoDoc?.cfg?.mode === "real" ? "real" : "demo",
+          lastCycleAt: autoState?.lastCycleAt ?? null,
+        },
+        heartbeatAt: heartbeatAt ?? null,
         push: await pushStatus(),
       });
     }
@@ -211,6 +252,99 @@ const server = http.createServer(async (req, res) => {
       const secret = String(url.searchParams.get("secret") ?? "");
       const result = await getAutoTradeStateFor(secret);
       return json(res, result.status, result.payload);
+    }
+
+    // ---- v1.5.8 — R4: بازپس‌گیری سرور با کد تلگرام -------------------------
+    // اگر برنامه از نو نصب شده باشد (راز نصب جدید) و سرور با رازِ گوشیِ قدیمی
+    // claim شده باشد، هر sync و هر push ربات ۴۰۳ می‌گیرد و «هیچ اعلانی با
+    // برنامه بسته نمی‌آید». چون فقط صاحبِ ربات تلگرام کد را می‌بیند، مالکیت
+    // با کد ۶ رقمی که به همان چت تنظیم‌شده فرستاده می‌شود اثبات می‌شود.
+    if (req.method === "POST" && url.pathname === "/scan/claim/start") {
+      const raw = await readBody(req);
+      let body: { secret?: string } = {};
+      try {
+        body = JSON.parse(raw || "{}") as { secret?: string };
+      } catch {
+        return json(res, 400, { ok: false, error: "invalid json" });
+      }
+      const cfg = await store.get<{ secret?: string; botToken?: string; chatId?: string }>("config");
+      if (!cfg) {
+        return json(res, 200, { ok: true, detail: "سرور هنوز به هیچ گوشی‌ای تعلق ندارد — مستقیم «همگام‌سازی پیکربندی اسکنر» را بزنید" });
+      }
+      if (!cfg.botToken || !cfg.chatId) {
+        return json(res, 400, { ok: false, detail: "توکن ربات/چت‌آیدی روی سرور ثبت نشده — از همان گوشیِ قدیمی همگام‌سازی کنید یا سرور را از نو دیپلوی کنید" });
+      }
+      if (body.secret && cfg.secret === body.secret) {
+        return json(res, 200, { ok: true, detail: "این گوشی همین حالا صاحب سرور است — نیازی به بازپس‌گیری نیست" });
+      }
+      // Rate limit: حداکثر ۳ کد در ساعت
+      const attempts = (await store.get<number>("claimCodeAttempts")) ?? 0;
+      const attemptsAt = (await store.get<number>("claimCodeAttemptsAt")) ?? 0;
+      if (Date.now() - attemptsAt > 3600_000) {
+        await store.put("claimCodeAttempts", 0);
+      } else if (attempts >= 3) {
+        return json(res, 429, { ok: false, detail: "زیادی تلاش شد — یک صبر کنید و دوباره امتحان کنید (حداکثر ۳ کد در ساعت)" });
+      }
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+      await store.put("claimCode", { code, newSecret: String(body.secret ?? ""), expiresAt: Date.now() + 15 * 60_000 });
+      await store.put("claimCodeAttempts", attempts + 1);
+      await store.put("claimCodeAttemptsAt", Date.now());
+      const sent = await sendTelegram(
+        { botToken: cfg.botToken, chatId: cfg.chatId },
+        [
+          "🔐 <b>کد بازپس‌گیری سرور PomPay</b>",
+          `کد شما: <b>${code}</b>`,
+          "این کد ۱۵ دقیقه اعتبار دارد و فقط یک‌بار قابل استفاده است.",
+          "اگر شما چنین درخواستی نداده‌اید، این پیام را نادیده بگیرید — کسی بدون دیدن همین چت نمی‌تواند سرور را بگیرد.",
+        ].join("\n")
+      );
+      if (!sent) {
+        const lastErr = await getLastTelegramError();
+        return json(res, 502, { ok: false, detail: "کد ساخته شد اما به تلگرام نرسید — توکن/چت‌آیدی تنظیم‌شده روی سرور معتبر نیست", error: lastErr?.error ?? null });
+      }
+      return json(res, 200, { ok: true, detail: "کد ۶ رقمی به تلگرامِ تنظیم‌شده روی سرور فرستاده شد — آن را در برنامه وارد کنید" });
+    }
+    if (req.method === "POST" && url.pathname === "/scan/claim/confirm") {
+      const raw = await readBody(req);
+      let body: { secret?: string; code?: string } = {};
+      try {
+        body = JSON.parse(raw || "{}") as { secret?: string; code?: string };
+      } catch {
+        return json(res, 400, { ok: false, error: "invalid json" });
+      }
+      const claim = await store.get<{ code: string; newSecret: string; expiresAt: number }>("claimCode");
+      if (!claim || !body.code || claim.code !== String(body.code).trim()) {
+        return json(res, 400, { ok: false, detail: "کد درست نیست — دوباره از دکمه بازپس‌گیری کد بگیرید" });
+      }
+      if (Date.now() > claim.expiresAt) {
+        await store.delete("claimCode");
+        return json(res, 400, { ok: false, detail: "کد منقضی شده — دوباره کد بگیرید (اعتبار ۱۵ دقیقه)" });
+      }
+      const newSecret = String(body.secret ?? claim.newSecret ?? "").trim();
+      if (!newSecret) {
+        return json(res, 400, { ok: false, detail: "راز نصب جدید پیدا نشد — دوباره تلاش کنید" });
+      }
+      const cfg = await store.get<{ secret?: string; botToken?: string; chatId?: string }>("config");
+      if (!cfg) {
+        return json(res, 400, { ok: false, detail: "سرور پیکربندی ندارد — اول همگام‌سازی کنید" });
+      }
+      const updated = { ...cfg, secret: newSecret };
+      await store.put("config", updated);
+      try {
+        const fs = await import("node:fs");
+        if (fs.existsSync("/data")) {
+          fs.writeFileSync("/data/pompay-config.json", JSON.stringify(updated));
+        }
+      } catch {}
+      await store.delete("claimCode");
+      await store.put("claimCodeAttempts", 0);
+      if (cfg.botToken && cfg.chatId) {
+        await sendTelegram(
+          { botToken: cfg.botToken, chatId: cfg.chatId },
+          "✅ <b>راز نصب این سرور به گوشی جدید منتقل شد</b>\nاز این پس همگام‌سازی‌ها و ربات ۲۴/۷ از همان گوشی کار می‌کنند. اگر شما این انتقال را نخواسته‌اید، همین‌ حالا دوباره از گوشی خودتان سرور را بازپس‌گیری کنید."
+        );
+      }
+      return json(res, 200, { ok: true, detail: "سرور به این گوشی منتقل شد — حالا «همگام‌سازی پیکربندی اسکنر» را دوباره بزنید" });
     }
 
     // ---- push notifications ----
@@ -510,6 +644,12 @@ async function fastTick(reason: string): Promise<void> {
     await runWhaleWatch();
   } catch (e) {
     console.log(`[Scheduler] ${reason} whale watch failed:`, e);
+  }
+  // v1.5.8 — R4: پیام سلامت روزانه (یک‌بار در روز، بعد از ۹ صبح تهران)
+  try {
+    await runDailyHeartbeat();
+  } catch (e) {
+    console.log(`[Scheduler] ${reason} heartbeat failed:`, e);
   }
 }
 
