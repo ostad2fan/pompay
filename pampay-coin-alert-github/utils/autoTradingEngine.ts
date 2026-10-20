@@ -1970,6 +1970,8 @@ export async function runLightMtm(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 const SERVER_OK_KEY = '@auto_trade_server_ok_v1';
+/** v1.5.8 — آخرین خطای push ربات به سرور (دلیل دقیق برای نشان وضعیت). */
+const SERVER_LAST_ERR_KEY = '@auto_trade_server_last_err_v1';
 
 async function isServerModeActive(): Promise<boolean> {
   try {
@@ -1983,6 +1985,28 @@ async function setServerModeActive(on: boolean): Promise<void> {
   try {
     await AsyncStorage.setItem(SERVER_OK_KEY, on ? '1' : '0');
   } catch {}
+}
+
+/** v1.5.8 — ذخیره/خواندن آخرین خطای push (با مهر زمانی). */
+async function saveLastPushError(error: string): Promise<void> {
+  try {
+    await AsyncStorage.setItem(SERVER_LAST_ERR_KEY, JSON.stringify({ at: Date.now(), error }));
+  } catch {}
+}
+
+async function clearLastPushError(): Promise<void> {
+  try {
+    await AsyncStorage.removeItem(SERVER_LAST_ERR_KEY);
+  } catch {}
+}
+
+async function readLastPushError(): Promise<{ at: number; error: string } | null> {
+  try {
+    const raw = await AsyncStorage.getItem(SERVER_LAST_ERR_KEY);
+    return raw ? (JSON.parse(raw) as { at: number; error: string }) : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function isAutoServerModeActive(): Promise<boolean> {
@@ -2017,6 +2041,17 @@ export async function getAutoServerStatus(): Promise<AutoServerStatus> {
   const active = await isServerModeActive();
   if (active) {
     return { active: true, reason: 'سرور ربات را ۲۴/۷ اجرا می‌کند — اعلان‌های باز/بسته شدن حتی با برنامه بسته به تلگرام می‌آید' };
+  }
+  // v1.5.8 — R4: علت دقیق آخرین push ناموفق (مثلاً ۴۰۳ راز نصب) به‌جای
+  // پیام کلی «اتصال برقرار نشد» — ریشه‌ی «هیچ اعلانی با برنامه بسته نمی‌آید».
+  const lastErr = await readLastPushError();
+  if (lastErr) {
+    const isSecret = /راز|403|unauthorized/i.test(lastErr.error);
+    return {
+      active: false,
+      reason: `${lastErr.error}${isSecret ? ' — از تنظیمات، «بررسی سلامت اعلان‌های ۲۴/۷» را باز کنید و سرور را با کد تلگرام بازپس‌گیری کنید' : ' — اگر ماند، سرور Railway را redeploy کنید'}`,
+      lastPushError: lastErr.error,
+    };
   }
   return {
     active: false,
@@ -2127,9 +2162,19 @@ export async function pushAutoTradeConfigToServer(
     const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; telegramConfigured?: boolean };
     if (res.ok && data?.ok) {
       await setServerModeActive(serverEnabled);
+      // v1.5.8 — push موفق → خطای قبلی پاک شود
+      await clearLastPushError();
       return { ok: true, telegramConfigured: !!telegram || !!data?.telegramConfigured };
     }
     await setServerModeActive(false);
+    // v1.5.8 — علت دقیق (۴۰۳ راز نصب / ۴۰۴ سرور قدیمی / …) ذخیره می‌شود تا
+    // نشان وضعیت داخل کارت ربات همان را نشان دهد.
+    const pushErr =
+      data?.error ??
+      (res.status === 403
+        ? 'راز نصب این گوشی با سرور مچ نیست (۴۰۳)'
+        : `سرور پیکربندی ربات را نپذیرفت (HTTP ${res.status})`);
+    await saveLastPushError(pushErr);
     // v1.5.3 — 404 = سرور هنوز کد موتور بک‌تست را ندارد (Railway دوباره deploy نشده)
     if (res.status === 404) {
       return {
@@ -2140,6 +2185,11 @@ export async function pushAutoTradeConfigToServer(
     return { ok: false, error: data?.error ?? `HTTP ${res.status}` };
   } catch (e) {
     await setServerModeActive(false);
+    await saveLastPushError(
+      e instanceof Error && /network|fetch|abort/i.test(e.message)
+        ? 'اتصال به سرور برقرار نشد (شبکه/فیلترشکن)'
+        : 'خطای نامشخص در ارتباط با سرور'
+    );
     return { ok: false, error: e instanceof Error ? e.message : 'خطای شبکه' };
   }
 }

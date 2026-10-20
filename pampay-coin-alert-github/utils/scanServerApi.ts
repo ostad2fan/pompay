@@ -537,3 +537,165 @@ export async function sendServerTelegramTest(): Promise<{
     };
   }
 }
+
+// ---------------------------------------------------------------------------
+// v1.5.8 — R4: «بررسی سلامت اعلان‌های ۲۴/۷» + بازپس‌گیری سرور با کد تلگرام
+// ---------------------------------------------------------------------------
+
+export interface ScanHealth {
+  ok: boolean;
+  hasConfig: boolean;
+  telegramConfigured: boolean;
+  whaleWallets: number;
+  lastWhaleWatchAt: number | null;
+  lastScanAt: number | null;
+  lastFastScanAt: number | null;
+  lastQuickScanAt: number | null;
+  telegram: { lastSuccessAt: number | null; lastError: { at: number; error: string } | null };
+  sections?: {
+    scanner: boolean;
+    meme: boolean;
+    preListing: boolean;
+    gainz: boolean;
+    hook: boolean;
+    whaleNotifications: boolean;
+    indicators: number;
+    indicatorsReceive: number;
+    indicatorErrors: number;
+  };
+  autotrade?: { enabled: boolean; mode: string; lastCycleAt: number | null };
+  heartbeatAt?: number | null;
+}
+
+/** وضعیت کامل ۲۴/۷ سرور — هر بخش فعال/خاموش، آخرین ارسال تلگرام و… (بدون راز). */
+export async function fetchScanHealth(): Promise<ScanHealth | null> {
+  const serverUrl = await getServerUrl();
+  if (!serverUrl) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12_000);
+    let res: Response;
+    try {
+      res = await fetch(`${serverUrl}/scan/status`, {
+        signal: controller.signal,
+        headers: { Accept: 'application/json' },
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) return null;
+    return (await res.json()) as ScanHealth;
+  } catch {
+    return null;
+  }
+}
+
+/** جزئیات اندیکاتورهای روی سرور + خطاهای ارزیابی (محافظت‌شده با راز نصب). */
+export async function fetchIndicatorDebug(): Promise<{
+  ok: boolean;
+  indicatorCount: number;
+  indicators: { name: string; timeframe: string; receiveSignals: boolean; codeLength: number; lastError: string | null }[];
+  customSignalCount: number;
+  lastQuickScanAt: number | null;
+  error?: string;
+} | null> {
+  const serverUrl = await getServerUrl();
+  if (!serverUrl) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12_000);
+    let res: Response;
+    try {
+      res = await fetch(
+        `${serverUrl}/scan/indicator-debug?secret=${encodeURIComponent(await getInstallSecret())}`,
+        { signal: controller.signal, headers: { Accept: 'application/json' } }
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) {
+      const detail =
+        res.status === 403
+          ? 'راز نصب این گوشی با سرور مچ نیست — سرور مال گوشی دیگری است؛ از تنظیمات «بازپس‌گیری سرور با کد تلگرام» را بزنید'
+          : `سرور پاسخ نداد (HTTP ${res.status})`;
+      return { ok: false, indicatorCount: 0, indicators: [], customSignalCount: 0, lastQuickScanAt: null, error: detail };
+    }
+    return (await res.json()) as {
+      ok: boolean;
+      indicatorCount: number;
+      indicators: { name: string; timeframe: string; receiveSignals: boolean; codeLength: number; lastError: string | null }[];
+      customSignalCount: number;
+      lastQuickScanAt: number | null;
+      error?: string;
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * گام ۱ بازپس‌گیری: از سرور می‌خواهد کد ۶ رقمی به تلگرامِ تنظیم‌شده روی
+ * سرور بفرستد (فقط صاحب آن چت کد را می‌بیند — همین اثبات مالکیت است).
+ */
+export async function startServerClaim(): Promise<{ ok: boolean; detail?: string }> {
+  const serverUrl = await getServerUrl();
+  if (!serverUrl) return { ok: false, detail: 'آدرس سرور تنظیم نشده است' };
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    let res: Response;
+    try {
+      res = await fetch(`${serverUrl}/scan/claim/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secret: await getInstallSecret() }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    const data = (await res.json().catch(() => null)) as { ok?: boolean; detail?: string; error?: string } | null;
+    if (res.ok && data?.ok) return { ok: true, detail: data.detail };
+    if (res.status === 404) {
+      return { ok: false, detail: 'سرور شما نسخه قدیمی است — کد سرور v1.5.8 هنوز دیپلوی نشده؛ Railway را دوباره دیپلوی کنید' };
+    }
+    return { ok: false, detail: data?.detail ?? data?.error ?? `HTTP ${res.status}` };
+  } catch {
+    const internetUp = await probeInternet();
+    return {
+      ok: false,
+      detail: internetUp
+        ? 'سرور پاسخ نمی‌دهد — سرویس Railway را Redeploy/Restart کنید'
+        : 'اینترنت گوشی یا فیلترشکن قطع است — فیلترشکن را روشن کنید و دوباره تلاش کنید',
+    };
+  }
+}
+
+/** گام ۲ بازپس‌گیری: کد تلگرام را تأیید می‌کند و راز نصب گوشی را مالک سرور می‌کند. */
+export async function confirmServerClaim(code: string): Promise<{ ok: boolean; detail?: string }> {
+  const serverUrl = await getServerUrl();
+  if (!serverUrl) return { ok: false, detail: 'آدرس سرور تنظیم نشده است' };
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    let res: Response;
+    try {
+      res = await fetch(`${serverUrl}/scan/claim/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secret: await getInstallSecret(), code: code.trim() }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    const data = (await res.json().catch(() => null)) as { ok?: boolean; detail?: string; error?: string } | null;
+    if (res.ok && data?.ok) return { ok: true, detail: data.detail };
+    if (res.status === 404) {
+      return { ok: false, detail: 'سرور شما نسخه قدیمی است — کد سرور v1.5.8 هنوز دیپلوی نشده؛ Railway را دوباره دیپلوی کنید' };
+    }
+    return { ok: false, detail: data?.detail ?? data?.error ?? `HTTP ${res.status}` };
+  } catch {
+    return { ok: false, detail: 'خطای شبکه — دوباره تلاش کنید' };
+  }
+}

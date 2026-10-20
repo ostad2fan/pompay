@@ -1,10 +1,21 @@
 /**
- * backtestPdf.ts — v1.5.4
+ * backtestPdf.ts — v1.5.4 → v1.5.8
  *
  * «در بک تست بتونم کل تاریخچه را در هر تایم‌فریمی که انتخاب می‌کنم به‌صورت
  * پی‌دی‌اف دانلود کنم یا اشتراک بگذارم و در پی‌دی‌اف تمام مشخصات پوزیشن
  * مثل نام، نقطه ورود، استاپ، تی‌پی، حجم مارجین، نوع بسته شدن (دستی / تیک
  * پروفیت / استاپ / بستن بخش حجم) باشد»
+ *
+ * v1.5.8 — R3 «پی دی اف در تایم ۷ روزه ساخته نمی‌شود یا خیلی زمان می‌برد؛
+ * سریع‌ترش کن؛ در تایم‌های بالاتر لازم نیست ریز معاملات ساخته بشه»:
+ *  • بازه‌ی «امروز» و «۷ روز»: جدول ریزِ «همه‌ی» معاملات همان بازه درج
+ *    می‌شود (سقف ۱۰۰تایی صفحه ندارد) اما نشانه‌گذاری HTML به‌شدت سبک
+ *    شده: کلاس‌های CSS به‌جای استایل درون‌خطیِ هر سلول، بدون ایموجیِ هر
+ *    ردیف، و از ۲۵۰ معامله به بالا جدولِ فشرده با ستون‌های کمتر — تا
+ *    ساخت PDF روی گوشی به‌جای دقیقه‌ها چند ثانیه طول بکشد.
+ *  • بازه‌های «۳۰ روز» و «همه»: فقط خلاصه‌ی آمار درج می‌شود (ریز
+ *    معاملات نیست — طبق درخواست) + یادداشتِ راهنما که برای ریز معاملات
+ *    بازه‌ی ۷ روز یا امروز را انتخاب کند.
  *
  * سازنده‌ی HTML راست‌به‌چپ فارسی برای expo-print (printToFileAsync → PDF).
  * تابع خالص است تا هم در اپ و هم در تست قابل استفاده باشد.
@@ -43,6 +54,11 @@ export interface BacktestPdfMeta {
   /** PnL بازِ لحظه‌ای. */
   openPnlUsd: number;
   generatedAt: number;
+  /**
+   * v1.5.8 — طول بازه‌ی انتخابی به روز (امروز=۱، ۷روز=۷، ۳۰روز=۳۰،
+   * همه=Infinity). <= ۷ → جدول ریز معاملات؛ بیشتر → فقط خلاصه.
+   */
+  windowDays?: number;
 }
 
 const PERSIAN_CLOSE_REASON: Record<string, string> = {
@@ -54,6 +70,9 @@ const PERSIAN_CLOSE_REASON: Record<string, string> = {
   partial: 'برداشت سود (بستن بخشی از حجم)',
   'partial-manual': 'بستن حجمی دستی',
 };
+
+/** از ۲۵۰ ردیف به بالا جدول فشرده (ستون کمتر) ساخته می‌شود. */
+const COMPACT_ROW_THRESHOLD = 250;
 
 function faDateTime(ms?: number): string {
   if (!ms) return '—';
@@ -75,6 +94,43 @@ function usd(n: number, digits = 2): string {
   return Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
+/** ردیف کامل (تا ۲۵۰ معامله) — همه‌ی ستون‌ها، فقط با کلاس (بدون استایل درون‌خطی). */
+function fullRowHtml(r: BacktestPdfRow, i: number): string {
+  const pnl = r.realizedPnl ?? 0;
+  const reason = PERSIAN_CLOSE_REASON[r.closeReason ?? ''] ?? (r.closeReason ? r.closeReason : '—');
+  return (
+    `<tr><td>${(i + 1).toLocaleString('fa-IR')}</td>` +
+    `<td class="b">${r.symbol}</td>` +
+    `<td class="${r.side === 'long' ? 'g' : 'r'} b">${r.side === 'long' ? 'لانگ' : 'شورت'} ${r.leverage.toLocaleString('fa-IR')}x</td>` +
+    `<td>${r.strategyName ?? '—'}</td>` +
+    `<td>${r.sourceLabel ?? '—'}</td>` +
+    `<td class="mono">${r.entryText}</td>` +
+    `<td class="mono">${r.stopText}</td>` +
+    `<td class="mono">${r.takeText}</td>` +
+    `<td class="mono">$${usd(r.marginUsd)}</td>` +
+    `<td>${faDateTime(r.openedAt)}</td>` +
+    `<td>${faDateTime(r.closedAt)}</td>` +
+    `<td>${reason}</td>` +
+    `<td class="mono b ${pnl >= 0 ? 'g' : 'r'}">${pnl >= 0 ? '+' : '−'}$${usd(pnl)}</td></tr>`
+  );
+}
+
+/** ردیف فشرده (بیش از ۲۵۰ معامله) — ستون‌های حیاتی؛ همه‌ی معاملات درج می‌شوند. */
+function compactRowHtml(r: BacktestPdfRow, i: number): string {
+  const pnl = r.realizedPnl ?? 0;
+  const reason = PERSIAN_CLOSE_REASON[r.closeReason ?? ''] ?? (r.closeReason ? r.closeReason : '—');
+  return (
+    `<tr><td>${(i + 1).toLocaleString('fa-IR')}</td>` +
+    `<td class="b">${r.symbol}</td>` +
+    `<td class="${r.side === 'long' ? 'g' : 'r'} b">${r.side === 'long' ? 'L' : 'S'}${r.leverage}x</td>` +
+    `<td class="mono">${r.entryText}</td>` +
+    `<td>${faDateTime(r.closedAt)}</td>` +
+    `<td>${reason}</td>` +
+    `<td class="mono">$${usd(r.marginUsd)}</td>` +
+    `<td class="mono b ${pnl >= 0 ? 'g' : 'r'}">${pnl >= 0 ? '+' : '−'}$${usd(pnl)}</td></tr>`
+  );
+}
+
 /** ساخت HTML گزارش PDF تاریخچه بک‌تست (RTL فارسی، سبک فیوچرز بایننس). */
 export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMeta): string {
   const totalTrades = rows.length;
@@ -85,30 +141,29 @@ export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMe
   const balance = meta.initialCapitalUsd + realized;
   const freeMargin = Math.max(0, balance - meta.engagedMarginUsd);
 
-  const rowsHtml = rows
-    .map((r, i) => {
-      const pnl = r.realizedPnl ?? 0;
-      const pnlColor = pnl >= 0 ? '#0ecb81' : '#f6465d';
-      const sideColor = r.side === 'long' ? '#0ecb81' : '#f6465d';
-      const reason = PERSIAN_CLOSE_REASON[r.closeReason ?? ''] ?? (r.closeReason ? r.closeReason : '—');
-      return `
-      <tr>
-        <td class="c">${(i + 1).toLocaleString('fa-IR')}</td>
-        <td class="c b">${r.symbol}</td>
-        <td class="c" style="color:${sideColor}">${r.side === 'long' ? 'لانگ 🟢' : 'شورت 🔴'} ×${r.leverage.toLocaleString('fa-IR')}</td>
-        <td class="c">${r.strategyName ?? '—'}</td>
-        <td class="c">${r.sourceLabel ?? '—'}</td>
-        <td class="c mono">${r.entryText}</td>
-        <td class="c mono">${r.stopText}</td>
-        <td class="c mono">${r.takeText}</td>
-        <td class="c mono">$${usd(r.marginUsd)}</td>
-        <td class="c">${faDateTime(r.openedAt)}</td>
-        <td class="c">${faDateTime(r.closedAt)}</td>
-        <td class="c">${reason}</td>
-        <td class="c mono b" style="color:${pnlColor}">${pnl >= 0 ? '+' : '−'}$${usd(pnl)}</td>
-      </tr>`;
-    })
-    .join('');
+  // v1.5.8 — R3: در بازه‌های بیشتر از ۷ روز، ریز معاملات در PDF درج
+  // نمی‌شود («در تایم‌های بالاتر لازم نیست ریز معاملات ساخته بشه»).
+  const windowDays = meta.windowDays ?? 1;
+  const includeTrades = Number.isFinite(windowDays) ? windowDays <= 7 : false;
+  const compact = totalTrades > COMPACT_ROW_THRESHOLD;
+
+  // ردیف‌ها با join یک‌باره ساخته می‌شوند (بدون تابع map+template سنگین).
+  let rowsHtml = '';
+  if (includeTrades && totalTrades > 0) {
+    const parts = new Array<string>(totalTrades);
+    for (let i = 0; i < totalTrades; i++) {
+      parts[i] = compact ? compactRowHtml(rows[i], i) : fullRowHtml(rows[i], i);
+    }
+    rowsHtml = parts.join('');
+  }
+
+  const fullTableHead =
+    '<tr><th>#</th><th>ارز</th><th>جهت / لوریج</th><th>استراتژی</th><th>اندیکاتور/منبع</th>' +
+    '<th>نقطه ورود</th><th>استاپ</th><th>تیک‌پرافیت</th><th>حجم مارجین</th>' +
+    '<th>باز شد</th><th>بسته شد</th><th>نوع بسته شدن</th><th>سود/زیان</th></tr>';
+  const compactTableHead =
+    '<tr><th>#</th><th>ارز</th><th>جهت</th><th>نقطه ورود</th><th>بسته شد</th>' +
+    '<th>نوع بسته شدن</th><th>حجم مارجین</th><th>سود/زیان</th></tr>';
 
   return `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -125,12 +180,14 @@ export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMe
   .stat .k { font-size: 10px; color: #848e9c; margin-bottom: 4px; }
   .stat .v { font-size: 14px; font-weight: 700; direction: ltr; text-align: right; }
   .green { color: #0ecb81; } .red { color: #f6465d; }
-  table { width: 100%; border-collapse: collapse; font-size: 9.5px; }
-  th { background: #0b0e11; color: #f0b90b; padding: 7px 4px; border: 1px solid #2b3139; font-size: 9px; white-space: nowrap; }
-  td { padding: 6px 4px; border: 1px solid #232830; vertical-align: middle; }
-  .c { text-align: center; } .b { font-weight: 700; }
+  .g { color: #0ecb81; } .r { color: #f6465d; }
+  table { width: 100%; border-collapse: collapse; font-size: 9px; }
+  th { background: #0b0e11; color: #f0b90b; padding: 5px 3px; border: 1px solid #2b3139; font-size: 8.5px; white-space: nowrap; }
+  td { padding: 4px 3px; border: 1px solid #232830; vertical-align: middle; text-align: center; }
+  .b { font-weight: 700; }
   .mono { font-family: 'Courier New', monospace; direction: ltr; text-align: center; }
   .empty { text-align: center; color: #848e9c; padding: 18px; }
+  .note { font-size: 10px; color: #f0b90b; line-height: 1.7; padding: 10px; border: 1px dashed #f0b90b55; border-radius: 8px; margin-top: 8px; }
   .footer { font-size: 9px; color: #707a8a; text-align: center; margin-top: 10px; }
   /* v1.5.7 — R6: راهنمای زیر جدول */
   .guide h2 { font-size: 13px; color: #f0b90b; margin: 0 0 8px; }
@@ -159,18 +216,16 @@ export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMe
   </div>
   <div class="card">
     ${
-      rows.length === 0
-        ? '<div class="empty">در این بازه/فیلتر معامله‌ای نیست.</div>'
-        : `<table>
-      <thead>
-        <tr>
-          <th>#</th><th>ارز</th><th>جهت / لوریج</th><th>استراتژی</th><th>اندیکاتور/منبع</th>
-          <th>نقطه ورود</th><th>استاپ</th><th>تیک‌پرافیت</th><th>حجم مارجین</th>
-          <th>باز شد</th><th>بسته شد</th><th>نوع بسته شدن</th><th>سود/زیان</th>
-        </tr>
-      </thead>
-      <tbody>${rowsHtml}</tbody>
-    </table>`
+      !includeTrades
+        ? `<div class="empty">این بازه (${meta.periodLabel}) فقط خلاصه‌ی آمار دارد.</div>
+    <div class="note">برای سرعتِ ساخت PDF، در بازه‌های بیشتر از ۷ روز جدول ریز معاملات درج نمی‌شود — بازه‌ی «۷ روز» یا «امروز» را انتخاب کنید تا همه‌ی ریز معاملات همان بازه با تمام مشخصات (ورود، استاپ، تیک‌پرافیت، حجم مارجین، نوع بسته شدن) در PDF بیاید.</div>`
+        : totalTrades === 0
+          ? '<div class="empty">در این بازه/فیلتر معامله‌ای نیست.</div>'
+          : `<table><thead>${compact ? compactTableHead : fullTableHead}</thead><tbody>${rowsHtml}</tbody></table>${
+              compact
+                ? `<div class="note">تعداد معاملات زیاد است؛ برای سرعت، همه‌ی ${totalTrades.toLocaleString('fa-IR')} معامله با ستون‌های فشرده درج شدند (ارز، جهت/لوریج، ورود، زمان بسته شدن، نوع بسته شدن، مارجین، سود/زیان). اگر ستون‌های استاپ/تیک‌پرافیت/استراتژی هم لازم دارید، بازه‌ی کوتاه‌تر (امروز) انتخاب کنید.</div>`
+                : ''
+            }`
     }
     <div class="footer">PampDumpCoins — گزارش تاریخچه بک‌تست • ${faNum(meta.engagedMarginUsd)}$ مارجین درگیر لحظه‌ی ساخت گزارش</div>
   </div>
@@ -181,7 +236,7 @@ export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMe
     <p><strong>نوع بسته شدن:</strong> استاپ‌لاس (رسیدن به حد ضرر)، تیک‌پرافیت (رسیدن به هدف)، دستی (بستن توسط خودتان)، بستن نهنگ (نهنگِ کپی‌شده پوزیشنش را بست)، سیگنال، «برداشت سود» (ربات در ۲۵٪ و ۵۰٪ سود، خودش بخشی از حجم را بست) و «بستن حجمی» (✂ دستیِ شما روی بخشی از حجم).</p>
     <p><strong>تریل استاپ:</strong> وقتی معامله ۱٪ به سود برود (قیمت اسپات)، استاپ روی نقطه ورود + کارمزد می‌رود (ریسک‌فری) و بعد روی «نصفِ بیشترین سود» دنبال می‌شود تا معامله سودده با ضرر بسته نشود.</p>
     <p><strong>حجم مارجین:</strong> ارزش دلاریِ پوزیشن ÷ لوریج = مبلغی از حساب که این معامله قفل کرده است. «مارجین درگیر» مجموع این مبلغ برای پوزیشن‌های بازِ لحظه‌ی ساخت گزارش است و «مارجین آزاد» = موجودی − مارجین درگیر.</p>
-    <p><strong>PNL بسته‌شده (خالص):</strong> مجموع سود/زیان «تمام» معاملات همین بازه/فیلتر — نه فقط ۱۰۰ ردیف روی صفحه؛ این گزارش PDF همه‌ی معاملات بازه را شامل می‌شود. «PNL باز» سود/زیان لحظه‌ای پوزیشن‌های هنوز باز است و در آن جمع نمی‌شود.</p>
+    <p><strong>PNL بسته‌شده (خالص):</strong> مجموع سود/زیان «تمام» معاملات همین بازه/فیلتر — نه فقط ۱۰۰ ردیف روی صفحه؛ در بازه‌های ۷ روز و کوتاه‌تر، این گزارش PDF همه‌ی معاملات بازه را شامل می‌شود. «PNL باز» سود/زیان لحظه‌ای پوزیشن‌های هنوز باز است و در آن جمع نمی‌شود.</p>
     <p><strong>اندیکاتور/منبع:</strong> نشان می‌دهد معامله از کدام سیگنال باز شده: نهنگِ کپی‌شده (Hyperliquid)، هوک ریورسال، GainzAlgo، اندیکاتور دستی شما، یا بک‌فیل.</p>
     <p><strong>نکته کارمزد:</strong> در حالت دمو، ارزش‌گذاری تقریبی است و کارمزد دقیق صرافی شما (تیکر/میکر) لحظه‌به‌لحظه کم نمی‌شود؛ در حالت واقعی، کارمزد واقعی صرافی به PnL اعمال می‌شود. برای بررسی اینکه با کارمزد صرافی شما این تنظیمات می‌صرفد یا نه، از «محاسبه‌گر بک‌تست واقعی» در تب بک‌تست استفاده کنید.</p>
   </div>
