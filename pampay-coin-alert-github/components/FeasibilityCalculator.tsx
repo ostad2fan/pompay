@@ -9,8 +9,8 @@
  */
 
 import React, { useMemo, useState } from 'react';
-import { View, Text, StyleSheet, Pressable, TextInput, Switch } from 'react-native';
-import { Calculator, ChevronDown, ChevronUp, CheckCircle2, XCircle } from 'lucide-react-native';
+import { View, Text, StyleSheet, Pressable, TextInput, Switch, ActivityIndicator } from 'react-native';
+import { Calculator, ChevronDown, ChevronUp, CheckCircle2, XCircle, Save, Rocket } from 'lucide-react-native';
 import colors from '@/constants/colors';
 import { ThemedAlert } from '@/components/ThemedAlert';
 import {
@@ -20,6 +20,13 @@ import {
 } from '@/utils/feasibilityCalculator';
 import { STRATEGY_CONFIGS, TradingStrategy } from '@/types/tradeAi';
 import { STRATEGY_ORDER } from '@/utils/tradeAiService';
+import { saveAutoSettings, loadAutoSettings } from '@/utils/autoTradingEngine';
+import { saveEnabledStrategies } from '@/utils/tradeAiService';
+import {
+  FeasibilityPreset,
+  applyFeasibilityPresetToSettings,
+  saveFeasibilityPreset,
+} from '@/utils/feasibilityPresets';
 
 /** تبدیل ارقام فارسی به لاتین برای ورودی‌های عددی. */
 const faToEn = (s: string): string =>
@@ -67,8 +74,84 @@ export default function FeasibilityCalculator() {
   const [winRatePercent, setWinRatePercent] = useState('50');
   const [useMaker, setUseMaker] = useState(true);
   const [takerText, setTakerText] = useState('');
+  /** v1.5.8 — R2: در حال ذخیره/اعمال پریست روی ربات. */
+  const [actionBusy, setActionBusy] = useState(false);
 
   const exchange = EXCHANGE_FEE_PROFILES.find((e) => e.id === exchangeId) ?? EXCHANGE_FEE_PROFILES[0];
+
+  /** v1.5.8 — R2: پریستِ همین ورودی‌ها (صرافی + استراتژی + اعداد). */
+  const buildPreset = (): Omit<FeasibilityPreset, 'id' | 'createdAt'> => ({
+    exchangeId: exchange.id,
+    exchangeName: exchange.name,
+    strategy,
+    tradesPerDay: num(tradesPerDay),
+    leverage: num(leverage),
+    totalMarginUsd: num(totalMargin),
+    volumePerTradeUsd: num(volumePerTrade),
+    slPercent: num(slPercent),
+    rewardRatio: num(rewardRatio),
+    dailyLossPercent: num(dailyLossPercent) || 100,
+    winRatePercent: num(winRatePercent) || 50,
+    useMaker,
+    takerPercent: takerText.trim() ? num(takerText) : exchange.takerPercent,
+  });
+
+  /** v1.5.8 — R2: «ذخیره تنظیمات» — هر ترکیب صرافی/اعداد برای بعد ذخیره
+   *  می‌شود و در حالت «واقعی» ربات قابل انتخاب است. */
+  const handleSavePreset = async () => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    try {
+      await saveFeasibilityPreset(buildPreset());
+      ThemedAlert.alert(
+        'تنظیمات ذخیره شد ✅',
+        `همین تنظیمات برای صرافی «${exchange.name}» ذخیره شد.\nهر موقع خواستید، در حالت «واقعی» ربات، از بخش «تنظیمات محاسبه‌گر (ذخیره‌شده)» همین پریست را انتخاب کنید و معامله را شروع کنید.`
+      );
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  /** v1.5.8 — R2: «شروع معامله واقعی با همین تنظیمات» — ربات به حالت
+   *  واقعی می‌رود، جدولش با اعداد محاسبه‌گر پری می‌شود، استراتژی انتخابی
+   *  روشن می‌شود؛ کاربر فقط دکمه شروع ربات را می‌زند. */
+  const handleStartReal = async () => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    try {
+      const preset = buildPreset();
+      await saveFeasibilityPreset(preset);
+      const cur = await loadAutoSettings();
+      const next = applyFeasibilityPresetToSettings(cur, { ...preset, id: '', createdAt: 0 }, {
+        realMode: true,
+      });
+      await saveAutoSettings(next);
+      // همان استراتژیِ محاسبه‌گر روشن شود تا برچسب پوزیشن‌ها هم درست باشد.
+      const strategyMap = Object.fromEntries(
+        STRATEGY_ORDER.map((s) => [s, s === strategy])
+      ) as Record<TradingStrategy, boolean>;
+      await saveEnabledStrategies(strategyMap);
+      const binanceNote =
+        exchange.id === 'binance'
+          ? ''
+          : `\n⚠️ اجرای سفارش واقعی فعلاً با کلید API فیوچرز بایننس انجام می‌شود؛ اعداد همین صرافی روی ربات اعمال شد و برای محاسبه‌ی کارمزد همان صرافی معتبر است.`;
+      ThemedAlert.alert(
+        'رفتی به حالت واقعی ربات 🚀',
+        `ربات به حالت «واقعی» رفت و جدول تنظیمات با همین اعداد محاسبه‌گر پر شد:\n${[
+          `لوریج ${next.leverage}x`,
+          `حد ضرر ${next.maxLossPercent}٪`,
+          `R:R 1:${next.rewardRatio}`,
+          `حجم مارجین هر معامله $${next.positionSizeUsd}`,
+          `سرمایه اولیه $${next.initialCapitalUsd}`,
+          `حد ضرر روزانه ${next.aiCapital.dailyLossLimitPercent}٪`,
+        ].join(' • ')}\n\nاگر کلید API بایننس ندارید، اول در همان بخش واقعی کلیدها را وارد کنید؛ بعد دکمه «شروع واقعی» را بزنید.${binanceNote}`
+      );
+    } catch {
+      ThemedAlert.alert('خطا', 'اعمال تنظیمات روی ربات انجام نشد — دوباره تلاش کنید.');
+    } finally {
+      setActionBusy(false);
+    }
+  };
 
   const applyStrategy = (s: TradingStrategy) => {
     const cfg = STRATEGY_CONFIGS[s];
@@ -299,6 +382,35 @@ export default function FeasibilityCalculator() {
                   {'\u2713'} {s.text}
                 </Text>
               ))}
+            </View>
+          )}
+
+          {result && (
+            <View style={styles.actionRow}>
+              <Pressable
+                style={[styles.actionBtn, styles.actionBtnSave]}
+                disabled={actionBusy}
+                onPress={() => void handleSavePreset()}
+              >
+                {actionBusy ? (
+                  <ActivityIndicator size="small" color={colors.dark.accent} />
+                ) : (
+                  <Save size={13} color={colors.dark.accent} />
+                )}
+                <Text style={styles.actionBtnSaveText}>ذخیره این تنظیمات</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.actionBtn, styles.actionBtnStart]}
+                disabled={actionBusy}
+                onPress={() => void handleStartReal()}
+              >
+                {actionBusy ? (
+                  <ActivityIndicator size="small" color="#FFF" />
+                ) : (
+                  <Rocket size={13} color="#FFF" />
+                )}
+                <Text style={styles.actionBtnStartText}>شروع معامله واقعی با این تنظیمات</Text>
+              </Pressable>
             </View>
           )}
 
@@ -547,5 +659,47 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '800',
     color: colors.dark.accent,
+  },
+  /* v1.5.8 — R2: دکمه‌های ذخیره/شروع واقعی */
+  actionRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10,
+  },
+  actionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    borderRadius: 10,
+    borderWidth: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+  },
+  actionBtnSave: {
+    flexBasis: '38%',
+    flexGrow: 1,
+    backgroundColor: colors.dark.surface,
+    borderColor: colors.dark.accent + '66',
+  },
+  actionBtnStart: {
+    flexBasis: '62%',
+    flexGrow: 2,
+    backgroundColor: colors.dark.accent,
+    borderColor: colors.dark.accent,
+  },
+  actionBtnSaveText: {
+    fontSize: 9.5,
+    fontWeight: '900',
+    color: colors.dark.accent,
+    textAlign: 'center',
+    flex: 1,
+  },
+  actionBtnStartText: {
+    fontSize: 9.5,
+    fontWeight: '900',
+    color: '#FFF',
+    textAlign: 'center',
+    flex: 1,
   },
 });

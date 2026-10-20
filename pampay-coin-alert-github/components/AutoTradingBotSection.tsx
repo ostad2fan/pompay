@@ -88,6 +88,8 @@ import {
   FileText,
   ChevronRight,
   ChevronLeft,
+  Calculator,
+  Trash2,
 } from 'lucide-react-native';
 import { captureRef } from 'react-native-view-shot';
 import * as Sharing from 'expo-sharing';
@@ -97,6 +99,16 @@ import * as Print from 'expo-print';
 import colors from '@/constants/colors';
 // v1.5.7 — همه پیغام‌ها با مودال درون‌برنامه‌ای هماهنگ با تم
 import { ThemedAlert } from '@/components/ThemedAlert';
+// v1.5.8 — R2: پریست‌های ذخیره‌شده‌ی محاسبه‌گر بک‌تست واقعی
+import {
+  FeasibilityPreset,
+  loadFeasibilityPresets,
+  deleteFeasibilityPreset,
+  applyFeasibilityPresetToSettings,
+  presetSummary,
+} from '@/utils/feasibilityPresets';
+import { saveEnabledStrategies, STRATEGY_ORDER } from '@/utils/tradeAiService';
+import type { TradingStrategy } from '@/types/tradeAi';
 // v1.5.6 — بازیابی دقت قیمت بایننس (getFuturesPricePrecisionMap از v1.5.4)
 import { formatBinancePrice, getFuturesPricePrecisionMap } from '@/utils/binanceFuturesTrading';
 import { BacktestPdfRow, buildBacktestPdfHtml } from '@/utils/backtestPdf';
@@ -165,6 +177,14 @@ const HIST_TYPE_FILTER_LABEL: Record<HistTypeFilter, string> = {
   take: 'تیک‌پرافیت',
   manual: 'بستن دستی',
   partial: 'بستن حجمی',
+};
+
+/** v1.5.8 — R2: نام فارسی استراتژی‌ها در لیست پریست‌های محاسبه‌گر. */
+const STRATEGY_LABELS_FA: Record<string, string> = {
+  conservative: 'محافظه‌کارانه',
+  balanced: 'متعادل',
+  aggressive: 'تهاجمی',
+  scalper: 'اسکالپر',
 };
 
 /** v1.5.4 (بازیابی‌شده در v1.5.6) — تطبیق لیست تاریخچه با فیلتر نوع. */
@@ -272,6 +292,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
 
   /** v1.5.7 — وضعیت ۲۴/۷ سرور برای نشانِ داخل کارت. */
   const [serverStatus, setServerStatus] = useState<{ active: boolean; reason: string }>({ active: false, reason: '' });
+  /** v1.5.8 — R2: پریست‌های محاسبه‌گر (حالت واقعی) */
+  const [feasPresets, setFeasPresets] = useState<FeasibilityPreset[]>([]);
+  const [feasOpen, setFeasOpen] = useState(true);
   const refreshServerStatus = useCallback(async () => {
     try {
       setServerStatus(await getAutoServerStatus());
@@ -342,6 +365,39 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     setLogs((await getAutoLogs()).slice(0, 30));
     setLastCycleAt(getLastGlobalCycleAt());
   }, []);
+
+  // v1.5.8 — R2: پریست‌های محاسبه‌گر در حالت واقعی هر بار که مود عوض می‌شود
+  //  دوباره خوانده می‌شوند (ذخیره/حذف در محاسبه‌گر لحظه‌ای منعکس می‌شود).
+  useEffect(() => {
+    if (settings.mode !== 'real') return;
+    let cancelled = false;
+    loadFeasibilityPresets().then((list) => {
+      if (!cancelled) setFeasPresets(list);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.mode]);
+
+  /** v1.5.8 — R2: اعمال یک پریست محاسبه‌گر روی جدول تنظیمات ربات. */
+  const applyFeasibilityPreset = useCallback(
+    (preset: FeasibilityPreset) => {
+      const next = applyFeasibilityPresetToSettings(settings, preset);
+      void persist(next).then(async () => {
+        try {
+          const map = Object.fromEntries(
+            STRATEGY_ORDER.map((s) => [s, s === preset.strategy])
+          ) as Record<TradingStrategy, boolean>;
+          await saveEnabledStrategies(map);
+        } catch {}
+        ThemedAlert.alert(
+          'تنظیمات محاسبه‌گر اعمال شد ✅',
+          `جدول ربات با پریست «${preset.exchangeName}» هم‌مقدار شد:\n${presetSummary(preset)}\n\nحالا دکمه «شروع ربات» را بزنید تا معامله با همین تنظیمات شروع شود.`
+        );
+      });
+    },
+    [persist, settings]
+  );
 
   // v1.5.2 — «پوزیشن‌های ربات هر ۳ ثانیه رفرش شوند»: چرخه سبک MTM
   // (قیمت تازه + تریل + چک SL/TP — بدون اسکن سیگنال/نهنگ) + ریلود ویو.
@@ -765,6 +821,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         engagedMarginUsd,
         openPnlUsd: isDemo ? totalPnl : realTotalPnl,
         generatedAt: Date.now(),
+        // v1.5.8 — R3: امروز/۷ روز → جدول ریز همه‌ی معاملات؛ بیشتر از ۷ روز → فقط خلاصه
+        windowDays: histWindowMs(histPeriod) / 86400000,
       });
       const { uri } = await Print.printToFileAsync({ html });
       const available = await Sharing.isAvailableAsync().catch(() => false);
@@ -893,6 +951,61 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
           )}
           {settings.mode === 'real' && realKeys && (
             <Text style={styles.warnReal}>⚠ حالت واقعی: هر سیگنال با پول واقعی معامله می‌شود — استاپ/تیپی روی صرافی live می‌ماند.</Text>
+          )}
+
+          {/* ── v1.5.8 — R2: «تنظیمات محاسبه‌گر (ذخیره‌شده)» — پریست‌هایی که
+              کاربر در محاسبه‌گر برای هر صرافی پیدا و ذخیره کرده؛ هر موقع
+              خواست همین‌جا انتخاب می‌کند و با همان صرافی/اعداد معامله را
+              شروع می‌کند. ── */}
+          {settings.mode === 'real' && (
+            <View style={styles.feasBox}>
+              <Pressable style={styles.feasHead} onPress={() => setFeasOpen((v) => !v)}>
+                <Calculator size={13} color={colors.dark.accent} />
+                <Text style={styles.feasTitle}>تنظیمات محاسبه‌گر (ذخیره‌شده)</Text>
+                <View style={styles.feasChev}>
+                  {feasOpen ? (
+                    <ChevronUp size={13} color={colors.dark.textSecondary} />
+                  ) : (
+                    <ChevronDown size={13} color={colors.dark.textSecondary} />
+                  )}
+                </View>
+              </Pressable>
+              {feasOpen && (
+                <>
+                  {feasPresets.length === 0 ? (
+                    <Text style={styles.feasHint}>
+                      هنوز تنظیماتی ذخیره نکرده‌اید — در «محاسبه‌گر بک‌تست واقعی» (پایین همین تب) تنظیمات مناسب هر صرافی را پیدا کنید و دکمه «ذخیره این تنظیمات» را بزنید؛ این‌جا قابل انتخاب می‌شود.
+                    </Text>
+                  ) : (
+                    feasPresets.map((p) => (
+                      <View key={p.id} style={styles.feasRow}>
+                        <Pressable style={styles.feasTexts} onPress={() => applyFeasibilityPreset(p)}>
+                          <Text style={styles.feasRowTitle} numberOfLines={1}>
+                            {p.exchangeName} • {STRATEGY_LABELS_FA[p.strategy] ?? p.strategy}
+                          </Text>
+                          <Text style={styles.feasRowSub} numberOfLines={2}>
+                            {presetSummary(p)}
+                          </Text>
+                          <Text style={styles.feasRowDate}>
+                            ذخیره: {new Date(p.createdAt).toLocaleDateString('fa-IR')} — برای اعمال بزنید
+                          </Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.feasDel}
+                          onPress={() => {
+                            void deleteFeasibilityPreset(p.id).then(() => {
+                              setFeasPresets((prev) => prev.filter((x) => x.id !== p.id));
+                            });
+                          }}
+                        >
+                          <Trash2 size={13} color={colors.dark.red} />
+                        </Pressable>
+                      </View>
+                    ))
+                  )}
+                </>
+              )}
+            </View>
           )}
           {settings.enabled && (
             <View style={styles.engineBadge}>
@@ -1588,7 +1701,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       ) : (
                         <FileText size={11} color={colors.dark.background} />
                       )}
-                      <Text style={styles.histPdfBtnText}>PDF</Text>
+                      <Text style={styles.histPdfBtnText}>{pdfBusy ? 'در حال ساخت…' : 'PDF'}</Text>
                     </Pressable>
                   </View>
                   <View style={styles.histPeriodRow}>
@@ -1809,7 +1922,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       ) : (
                         <FileText size={11} color={colors.dark.background} />
                       )}
-                      <Text style={styles.histPdfBtnText}>PDF</Text>
+                      <Text style={styles.histPdfBtnText}>{pdfBusy ? 'در حال ساخت…' : 'PDF'}</Text>
                     </Pressable>
                   </View>
                   <View style={styles.histPeriodRow}>
@@ -2899,5 +3012,74 @@ const styles = StyleSheet.create({
     fontSize: 9.5,
     fontWeight: '700',
     color: colors.dark.textSecondary,
+  },
+  /* v1.5.8 — R2: کارت «تنظیمات محاسبه‌گر (ذخیره‌شده)» در حالت واقعی */
+  feasBox: {
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.accent + '3A',
+    borderRadius: 10,
+    padding: 10,
+    marginTop: 8,
+  },
+  feasHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  feasTitle: {
+    flex: 1,
+    fontSize: 11,
+    fontWeight: '900',
+    color: colors.dark.text,
+    textAlign: 'right',
+  },
+  feasChev: {
+    padding: 4,
+  },
+  feasHint: {
+    fontSize: 9,
+    lineHeight: 14,
+    color: colors.dark.textSecondary,
+    marginTop: 8,
+    textAlign: 'right',
+  },
+  feasRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: colors.dark.background,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    borderRadius: 8,
+    padding: 8,
+    marginTop: 8,
+  },
+  feasTexts: {
+    flex: 1,
+  },
+  feasRowTitle: {
+    fontSize: 10.5,
+    fontWeight: '900',
+    color: colors.dark.text,
+    textAlign: 'right',
+  },
+  feasRowSub: {
+    fontSize: 9,
+    color: colors.dark.textSecondary,
+    lineHeight: 14,
+    marginTop: 2,
+    textAlign: 'right',
+  },
+  feasRowDate: {
+    fontSize: 8.5,
+    color: colors.dark.textMuted,
+    marginTop: 2,
+    textAlign: 'right',
+  },
+  feasDel: {
+    padding: 6,
+    borderRadius: 6,
+    backgroundColor: colors.dark.red + '14',
   },
 });
