@@ -13,10 +13,22 @@ import {
   Animated,
   Linking,
   Image,
+  ActivityIndicator,
 } from 'react-native';
-import { Plus, Trash2, Pencil, Check, X, Search, Save, HelpCircle, ChevronDown, ChevronUp, Instagram, Send, Bot, MessageCircle, Globe, Download, RefreshCw, Sun, Moon, Bell } from 'lucide-react-native';
+import { Plus, Trash2, Pencil, Check, X, Search, Save, HelpCircle, ChevronDown, ChevronUp, Instagram, Send, Bot, MessageCircle, Globe, Download, RefreshCw, Sun, Moon, Bell, HeartPulse, KeyRound } from 'lucide-react-native';
 import { sendTelegramWelcome, startTelegramPolling } from '@/utils/telegramService';
-import { getServerUrl, setServerUrl, testServerUrl, syncScanConfig, sendServerTelegramTest } from '@/utils/scanServerApi';
+import {
+  getServerUrl,
+  setServerUrl,
+  testServerUrl,
+  syncScanConfig,
+  sendServerTelegramTest,
+  fetchScanHealth,
+  fetchIndicatorDebug,
+  startServerClaim,
+  confirmServerClaim,
+  type ScanHealth,
+} from '@/utils/scanServerApi';
 import { registerPushOnServer, sendTestLocalNotification } from '@/utils/pushService';
 import {
   AppUpdateInfo,
@@ -47,6 +59,18 @@ const POPULAR_COINS = [
   'TON', 'NOT', 'AEVO', 'ETHFI', 'W', 'TNSR', 'TAO', 'RENDER', 'FET', 'AGIX',
   'PEOPLE', 'CFX', 'STORJ', 'IMX', 'ALGO', 'EGLD', 'THETA', 'VET', 'HBAR', 'XLM',
 ];
+
+/** v1.5.8 — «X دقیقه پیش» فارسی برای ردیف‌های سلامت سرور. */
+function minutesAgoFa(ms: number | null | undefined): string {
+  if (!ms) return '—';
+  const m = Math.max(0, Math.round((Date.now() - ms) / 60_000));
+  if (m < 1) return 'همین حالا';
+  if (m < 60) return `${m.toLocaleString('fa-IR')} دقیقه پیش`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h.toLocaleString('fa-IR')} ساعت پیش`;
+  const d = Math.floor(h / 24);
+  return `${d.toLocaleString('fa-IR')} روز پیش`;
+}
 
 const REFRESH_INTERVAL_OPTIONS = [
   { key: '0.05', label: '۳ ثانیه' },
@@ -229,6 +253,17 @@ export default function SettingsScreen() {
   const [serverStatus, setServerStatus] = useState('');
   const [serverBusy, setServerBusy] = useState(false);
 
+  // ── v1.5.8 — R4: بررسی سلامت اعلان‌های ۲۴/۷ + بازپس‌گیری سرور ──
+  const [healthBusy, setHealthBusy] = useState(false);
+  const [health, setHealth] = useState<ScanHealth | null>(null);
+  const [indDebug, setIndDebug] = useState<
+    | { ok: boolean; indicatorCount: number; indicators: { name: string; timeframe: string; receiveSignals: boolean; lastError: string | null }[]; customSignalCount: number; lastQuickScanAt: number | null; error?: string }
+    | null
+  >(null);
+  const [claimVisible, setClaimVisible] = useState(false);
+  const [claimCode, setClaimCode] = useState('');
+  const [claimBusy, setClaimBusy] = useState(false);
+
   // ── In-app update state ───────────────────────────────
   const installedVersion = useMemo(() => getInstalledVersion(), []);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
@@ -245,6 +280,71 @@ export default function SettingsScreen() {
   useEffect(() => {
     getServerUrl().then((u) => setServerUrlInput(u));
   }, []);
+
+  // ── v1.5.8 — R4: «بررسی سلامت اعلان‌های ۲۴/۷» — هر بخش روی سرور فعال
+  //  است یا خاموش؟ آخرین ارسال موفق تلگرام کی بوده؟ خطای اندیکاتور روی
+  //  سرور؟ — همه در یک نگاه، تا «هیچ اعلانی نمی‌آید» قابل تشخیص شود.
+  const runHealthCheck = async () => {
+    if (serverBusy || healthBusy) return;
+    setHealthBusy(true);
+    try {
+      const [h, dbg] = await Promise.all([fetchScanHealth(), fetchIndicatorDebug()]);
+      setHealth(h);
+      setIndDebug(dbg);
+      if (!h) {
+        setServerStatus('❌ سرور به سلامت‌سنجی پاسخ نداد — اول «تست و ذخیره آدرس سرور» را بزنید؛ اگر هم خطا داد، Railway را redeploy کنید');
+      } else if (!h.telegramConfigured) {
+        setServerStatus('⚠ سرور تلگرام دارد؟ نه! — توکن ربات/چت‌آیدی هرگز روی سرور sync نشده؛ دکمه «همگام‌سازی پیکربندی اسکنر» را بزنید');
+      } else if (h.telegram.lastError) {
+        setServerStatus(`⚠ آخرین خطای تلگرام سرور: ${h.telegram.lastError.error}`);
+      }
+    } finally {
+      setHealthBusy(false);
+    }
+  };
+
+  // ── v1.5.8 — R4: بازپس‌گیری سرور با کد تلگرام (وقتی سرور مال گوشی دیگری
+  //  است و ۴۰۳ می‌دهد) — کد به چت تلگرامِ تنظیم‌شده روی سرور می‌رود.
+  const startClaim = async () => {
+    if (serverBusy || healthBusy) return;
+    setHealthBusy(true);
+    try {
+      const r = await startServerClaim();
+      if (r.ok && /کد/.test(r.detail ?? '')) {
+        setClaimCode('');
+        setClaimVisible(true);
+      } else if (r.ok) {
+        ThemedAlert.alert('بازپس‌گیری سرور', r.detail ?? 'این گوشی همین حالا صاحب سرور است.');
+      } else {
+        ThemedAlert.alert('بازپس‌گیری ناموفق', r.detail ?? 'کد ارسال نشد — دوباره تلاش کنید');
+      }
+    } finally {
+      setHealthBusy(false);
+    }
+  };
+
+  const confirmClaim = async () => {
+    if (claimBusy) return;
+    if (claimCode.trim().length !== 6) {
+      ThemedAlert.alert('کد', 'کد ۶ رقمی که به تلگرام آمد را کامل وارد کنید');
+      return;
+    }
+    setClaimBusy(true);
+    try {
+      const r = await confirmServerClaim(claimCode.trim());
+      if (r.ok) {
+        setClaimVisible(false);
+        ThemedAlert.alert(
+          'سرور بازپس‌گیری شد ✅',
+          `${r.detail ?? ''}\n\nحالا دکمه «همگام‌سازی پیکربندی اسکنر» را بزنید و ربات بک‌تست را یک‌بار خاموش/روشن کنید تا اعلان‌های ۲۴/۷ ادامه یابد.`
+        );
+      } else {
+        ThemedAlert.alert('بازپس‌گیری ناموفق', r.detail ?? 'کد درست نیست');
+      }
+    } finally {
+      setClaimBusy(false);
+    }
+  };
 
   const [showIndicatorForm, setShowIndicatorForm] = useState(false);
   const [editingIndicator, setEditingIndicator] = useState<CustomIndicator | null>(null);
@@ -1213,6 +1313,109 @@ export default function SettingsScreen() {
           <Bell size={14} color="#FFF" />
           <Text style={styles.testTelegramBtnText}>تست نمایش نوتیفیکیشن</Text>
         </Pressable>
+        <Pressable
+          style={({ pressed }) => [styles.testTelegramBtn, pressed && { opacity: 0.8 }]}
+          disabled={serverBusy || healthBusy}
+          onPress={() => void runHealthCheck()}
+        >
+          {healthBusy ? (
+            <ActivityIndicator size="small" color="#FFF" style={{ transform: [{ scale: 0.8 }] }} />
+          ) : (
+            <HeartPulse size={14} color="#FFF" />
+          )}
+          <Text style={styles.testTelegramBtnText}>بررسی سلامت اعلان‌های ۲۴/۷ (همه بخش‌ها)</Text>
+        </Pressable>
+        {health && (
+          <View style={styles.healthBox}>
+            <Text style={styles.healthBoxTitle}>وضعیت پایش ۲۴/۷ سرور (حتی با برنامه بسته):</Text>
+            {([
+              ['🚀 پامپ/دامپ', health.sections?.scanner],
+              ['🎯 شورت میم', health.sections?.meme],
+              ['📌 پیش‌لیستینگ', health.sections?.preListing],
+              ['📈 GainzAlgo', health.sections?.gainz],
+              ['🪝 هوک ریورسال', health.sections?.hook],
+              ['🐋 نهنگ‌ها', health.sections ? health.sections.whaleNotifications && health.whaleWallets > 0 : undefined],
+              [
+                '🧩 اندیکاتورها',
+                health.sections
+                  ? health.sections.indicatorsReceive > 0 || health.sections.indicators > 0
+                  : undefined,
+              ],
+              ['🤖 ربات بک‌تست (سرور)', health.autotrade?.enabled],
+            ] as [string, boolean | undefined][]).map(([label, on]) => (
+              <View key={label} style={styles.healthRow}>
+                <Text style={styles.healthRowLabel}>{label}</Text>
+                <Text style={[styles.healthRowValue, { color: on ? colors.dark.green : colors.dark.red }]}>
+                  {on === undefined ? 'نامشخص' : on ? '✅ فعال' : '⛔️ غیرفعال'}
+                </Text>
+              </View>
+            ))}
+            <View style={styles.healthRow}>
+              <Text style={styles.healthRowLabel}>✉️ آخرین ارسال موفق تلگرام</Text>
+              <Text style={styles.healthRowValue}>{minutesAgoFa(health.telegram.lastSuccessAt)}</Text>
+            </View>
+            {health.telegram.lastError ? (
+              <View style={styles.healthRow}>
+                <Text style={styles.healthRowLabel}>⚠️ آخرین خطای تلگرام</Text>
+                <Text style={[styles.healthRowValue, { color: colors.dark.red, flex: 1, textAlign: 'left' }]} numberOfLines={2}>
+                  {health.telegram.lastError.error}
+                </Text>
+              </View>
+            ) : null}
+            {health.autotrade ? (
+              <View style={styles.healthRow}>
+                <Text style={styles.healthRowLabel}>🔁 آخرین چرخه ربات روی سرور</Text>
+                <Text style={styles.healthRowValue}>{minutesAgoFa(health.autotrade.lastCycleAt)}</Text>
+              </View>
+            ) : null}
+            {typeof health.heartbeatAt === 'number' && health.heartbeatAt > 0 ? (
+              <View style={styles.healthRow}>
+                <Text style={styles.healthRowLabel}>💓 آخرین پیام سلامت روزانه</Text>
+                <Text style={styles.healthRowValue}>{minutesAgoFa(health.heartbeatAt)}</Text>
+              </View>
+            ) : null}
+            {indDebug?.ok && (
+              <View style={[styles.healthRow, { flexDirection: 'column', alignItems: 'flex-start', gap: 4 }]}>
+                <Text style={styles.healthRowLabel}>
+                  🧩 اندیکاتورهای روی سرور: {indDebug.indicatorCount.toLocaleString('fa-IR')} • سیگنال‌فرست: {indDebug.indicators.filter((i) => i.receiveSignals).length.toLocaleString('fa-IR')} • آخرین اسکن: {minutesAgoFa(indDebug.lastQuickScanAt)}
+                </Text>
+                {indDebug.indicators
+                  .filter((i) => i.lastError)
+                  .slice(0, 3)
+                  .map((i) => (
+                    <Text key={i.name} style={[styles.healthRowValue, { color: colors.dark.red, textAlign: 'left', flex: 1 }]} numberOfLines={2}>
+                      ⚠ «{i.name}»: {i.lastError}
+                    </Text>
+                  ))}
+                {indDebug.indicators.length > 0 && indDebug.indicators.every((i) => !i.receiveSignals) ? (
+                  <Text style={[styles.healthRowValue, { color: '#F0B90B', textAlign: 'left', flex: 1 }]}>
+                    ⚠ هیچ اندیکاتوری «دریافت سیگنال» ندارد — از همین صفحه، بخش اندیکاتورها، گزینه دریافت سیگنال را روشن کنید
+                  </Text>
+                ) : null}
+              </View>
+            )}
+            {indDebug && !indDebug.ok && indDebug.error ? (
+              <Text style={[styles.healthRowValue, { color: colors.dark.red, textAlign: 'left', flex: 1 }]}>
+                ⚠ {indDebug.error}
+              </Text>
+            ) : null}
+            <Text style={styles.healthHint}>
+              بخش‌های «⛔️ غیرفعال» از تنظیمات همین برنامه خاموش شده‌اند — اگر اعلان می‌خواهید، سوییچ همان بخش را روشن کنید و دوباره همگام‌سازی کنید. اگر همه فعال‌اند ولی پیامی نمی‌آید، یعنی رویداد جدیدی (سیگنال/حرکت نهنگ) رخ نداده؛ پیام سلامت روزانه (هر صبح ~۹) راه رسیدن پیام‌ها را اثبات می‌کند.
+            </Text>
+          </View>
+        )}
+        <Pressable
+          style={({ pressed }) => [styles.testTelegramBtn, { backgroundColor: colors.dark.surface, borderWidth: 1, borderColor: colors.dark.accent + '66' }, pressed && { opacity: 0.8 }]}
+          disabled={serverBusy || healthBusy}
+          onPress={() => void startClaim()}
+        >
+          {healthBusy ? (
+            <ActivityIndicator size="small" color={colors.dark.accent} style={{ transform: [{ scale: 0.8 }] }} />
+          ) : (
+            <KeyRound size={14} color={colors.dark.accent} />
+          )}
+          <Text style={[styles.testTelegramBtnText, { color: colors.dark.accent }]}>بازپس‌گیری سرور با کد تلگرام (خطای ۴۰۳)</Text>
+        </Pressable>
         {serverStatus ? (
           <Text style={styles.telegramHelpText}>{serverStatus}</Text>
         ) : null}
@@ -1421,6 +1624,52 @@ export default function SettingsScreen() {
             <Pressable style={styles.coinPickerDone} onPress={closeCoinPicker}>
               <Text style={styles.coinPickerDoneText}>تایید ({customCoins.length} ارز)</Text>
             </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      {/* ── v1.5.8 — R4: مودال کد بازپس‌گیری سرور (هماهنگ با تم) ── */}
+      <Modal
+        visible={claimVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setClaimVisible(false)}
+      >
+        <View style={styles.claimOverlay}>
+          <View style={styles.claimCard}>
+            <Text style={styles.claimTitle}>🔑 کد بازپس‌گیری سرور</Text>
+            <Text style={styles.claimHint}>
+              کد ۶ رقمی که همین حالا به تلگرامِ تنظیم‌شده روی سرور فرستاده شد را وارد کنید (۱۵ دقیقه اعتبار دارد). کسی جز صاحب آن چت تلگرام کد را نمی‌بیند.
+            </Text>
+            <TextInput
+              style={styles.claimInput}
+              value={claimCode}
+              onChangeText={(t) => setClaimCode(t.replace(/[^0-9]/g, '').slice(0, 6))}
+              keyboardType="number-pad"
+              placeholder="——————"
+              placeholderTextColor={colors.dark.textMuted}
+              maxLength={6}
+            />
+            <View style={styles.claimBtnRow}>
+              <Pressable
+                style={[styles.claimBtn, styles.claimBtnCancel]}
+                onPress={() => setClaimVisible(false)}
+                disabled={claimBusy}
+              >
+                <Text style={styles.claimBtnCancelText}>لغو</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.claimBtn, styles.claimBtnOk]}
+                onPress={() => void confirmClaim()}
+                disabled={claimBusy || claimCode.length !== 6}
+              >
+                {claimBusy ? (
+                  <ActivityIndicator size="small" color={colors.dark.background} />
+                ) : (
+                  <Text style={styles.claimBtnOkText}>تأیید و انتقال سرور</Text>
+                )}
+              </Pressable>
+            </View>
           </View>
         </View>
       </Modal>
@@ -2179,5 +2428,121 @@ const styles = createThemedStyles(() => StyleSheet.create({
     fontSize: 12,
     fontWeight: '800' as const,
     color: '#0B0E11',
+  },
+  /* ── v1.5.8 — R4: بررسی سلامت اعلان‌های ۲۴/۷ ── */
+  healthBox: {
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.accent + '3A',
+    borderRadius: 12,
+    padding: 12,
+    marginTop: 10,
+  },
+  healthBoxTitle: {
+    fontSize: 11,
+    fontWeight: '900' as const,
+    color: colors.dark.text,
+    marginBottom: 6,
+    textAlign: 'right',
+  },
+  healthRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+    paddingVertical: 4,
+  },
+  healthRowLabel: {
+    flex: 1,
+    fontSize: 10,
+    fontWeight: '600' as const,
+    color: colors.dark.textSecondary,
+    textAlign: 'right',
+  },
+  healthRowValue: {
+    fontSize: 10,
+    fontWeight: '800' as const,
+    color: colors.dark.text,
+  },
+  healthHint: {
+    fontSize: 9,
+    lineHeight: 15,
+    color: colors.dark.textMuted,
+    marginTop: 8,
+    textAlign: 'right',
+  },
+  /* ── v1.5.8 — R4: مودال کد بازپس‌گیری سرور ── */
+  claimOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  claimCard: {
+    width: '100%',
+    maxWidth: 360,
+    backgroundColor: colors.dark.surface,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+    borderRadius: 14,
+    padding: 18,
+  },
+  claimTitle: {
+    fontSize: 14,
+    fontWeight: '900' as const,
+    color: colors.dark.text,
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  claimHint: {
+    fontSize: 10,
+    lineHeight: 16,
+    color: colors.dark.textSecondary,
+    textAlign: 'right',
+    marginBottom: 12,
+  },
+  claimInput: {
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.accent + '55',
+    borderRadius: 10,
+    color: colors.dark.text,
+    fontSize: 20,
+    fontWeight: '900' as const,
+    letterSpacing: 8,
+    textAlign: 'center',
+    paddingVertical: 10,
+    direction: 'ltr',
+  },
+  claimBtnRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 14,
+  },
+  claimBtn: {
+    flex: 1,
+    borderRadius: 10,
+    paddingVertical: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  claimBtnCancel: {
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+  },
+  claimBtnOk: {
+    backgroundColor: colors.dark.green,
+  },
+  claimBtnCancelText: {
+    fontSize: 11,
+    fontWeight: '800' as const,
+    color: colors.dark.textSecondary,
+  },
+  claimBtnOkText: {
+    fontSize: 11,
+    fontWeight: '900' as const,
+    color: colors.dark.background,
   },
 }));

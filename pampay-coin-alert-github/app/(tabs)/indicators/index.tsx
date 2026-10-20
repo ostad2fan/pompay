@@ -37,6 +37,7 @@ import {
 import {
   fetchServerSignals,
   syncScanConfig,
+  fetchIndicatorDebug,
   ServerSignalsResponse,
 } from '@/utils/scanServerApi';
 
@@ -88,6 +89,14 @@ export default function IndicatorsScreen() {
   const [isSavingIndicator, setIsSavingIndicator] = useState(false);
   const [dayFilter, setDayFilter] = useState<DayFilter>(0);
   const [serverSignals, setServerSignals] = useState<ServerSignalsResponse | null>(null);
+  /** v1.5.8 — R4: آنچه سرور از اندیکاتورهای شما دارد (+ خطاهای ارزیابی سرور). */
+  const [serverInd, setServerInd] = useState<{
+    ok: boolean;
+    indicatorCount: number;
+    indicators: { name: string; timeframe: string; receiveSignals: boolean; lastError: string | null }[];
+    lastQuickScanAt: number | null;
+    error?: string;
+  } | null>(null);
 
   // Signals of the current/last N days, based on when the signal was DETECTED
   // (UTC days). A daily candle that closed last night has yesterday's
@@ -145,14 +154,16 @@ export default function IndicatorsScreen() {
 
   const loadCustomData = useCallback(async () => {
     try {
-      const [list, signals, errors, server] = await Promise.all([
+      const [list, signals, errors, server, srvInd] = await Promise.all([
         getUserIndicators(),
         getStoredCustomSignals(),
         getIndicatorErrors(),
         fetchServerSignals(),
+        fetchIndicatorDebug(),
       ]);
       setIndicators(list);
       setIndicatorErrors(errors);
+      setServerInd(srvInd);
       if (server) {
         setServerSignals(server);
         // Persist server signals locally too, so the Telegram bot commands
@@ -628,6 +639,39 @@ export default function IndicatorsScreen() {
               </Pressable>
             </View>
 
+            {/* ── v1.5.8 — R4: «وضعیت سرور» — سرور دقیقاً چه اندیکاتورهایی را
+                دارد، کی اسکن کرده و خطا داشته؟ (اعلان با برنامه بسته فقط از
+                همین مسیر می‌آید) ── */}
+            {serverInd && (
+              <View style={styles.serverIndBox}>
+                <Text style={styles.serverIndTitle}>وضعیت اندیکاتورها روی سرور ۲۴/۷:</Text>
+                {serverInd.ok ? (
+                  <>
+                    <Text style={styles.serverIndText}>
+                      {serverInd.indicatorCount === 0
+                        ? 'هنوز اندیکاتوری روی سرور نیست — دکمه «افزودن اندیکاتور» یا همان‌طور ویرایش/ذخیره یکی، خودش sync می‌کند.'
+                        : `✓ ${serverInd.indicatorCount.toLocaleString('fa-IR')} اندیکاتور روی سرور همگام است • سیگنال‌فرست: ${serverInd.indicators.filter((i) => i.receiveSignals).length.toLocaleString('fa-IR')}`}
+                    </Text>
+                    {serverInd.lastQuickScanAt ? (
+                      <Text style={styles.serverIndSub}>
+                        آخرین اسکن سریع سرور: {Math.max(0, Math.round((Date.now() - serverInd.lastQuickScanAt) / 60_000)).toLocaleString('fa-IR')} دقیقه پیش
+                      </Text>
+                    ) : null}
+                    {serverInd.indicators
+                      .filter((i) => i.lastError)
+                      .slice(0, 3)
+                      .map((i) => (
+                        <Text key={i.name} style={styles.serverIndErr} numberOfLines={2}>
+                          ⚠ «{i.name}» روی سرور خطا می‌دهد: {i.lastError} — با برنامه بسته سیگنال نمی‌دهد؛ کد را با توابع پشتیبانی‌شده بازنویسی کنید.
+                        </Text>
+                      ))}
+                  </>
+                ) : (
+                  <Text style={styles.serverIndErr}>{serverInd.error ?? 'سرور وضعیت اندیکاتورها را برنگرداند'}</Text>
+                )}
+              </View>
+            )}
+
             {indicators.map((ind) => (
               <View key={ind.id} style={styles.indicatorItem} testID={`indicator-${ind.name}`}>
                 <View style={styles.indicatorMain}>
@@ -946,6 +990,41 @@ const styles = createThemedStyles(() => StyleSheet.create({
   },
   serverTgHintWarn: {
     color: colors.dark.red,
+  },
+  /* ── v1.5.8 — R4: جعبه «وضعیت اندیکاتورها روی سرور ۲۴/۷» ── */
+  serverIndBox: {
+    backgroundColor: colors.dark.card,
+    borderWidth: 1,
+    borderColor: colors.dark.accent + '3A',
+    borderRadius: 12,
+    padding: 12,
+    marginTop: 10,
+  },
+  serverIndTitle: {
+    fontSize: 11,
+    fontWeight: '900' as const,
+    color: colors.dark.text,
+    textAlign: 'right',
+    marginBottom: 5,
+  },
+  serverIndText: {
+    fontSize: 10,
+    lineHeight: 16,
+    color: colors.dark.textSecondary,
+    textAlign: 'right',
+  },
+  serverIndSub: {
+    fontSize: 9.5,
+    color: colors.dark.textMuted,
+    textAlign: 'right',
+    marginTop: 3,
+  },
+  serverIndErr: {
+    fontSize: 9.5,
+    lineHeight: 15,
+    color: colors.dark.red,
+    textAlign: 'right',
+    marginTop: 5,
   },
   tfSelectChips: {
     flexDirection: 'row-reverse',

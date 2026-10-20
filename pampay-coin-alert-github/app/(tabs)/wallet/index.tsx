@@ -2348,24 +2348,6 @@ export default function WalletScreen() {
   );
   const blockchainToman = usdtToToman > 0 ? blockchainTotalUsd * usdtToToman : 0;
 
-  // v1.5.7 — R1: «در قسمت دارایی من موجودی کیف پول بلاکچین و ارز دیجیتالشون
-  // رو بده» — تجمیع توکن‌های همه‌ی کیف‌پول‌های بلاکچین (برای ردیف داخل
-  // «دارایی‌های من» در تب دارایی ریالی و فلزات).
-  const blockchainCoins = useMemo(() => {
-    const bySymbol: Record<string, { symbol: string; name: string; qty: number; valueUsd: number }> = {};
-    for (const w of bcWallets) {
-      const d = bcBalanceByWallet[w.id]?.data;
-      if (!d?.tokens) continue;
-      for (const t of d.tokens) {
-        if (!(t.qty > 0)) continue;
-        const row = (bySymbol[t.symbol] ??= { symbol: t.symbol, name: t.name ?? t.symbol, qty: 0, valueUsd: 0 });
-        row.qty += t.qty;
-        row.valueUsd += t.valueUsd ?? 0;
-      }
-    }
-    return Object.values(bySymbol).sort((a, b) => b.valueUsd - a.valueUsd).slice(0, 8);
-  }, [bcWallets, bcBalanceByWallet]);
-
   // PnL over all four periods at once — keyed by the aggregated holdings so
   // it recomputes whenever balances change (qty/asset shifts).
   const bcTokensKey = useMemo(
@@ -3088,7 +3070,6 @@ export default function WalletScreen() {
             hasBlockchainWallet={hasBlockchainWallet}
             blockchainPnlTomanByPeriod={blockchainPnlTomanByPeriod}
             blockchainTotalUsd={blockchainTotalUsd}
-            blockchainCoins={blockchainCoins}
           />
         </>
       )}
