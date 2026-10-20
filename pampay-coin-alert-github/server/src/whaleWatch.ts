@@ -182,6 +182,10 @@ async function announce(
   }
   lines.push(`   🖥 Hyperliquid • ${new Date().toLocaleString("fa-IR")}`);
   await sendTelegram(cfg, lines.join("\n"));
+  // v1.5.7 — زمان آخرین رخداد نهنگ برای نمایش در برنامه
+  try {
+    await store.put("lastWhaleEventAt", Date.now());
+  } catch {}
   await sendPushToAll(
     event === "close" ? "🔒 نهنگ پوزیشن بست" : "🐋 حرکت نهنگ",
     `${whale.label}: ${pos.coin} ${pos.side === "long" ? "لانگ" : "شورت"} ${event}`,
@@ -229,13 +233,46 @@ export async function runWhaleWatch(): Promise<WhaleWatchSummary> {
         const prev = snapshots[whale.id];
 
         if (!prev || Date.now() - prev.at > SNAP_MAX_AGE_MS) {
-          // first sight (or stale snapshot): just record, no announcement —
+          // first sight (or stale snapshot): record baseline, no diff announce —
           // announcing positions the server never "saw" would be noise.
           snapshots[whale.id] = {
             positions: current,
             accountValue: parseFloat(state.marginSummary?.accountValue ?? "0") || 0,
             at: Date.now(),
           };
+          // v1.5.7 — R4 «اعلان نهنگ‌ها با برنامه بسته نمی‌آید»: برای نهنگِ
+          // تازه‌اضافه‌شده یک پیام «پایش شروع شد» با پوزیشن‌های فعلی‌اش می‌رود
+          // تا کاربر همان لحظه ببیند سرور در حال ردیابی است (پس از هر
+          // ری‌دپلوی هم فقط یک‌بار برای هر نهنگ تکرار می‌شود — غیرمزاحم).
+          try {
+            const watchKey = `whaleWatchStarted:${whale.id}`;
+            const dayBucket = Math.floor(Date.now() / 86400_000);
+            const startedAt = (await store.get<number>(watchKey)) ?? 0;
+            if (!prev && (!startedAt || dayBucket - Math.floor(startedAt / 86400_000) >= 1)) {
+              await store.put(watchKey, Date.now());
+              const posLines =
+                current.length > 0
+                  ? current
+                      .slice(0, 6)
+                      .map(
+                        (p) =>
+                          `   ${p.side === "long" ? "🟢" : "🔴"} ${p.coin} — ${fmtUsd(p.value)} (ورود ${p.entryPx > 0 ? p.entryPx.toLocaleString("en-US", { maximumFractionDigits: 6 }) : "—"})`
+                      )
+                      .join("\n")
+                  : "   (فعلاً پوزیشن بازیابی‌شده‌ای ندارد)";
+              await sendTelegram(
+                target,
+                [
+                  `📡 <b>پایش نهنگ شروع شد</b>`,
+                  `🐋 ${whale.label}`,
+                  `سرور از این لحظه ۲۴/۷ (حتی با برنامه بسته) پوزیشن‌های این نهنگ را روی Hyperliquid ردیابی می‌کند:`,
+                  posLines,
+                  `   🖥 Hyperliquid • ${new Date().toLocaleString("fa-IR")}`,
+                ].join("\n")
+              );
+              await store.put("lastWhaleEventAt", Date.now());
+            }
+          } catch {}
           continue;
         }
 

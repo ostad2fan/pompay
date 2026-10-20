@@ -6,7 +6,6 @@ import {
   ScrollView,
   Pressable,
   TextInput,
-  Alert,
   ActivityIndicator,
   Animated,
   Platform,
@@ -75,6 +74,7 @@ import DropdownPicker from '@/components/DropdownPicker';
 import { sendTelegramTradeNotification, sendTelegramAISignal } from '@/utils/telegramService';
 import TradeAiSegmentHeader from '@/components/TradeAiSegmentHeader';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 const SIGNALS_HISTORY_KEY = '@trade_ai_signals';
 const PREV_SIGNALS_KEY = '@trade_ai_prev_signal_states';
 const AUTO_TRADE_CONFIG_KEY = '@real_trade_auto_config';
@@ -323,7 +323,7 @@ export default function RealTradeScreen() {
     setEnabledStrategies((prev) => {
       const next = { ...prev, [key]: !prev[key] };
       if (!STRATEGY_ORDER.some((s) => next[s])) {
-        Alert.alert('غیرممکن', 'حداقل یک استراتژی باید روشن باشد.');
+        ThemedAlert.alert('غیرممکن', 'حداقل یک استراتژی باید روشن باشد.');
         return prev;
       }
       void saveEnabledStrategies(next).then(() => {
@@ -367,7 +367,7 @@ export default function RealTradeScreen() {
       if ('Notification' in window && Notification.permission === 'granted') {
         new Notification(title, { body });
       }
-      Alert.alert(title, body);
+      ThemedAlert.alert(title, body);
     } else {
       try {
         await Notifications.scheduleNotificationAsync({
@@ -375,7 +375,7 @@ export default function RealTradeScreen() {
           trigger: null,
         });
       } catch {
-        Alert.alert(title, body);
+        ThemedAlert.alert(title, body);
       }
     }
   }, []);
@@ -601,7 +601,7 @@ export default function RealTradeScreen() {
     },
     onSuccess: () => {
       try { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
-      Alert.alert('موفق', 'پوزیشن واقعی باز شد!');
+      ThemedAlert.alert('موفق', 'پوزیشن واقعی باز شد!');
       queryClient.invalidateQueries({ queryKey: ['binance-positions'] });
       queryClient.invalidateQueries({ queryKey: ['binance-account'] });
       queryClient.invalidateQueries({ queryKey: ['binance-orders'] });
@@ -621,7 +621,7 @@ export default function RealTradeScreen() {
     },
     onError: (err) => {
       try { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error); } catch {}
-      Alert.alert('خطا', (err as Error).message);
+      ThemedAlert.alert('خطا', (err as Error).message);
     },
   });
 
@@ -633,7 +633,7 @@ export default function RealTradeScreen() {
     },
     onSuccess: (_data, pos) => {
       try { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
-      Alert.alert('موفق', 'پوزیشن بسته شد');
+      ThemedAlert.alert('موفق', 'پوزیشن بسته شد');
       queryClient.invalidateQueries({ queryKey: ['binance-positions'] });
       queryClient.invalidateQueries({ queryKey: ['binance-account'] });
 
@@ -651,7 +651,7 @@ export default function RealTradeScreen() {
         }).catch(() => {});
       }
     },
-    onError: (err) => Alert.alert('خطا', (err as Error).message),
+    onError: (err) => ThemedAlert.alert('خطا', (err as Error).message),
   });
 
   const updateSLMutation = useMutation({
@@ -660,11 +660,11 @@ export default function RealTradeScreen() {
       return updateStopLoss(activeExchange.apiKey, activeExchange.apiSecret, pos.symbol, pos.side, pos.size, newSL);
     },
     onSuccess: () => {
-      Alert.alert('موفق', 'حد ضرر بروزرسانی شد');
+      ThemedAlert.alert('موفق', 'حد ضرر بروزرسانی شد');
       setEditingPos(null);
       queryClient.invalidateQueries({ queryKey: ['binance-orders'] });
     },
-    onError: (err) => Alert.alert('خطا', (err as Error).message),
+    onError: (err) => ThemedAlert.alert('خطا', (err as Error).message),
   });
 
   const updateTPMutation = useMutation({
@@ -673,11 +673,11 @@ export default function RealTradeScreen() {
       return updateTakeProfit(activeExchange.apiKey, activeExchange.apiSecret, pos.symbol, pos.side, pos.size, newTP);
     },
     onSuccess: () => {
-      Alert.alert('موفق', 'تارگت بروزرسانی شد');
+      ThemedAlert.alert('موفق', 'تارگت بروزرسانی شد');
       setEditingPos(null);
       queryClient.invalidateQueries({ queryKey: ['binance-orders'] });
     },
-    onError: (err) => Alert.alert('خطا', (err as Error).message),
+    onError: (err) => ThemedAlert.alert('خطا', (err as Error).message),
   });
 
   const setTrailingMutation = useMutation({
@@ -686,15 +686,15 @@ export default function RealTradeScreen() {
       return setTrailingStop(activeExchange.apiKey, activeExchange.apiSecret, pos.symbol, pos.side, pos.size, rate);
     },
     onSuccess: () => {
-      Alert.alert('موفق', 'تریل استاپ فعال شد');
+      ThemedAlert.alert('موفق', 'تریل استاپ فعال شد');
       setShowTrailingModal(null);
       queryClient.invalidateQueries({ queryKey: ['binance-orders'] });
     },
-    onError: (err) => Alert.alert('خطا', (err as Error).message),
+    onError: (err) => ThemedAlert.alert('خطا', (err as Error).message),
   });
 
   const handleClosePosition = useCallback((pos: RealPosition) => {
-    Alert.alert(
+    ThemedAlert.alert(
       'بستن پوزیشن واقعی',
       `آیا مطمئنید می‌خواهید پوزیشن ${pos.symbol} را ببندید؟\nسود/زیان: ${pos.pnl >= 0 ? '+' : ''}$${pos.pnl.toFixed(2)}`,
       [
@@ -707,7 +707,7 @@ export default function RealTradeScreen() {
   const handleConfirmEdit = useCallback(() => {
     if (!editingPos) return;
     const val = parseFloat(editingPos.value);
-    if (isNaN(val) || val <= 0) { Alert.alert('خطا', 'مقدار نامعتبر'); return; }
+    if (isNaN(val) || val <= 0) { ThemedAlert.alert('خطا', 'مقدار نامعتبر'); return; }
     if (editingPos.field === 'sl') updateSLMutation.mutate({ pos: editingPos.position, newSL: val });
     else if (editingPos.field === 'tp') updateTPMutation.mutate({ pos: editingPos.position, newTP: val });
   }, [editingPos, updateSLMutation, updateTPMutation]);
@@ -722,10 +722,10 @@ export default function RealTradeScreen() {
   }, []);
 
   const handleOpenPosition = useCallback(() => {
-    if (!selectedSignal) { Alert.alert('خطا', 'ابتدا یک سیگنال انتخاب کنید'); return; }
+    if (!selectedSignal) { ThemedAlert.alert('خطا', 'ابتدا یک سیگنال انتخاب کنید'); return; }
     const amount = parseFloat(entryAmount);
-    if (isNaN(amount) || amount <= 0) { Alert.alert('خطا', 'مبلغ ورودی نامعتبر'); return; }
-    Alert.alert(
+    if (isNaN(amount) || amount <= 0) { ThemedAlert.alert('خطا', 'مبلغ ورودی نامعتبر'); return; }
+    ThemedAlert.alert(
       'تایید معامله واقعی',
       `${selectedSignal.action === 'buy' ? '🟢 Long' : '🔴 Short'} ${selectedSignal.symbol.replace('USDT', '/USDT')}\nمبلغ: $${amount}\nاهرم: ${customLeverage || selectedSignal.leverage}x\nحد ضرر: $${customSL || selectedSignal.stopLoss.toFixed(4)}\nتارگت: $${customTP || selectedSignal.targetPrice.toFixed(4)}`,
       [
@@ -737,11 +737,11 @@ export default function RealTradeScreen() {
 
   const handleAddExchange = useCallback(() => {
     if (!newApiKey.trim() || !newApiSecret.trim()) {
-      Alert.alert('خطا', 'API Key و Secret الزامی است');
+      ThemedAlert.alert('خطا', 'API Key و Secret الزامی است');
       return;
     }
     if (exchangeConfigs.length >= 2) {
-      Alert.alert('خطا', 'حداکثر ۲ صرافی مجاز است');
+      ThemedAlert.alert('خطا', 'حداکثر ۲ صرافی مجاز است');
       return;
     }
     const config: ExchangeConfig = {
@@ -761,11 +761,11 @@ export default function RealTradeScreen() {
     setNewSelectedSymbols([]);
     setNewCoinInput('');
     setShowExchangeForm(false);
-    Alert.alert('موفق', `صرافی ${EXCHANGES[newExchangeId].name} اضافه شد`);
+    ThemedAlert.alert('موفق', `صرافی ${EXCHANGES[newExchangeId].name} اضافه شد`);
   }, [newApiKey, newApiSecret, newExchangeId, newTradeSource, newTradeAllSymbols, exchangeConfigs, saveExchangeConfigs]);
 
   const handleRemoveExchange = useCallback((idx: number) => {
-    Alert.alert('حذف صرافی', 'آیا مطمئنید؟', [
+    ThemedAlert.alert('حذف صرافی', 'آیا مطمئنید؟', [
       { text: 'لغو', style: 'cancel' },
       {
         text: 'حذف', style: 'destructive',
@@ -780,11 +780,11 @@ export default function RealTradeScreen() {
 
   const handleToggleAutoTrade = useCallback((enabled: boolean) => {
     if (enabled && !hasApiKeys) {
-      Alert.alert('خطا', 'ابتدا API صرافی را وارد کنید');
+      ThemedAlert.alert('خطا', 'ابتدا API صرافی را وارد کنید');
       return;
     }
     if (enabled) {
-      Alert.alert(
+      ThemedAlert.alert(
         'فعال‌سازی ربات',
         `ربات با حداقل ${autoConfig.minConfidence}% اطمینان و حداکثر ${autoConfig.maxOpenPositions} پوزیشن معامله می‌کند.\nحفظ ${autoConfig.preserveCapitalPercent}% سرمایه اولیه.\n\nادامه می‌دهید؟`,
         [
@@ -1642,7 +1642,7 @@ export default function RealTradeScreen() {
                   if (!showTrailingModal) return;
                   const rate = parseFloat(trailingRate);
                   if (isNaN(rate) || rate <= 0 || rate > 5) {
-                    Alert.alert('خطا', 'نرخ بازگشت باید بین ۰.۱ تا ۵ باشد');
+                    ThemedAlert.alert('خطا', 'نرخ بازگشت باید بین ۰.۱ تا ۵ باشد');
                     return;
                   }
                   setTrailingMutation.mutate({ pos: showTrailingModal, rate });

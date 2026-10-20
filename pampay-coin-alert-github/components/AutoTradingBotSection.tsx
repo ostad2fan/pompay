@@ -60,7 +60,6 @@ import {
   Switch,
   ActivityIndicator,
   ScrollView,
-  Alert,
   Platform,
   Modal,
   Image,
@@ -96,6 +95,8 @@ import * as MediaLibrary from 'expo-media-library';
 // v1.5.6 — بازیابی خروجی PDF تاریخچه (expo-print + utils/backtestPdf.ts)
 import * as Print from 'expo-print';
 import colors from '@/constants/colors';
+// v1.5.7 — همه پیغام‌ها با مودال درون‌برنامه‌ای هماهنگ با تم
+import { ThemedAlert } from '@/components/ThemedAlert';
 // v1.5.6 — بازیابی دقت قیمت بایننس (getFuturesPricePrecisionMap از v1.5.4)
 import { formatBinancePrice, getFuturesPricePrecisionMap } from '@/utils/binanceFuturesTrading';
 import { BacktestPdfRow, buildBacktestPdfHtml } from '@/utils/backtestPdf';
@@ -114,6 +115,7 @@ import {
   AUTO_TF_LABEL,
   computeAutoPnlStats,
   getAutoLogs,
+  getAutoServerStatus,
   getLastGlobalCycleAt,
   listIndicatorOptions,
   listTrackedWhales,
@@ -124,10 +126,12 @@ import {
   manualClosePosition,
   manualPartialClosePosition,
   positionPnlPercent,
+  pushAutoTradeConfigToServer,
   resetDemoBacktest,
   runGlobalCycleNow,
   runLightMtm,
   saveAutoSettings,
+  subscribeAutoSettings,
   updatePositionTpsl,
 } from '@/utils/autoTradingEngine';
 
@@ -266,6 +270,14 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [pricePrecision, setPricePrecision] = useState<Record<string, number>>({});
   const pnlCardRef = useRef<View>(null);
 
+  /** v1.5.7 — وضعیت ۲۴/۷ سرور برای نشانِ داخل کارت. */
+  const [serverStatus, setServerStatus] = useState<{ active: boolean; reason: string }>({ active: false, reason: '' });
+  const refreshServerStatus = useCallback(async () => {
+    try {
+      setServerStatus(await getAutoServerStatus());
+    } catch {}
+  }, []);
+
   // load everything on mount
   useEffect(() => {
     (async () => {
@@ -287,15 +299,41 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       setRealKeys(keys);
       setLastCycleAt(getLastGlobalCycleAt());
       setLoaded(true);
+      // v1.5.7 — شروع برنامه: اگر ربات روشن است و سرور/تلگرام تنظیم است،
+      // ۲۴/۷ خودکار فعال شود (push کانفیگ) و نشان وضعیت تازه شود.
+      if (s.enabled) {
+        void pushAutoTradeConfigToServer(s)
+          .then(() => refreshServerStatus())
+          .catch(() => refreshServerStatus());
+      } else {
+        void refreshServerStatus();
+      }
     })().catch(() => setLoaded(true));
-  }, [realKeysProp]);
+  }, [realKeysProp, refreshServerStatus]);
 
-  const persist = useCallback(async (next: AutoTradeSettings) => {
-    setSettings(next);
-    await saveAutoSettings(next);
-    // v1.5.5 — سوییچ «اعلام تلگرام ۲۴/۷ (سرور)» حذف شد؛ دیگر کانفیگی به
-    // سرور push نمی‌شود. ربات روی خود گوشی اجرا می‌شود و اعلام تلگرام
-    // از خود برنامه (announceTelegram) ارسال می‌شود.
+  const persist = useCallback(
+    async (next: AutoTradeSettings) => {
+      setSettings(next);
+      await saveAutoSettings(next);
+      // v1.5.7 — حالت ۲۴/۷ خودکار: با هر تغییر تنظیمات (روشن/خاموش ربات یا
+      // پارامترها)، کانفیگ به سرور push می‌شود. ربات روشن + تلگرام تنظیم →
+      // سرور ۲۴/۷ اجرا و اعلام می‌کند؛ ربات خاموش → سرور متوقف. غیرfatal.
+      void pushAutoTradeConfigToServer(next)
+        .then(() => refreshServerStatus())
+        .catch(() => refreshServerStatus());
+    },
+    [refreshServerStatus]
+  );
+
+  // v1.5.7 — R7 ریشه‌ی باگ «پریست استراتژی جدول را پر نمی‌کند»: وقتی بیرونِ
+  // این کامپوننت (توقف/روشن‌کردن استراتژی در auto-trade.tsx) تنظیمات ذخیره
+  // شود، همین‌جا state تازه می‌شود — جدول لحظه‌ای پریست را نشان می‌دهد و
+  // persistهای بعدی دیگر مقادیر کهنه را برنمی‌گردانند.
+  useEffect(() => {
+    const unsub = subscribeAutoSettings((next) => {
+      setSettings((cur) => (JSON.stringify(cur) === JSON.stringify(next) ? cur : next));
+    });
+    return unsub;
   }, []);
 
   const refreshPositions = useCallback(async () => {
@@ -354,17 +392,23 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   );
 
   const openPositions = useMemo(() => positions.filter((p) => p.status === 'open'), [positions]);
-  // v1.5.6 — ادغام v1.5.4 با v1.5.5: فیلتر بازه روز + فیلتر نوع (سود/ضرر/نوع بستن)
-  // + مرتب‌سازی «جدیدترین بسته‌شده اول» + سقف ۱۰۰ معامله (v1.5.5) + صفحه‌بندی ۱۰۰تایی (v1.5.4).
+  // v1.5.7 — R2: فیلتر بازه + فیلتر نوع + مرتب‌سازی «جدیدترین بسته‌شده اول».
+  // سقف ۱۰۰تایی v1.5.5 حذف شد — صفحه‌بندی ۱۰۰تایی خودش کار نمایش را می‌کند و
+  // PDF/جمع بازه روی «تمام» معاملات همان بازه محاسبه می‌شود (نه فقط ۱۰۰ تای
+  // روی صفحه). معاملاتی که closedAt ندارند (رکوردهای خیلی قدیمی) با openedAt
+  // فیلتر می‌شوند تا «در اون بازه نشون نمیده» رخ ندهد.
   const closedFiltered = useMemo(() => {
     const win = histWindowMs(histPeriod);
     const now = Date.now();
     return matchHistType(
-      positions.filter((p) => p.status === 'closed' && (win === Infinity || (!!p.closedAt && now - p.closedAt <= win))),
+      positions.filter((p) => {
+        if (p.status !== 'closed') return false;
+        if (win === Infinity) return true;
+        const at = p.closedAt ?? p.openedAt;
+        return !!at && now - at <= win;
+      }),
       histTypeFilter
-    )
-      .sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0))
-      .slice(0, 100);
+       ).sort((a, b) => (b.closedAt ?? b.openedAt ?? 0) - (a.closedAt ?? a.openedAt ?? 0));
   }, [positions, histPeriod, histWindowMs, histTypeFilter]);
   const closedTotalPages = Math.max(1, Math.ceil(closedFiltered.length / HIST_PAGE_SIZE));
   const closedPositions = useMemo(() => {
@@ -376,17 +420,22 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     const win = histWindowMs(histPeriod);
     const now = Date.now();
     return matchHistType(
-      realPositions.filter((p) => p.status === 'closed' && (win === Infinity || (!!p.closedAt && now - p.closedAt <= win))),
+      realPositions.filter((p) => {
+        if (p.status !== 'closed') return false;
+        if (win === Infinity) return true;
+        const at = p.closedAt ?? p.openedAt;
+        return !!at && now - at <= win;
+      }),
       histTypeFilter
-    )
-      .sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0))
-      .slice(0, 100);
+    ).sort((a, b) => (b.closedAt ?? b.openedAt ?? 0) - (a.closedAt ?? a.openedAt ?? 0));
   }, [realPositions, histPeriod, histWindowMs, histTypeFilter]);
   const realClosedTotalPages = Math.max(1, Math.ceil(realClosedFiltered.length / HIST_PAGE_SIZE));
   const realClosed = useMemo(() => {
     const page = Math.min(realHistPage, realClosedTotalPages);
     return realClosedFiltered.slice((page - 1) * HIST_PAGE_SIZE, page * HIST_PAGE_SIZE);
   }, [realClosedFiltered, realHistPage, realClosedTotalPages]);
+  // v1.5.7 — R2: جمع سود/زیانِ «تمام» معاملات همان بازه در سرتیتر تاریخچه
+  // محاسبه می‌شود (closedFiltered دیگر سقف ۱۰۰تایی ندارد — PDF هم همین است).
 
   const totalPnl = openPositions.reduce((s, p) => {
     const dir = p.side === 'long' ? 1 : -1;
@@ -450,22 +499,22 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
 
   const startBot = () => {
     if (!settings.whale.enabled && !settings.indicators.enabled) {
-      Alert.alert('منبع انتخاب نشده', 'حداقل یکی از دو منبع (نهنگ یا اندیکاتور) را فعال و انتخاب کنید.');
+      ThemedAlert.alert('منبع انتخاب نشده', 'حداقل یکی از دو منبع (نهنگ یا اندیکاتور) را فعال و انتخاب کنید.');
       return;
     }
     if (settings.whale.enabled && !settings.whale.address) {
-      Alert.alert('نهنگ انتخاب نشده', 'از لیست، نهنگ موردنظر برای کپی معاملات را انتخاب کنید.');
+      ThemedAlert.alert('نهنگ انتخاب نشده', 'از لیست، نهنگ موردنظر برای کپی معاملات را انتخاب کنید.');
       return;
     }
     if (settings.indicators.enabled && settings.indicators.selections.length === 0) {
-      Alert.alert('اندیکاتور انتخاب نشده', 'از منوی کشویی، حداقل یک اندیکاتور انتخاب کنید.');
+      ThemedAlert.alert('اندیکاتور انتخاب نشده', 'از منوی کشویی، حداقل یک اندیکاتور انتخاب کنید.');
       return;
     }
     if (settings.mode === 'real' && !realKeys) {
-      Alert.alert('کلید API نیست', 'برای معامله واقعی، ابتدا کلید API فیوچرز بایننس را در تب «واقعی» اضافه کنید.');
+      ThemedAlert.alert('کلید API نیست', 'برای معامله واقعی، ابتدا کلید API فیوچرز بایننس را در تب «واقعی» اضافه کنید.');
       return;
     }
-    Alert.alert(
+    ThemedAlert.alert(
       settings.mode === 'demo' ? 'شروع دمو' : 'شروع واقعی',
       settings.mode === 'demo'
         ? 'ربات در حالت دمو شروع می‌شود — پوزیشن‌های شبیه‌سازی‌شده با تنظیمات شما باز/بسته می‌شوند. ربات روشن می‌ماند و با بستن برنامه خاموش نمی‌شود.'
@@ -502,12 +551,12 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     setCaptureBusy(true);
     try {
       if (Platform.OS === 'web') {
-        Alert.alert('وب', 'خروجی عکس فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
+        ThemedAlert.alert('وب', 'خروجی عکس فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
         return;
       }
       const uri = await capturePnl();
       if (!uri) {
-        Alert.alert('خطا', 'ساخت عکس PnL ممکن نشد.');
+        ThemedAlert.alert('خطا', 'ساخت عکس PnL ممکن نشد.');
         return;
       }
       setPreviewUri(uri);
@@ -522,7 +571,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     try {
       const available = await Sharing.isAvailableAsync().catch(() => false);
       if (!available) {
-        Alert.alert('غيرممکن', 'اشتراک‌گذاری روی این دستگاه در دسترس نیست.');
+        ThemedAlert.alert('غيرممکن', 'اشتراک‌گذاری روی این دستگاه در دسترس نیست.');
         return;
       }
       await Sharing.shareAsync(previewUri, {
@@ -540,13 +589,13 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     try {
       const perm = await MediaLibrary.requestPermissionsAsync().catch(() => ({ granted: false }) as { granted: boolean });
       if (!perm.granted) {
-        Alert.alert('دسترسی داده نشد', 'برای ذخیره عکس در گالری، دسترسی رسانه را تأیید کنید.');
+        ThemedAlert.alert('دسترسی داده نشد', 'برای ذخیره عکس در گالری، دسترسی رسانه را تأیید کنید.');
         return;
       }
       await MediaLibrary.saveToLibraryAsync(previewUri);
-      Alert.alert('ذخیره شد ✅', 'عکس PnL ربات در گالری گوشی ذخیره شد.');
+      ThemedAlert.alert('ذخیره شد ✅', 'عکس PnL ربات در گالری گوشی ذخیره شد.');
     } catch {
-      Alert.alert('خطا', 'ذخیره عکس انجام نشد.');
+      ThemedAlert.alert('خطا', 'ذخیره عکس انجام نشد.');
     } finally {
       setCaptureBusy(false);
     }
@@ -564,16 +613,16 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     const newStop = parseFloat(editStopText.replace(/[^\d.]/g, ''));
     const newTake = parseFloat(editTakeText.replace(/[^\d.]/g, ''));
     if (!(newStop > 0) || !(newTake > 0)) {
-      Alert.alert('خطا', 'قیمت استاپ و تیک‌پرافیت را درست وارد کنید (بزرگ‌تر از صفر).');
+      ThemedAlert.alert('خطا', 'قیمت استاپ و تیک‌پرافیت را درست وارد کنید (بزرگ‌تر از صفر).');
       return;
     }
     const long = editTpsl.side === 'long';
     if (long && newStop >= newTake) {
-      Alert.alert('خطا', 'در پوزیشن لانگ، استاپ باید پایین‌تر از تیک‌پرافیت باشد.');
+      ThemedAlert.alert('خطا', 'در پوزیشن لانگ، استاپ باید پایین‌تر از تیک‌پرافیت باشد.');
       return;
     }
     if (!long && newStop <= newTake) {
-      Alert.alert('خطا', 'در پوزیشن شورت، استاپ باید بالاتر از تیک‌پرافیت باشد.');
+      ThemedAlert.alert('خطا', 'در پوزیشن شورت، استاپ باید بالاتر از تیک‌پرافیت باشد.');
       return;
     }
     setTpslBusy(true);
@@ -583,7 +632,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         setEditTpsl(null);
         await refreshPositions();
       } else {
-        Alert.alert('ناموفق', 'تغییر TP/SL انجام نشد — اعداد را دوباره چک کنید و دوباره تلاش کنید.');
+        ThemedAlert.alert('ناموفق', 'تغییر TP/SL انجام نشد — اعداد را دوباره چک کنید و دوباره تلاش کنید.');
       }
     } finally {
       setTpslBusy(false);
@@ -657,7 +706,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   // v1.5.4 (بازیابی‌شده در v1.5.6) — «بستن هر معامله با پیغام تایید»: قبل از
   // بسته شدن کامل، تایید می‌گیرد.
   const confirmClosePosition = (t: { id: string; symbol: string; side: 'long' | 'short'; lastPrice: number }) => {
-    Alert.alert(
+    ThemedAlert.alert(
       'بستن معامله',
       `معامله ${t.symbol} (${t.side === 'long' ? 'لانگ 🟢' : 'شورت 🔴'}) کامل بسته شود؟`,
       [
@@ -680,13 +729,13 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     setPdfBusy(true);
     try {
       if (Platform.OS === 'web') {
-        Alert.alert('وب', 'خروجی PDF فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
+        ThemedAlert.alert('وب', 'خروجی PDF فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
         return;
       }
       const isDemo = settings.mode === 'demo';
       const source = isDemo ? closedFiltered : realClosedFiltered;
       if (source.length === 0) {
-        Alert.alert('تاریخچه خالی', 'در این بازه/فیلتر معامله‌ای برای PDF نیست.');
+        ThemedAlert.alert('تاریخچه خالی', 'در این بازه/فیلتر معامله‌ای برای PDF نیست.');
         return;
       }
       const rows: BacktestPdfRow[] = source.map((p) => ({
@@ -720,12 +769,12 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       const { uri } = await Print.printToFileAsync({ html });
       const available = await Sharing.isAvailableAsync().catch(() => false);
       if (!available) {
-        Alert.alert('PDF ساخته شد', 'فایل ساخته شد اما اشتراک‌گذاری روی این دستگاه در دسترس نیست.');
+        ThemedAlert.alert('PDF ساخته شد', 'فایل ساخته شد اما اشتراک‌گذاری روی این دستگاه در دسترس نیست.');
         return;
       }
       await Sharing.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: 'گزارش تاریخچه بک‌تست (PDF)' });
     } catch {
-      Alert.alert('خطا', 'ساخت PDF انجام نشد — دوباره تلاش کنید.');
+      ThemedAlert.alert('خطا', 'ساخت PDF انجام نشد — دوباره تلاش کنید.');
     } finally {
       setPdfBusy(false);
     }
@@ -747,7 +796,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
 
   // v1.5.3 — «برای حالت دمو گزینه ریست بزار که همه چی از اول بتونم بک‌تست بگیرم»
   const handleResetDemo = () => {
-    Alert.alert(
+    ThemedAlert.alert(
       'ریست کامل بک‌تست دمو',
       'همه پوزیشن‌های دمو، تاریخچه، آمار روزانه و لاگ‌ها پاک می‌شوند و از صفر شروع می‌کنید. (حالت واقعی دست‌نخورده می‌ماند.)',
       [
@@ -762,7 +811,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               try {
                 await resetDemoBacktest();
                 await refreshPositions();
-                Alert.alert('ریست شد ✅', 'بک‌تست دمو از صفر شروع شد — در اولین چرخه، سیگنال‌های ۷ روز اخیر دوباره تا سقف پوزیشن‌های همزمان باز می‌شوند.');
+                ThemedAlert.alert('ریست شد ✅', 'بک‌تست دمو از صفر شروع شد — در اولین چرخه، سیگنال‌های ۷ روز اخیر دوباره تا سقف پوزیشن‌های همزمان باز می‌شوند.');
               } finally {
                 setResetBusy(false);
               }
@@ -851,6 +900,17 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               <Text style={styles.engineBadgeText}>
                 موتور همیشه‌فعال: هر ۶۰ ثانیه + هنگام باز شدن برنامه چرخه می‌زند — با بستن برنامه خاموش نمی‌شود.
                 {lastCycleAt ? ` آخرین چرخه: ${Math.max(0, Math.round((Date.now() - lastCycleAt) / 1000))} ثانیه پیش.` : ''}
+              </Text>
+            </View>
+          )}
+          {/* v1.5.7 — R4: نشان وضعیت ۲۴/۷ سرور (اعلام تلگرام با برنامه بسته) */}
+          {settings.enabled && (
+            <View style={[styles.serverBadge, serverStatus.active ? styles.serverBadgeOn : styles.serverBadgeOff]}>
+              <Text style={styles.serverBadgeIcon}>{serverStatus.active ? '📢' : '🔕'}</Text>
+              <Text style={[styles.serverBadgeText, serverStatus.active ? { color: colors.dark.green } : { color: '#F0B90B' }]}>
+                {serverStatus.active
+                  ? 'اعلام تلگرام ۲۴/۷ (سرور): فعال — باز/بسته شدن معاملات حتی با برنامه بسته به تلگرام شما می‌آید.'
+                  : `اعلام تلگرام ۲۴/۷ (سرور): غیرفعال — ${serverStatus.reason || 'سرور تنظیم نشده'}`}
               </Text>
             </View>
           )}
@@ -1157,7 +1217,15 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     <Pressable
                       key={p}
                       style={[styles.pnlPeriodChip, pnlPeriod === p && styles.pnlPeriodChipActive]}
-                      onPress={() => setPnlPeriod(p)}
+                      onPress={() => {
+                        // v1.5.7 — R2: «تایم‌فریم PnL را عوض می‌کنم ولی تاریخچه
+                        // در اون بازه نشون داده نمی‌شه» — بازه‌ی تاریخچه هم
+                        // همان لحظه با بازه‌ی PnL هم‌گام می‌شود + صفحه اول.
+                        setPnlPeriod(p);
+                        setHistPeriod(p);
+                        setHistPage(1);
+                        setRealHistPage(1);
+                      }}
                     >
                       <Text style={[styles.pnlPeriodText, pnlPeriod === p && styles.pnlPeriodTextActive]}>
                         {AUTO_PNL_PERIOD_LABEL[p]}
@@ -2013,6 +2081,33 @@ const styles = StyleSheet.create({
     fontSize: 9,
     color: colors.dark.green,
     lineHeight: 13,
+  },
+  /* v1.5.7 — R4: نشان وضعیت اعلام ۲۴/۷ سرور */
+  serverBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 7,
+    marginBottom: 8,
+  },
+  serverBadgeOn: {
+    backgroundColor: colors.dark.green + '10',
+    borderColor: colors.dark.green + '33',
+  },
+  serverBadgeOff: {
+    backgroundColor: '#F0B90B10',
+    borderColor: '#F0B90B33',
+  },
+  serverBadgeIcon: {
+    fontSize: 12,
+  },
+  serverBadgeText: {
+    flex: 1,
+    fontSize: 9,
+    lineHeight: 13,
+    fontWeight: '700',
   },
   sourceBox: {
     backgroundColor: colors.dark.background,

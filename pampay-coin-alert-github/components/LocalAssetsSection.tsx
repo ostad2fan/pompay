@@ -116,6 +116,10 @@ interface Props {
   hasBlockchainWallet?: boolean;
   /** v1.4.16 — per-period TOMAN PnL (+basis) of the blockchain holdings. */
   blockchainPnlTomanByPeriod?: Record<number, { pnlToman: number; basisToman: number } | null>;
+  /** v1.5.7 — R1: مجموع دلاری کیف‌پول‌های بلاکچین (برای ردیف «دارایی‌های من»). */
+  blockchainTotalUsd?: number;
+  /** v1.5.7 — R1: لیست ارزهای کیف‌پول‌های بلاکچین (تجمیع‌شده، مرتب بر اساس ارزش). */
+  blockchainCoins?: { symbol: string; name: string; qty: number; valueUsd: number }[];
 }
 
 const EXPANDED_KEY = '@local_assets_expanded_v1';
@@ -126,10 +130,14 @@ export default function LocalAssetsSection({
   blockchainToman = 0,
   hasBlockchainWallet = false,
   blockchainPnlTomanByPeriod,
+  blockchainTotalUsd = 0,
+  blockchainCoins,
 }: Props) {
   const [assets, setAssets] = useState<LocalAssets>(EMPTY_ASSETS);
   // v1.4.16 — «دارایی‌های من» collapsible with its own arrow; persisted.
   const [expanded, setExpanded] = useState(true);
+  // v1.5.7 — R1: باز/بسته بودن جزئیات ارزهای کیف بلاکچین.
+  const [bcCoinsOpen, setBcCoinsOpen] = useState(false);
   const queryClient = useQueryClient();
 
   useEffect(() => {
@@ -464,9 +472,52 @@ export default function LocalAssetsSection({
             valueHint={p?.coinRob ? `قیمت هر عدد: ${formatFullToman(p.coinRob)}` : 'قیمت در حال دریافت'}
           />
 
-          {/* ── v1.4.19 — حذف دو ردیف آخر (ارز دیجیتال + کیف بلاکچین):
-              این دو از بالا به‌صورت کادر خلاصه نمایش داده می‌شوند؛ تکرار
-              درون «دارایی‌های من» حذف شد (درخواست مستقیم کاربر). ── */}
+          {/* ── v1.5.7 — R1: ردیف کیف پول بلاکچین + ارزهایش (فقط خواندنی —
+              «در قسمت دارایی من موجودی کیف پول بلاکچین و ارز دیجیتالشون
+              رو بده») ── */}
+          {hasBlockchainWallet && (
+            <View style={styles.bcRow}>
+              <Pressable
+                style={styles.bcRowHead}
+                onPress={() => setBcCoinsOpen((v) => !v)}
+              >
+                <View style={styles.bcRowTexts}>
+                  <Text style={styles.bcLabel}>
+                    <Lock size={10} color={colors.dark.accent} /> کیف پول بلاکچین (فقط خواندنی)
+                  </Text>
+                  <Text style={styles.bcSub}>
+                    {blockchainTotalUsd > 0 ? `≈ $${blockchainTotalUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })} • ${formatToman(blockchainValue)} تومان` : 'در حال دریافت…'}
+                    {blockchainCoins && blockchainCoins.length > 0 ? ` • ${blockchainCoins.length.toLocaleString('fa-IR')} ارز` : ''}
+                  </Text>
+                </View>
+                <View style={styles.chevronBtn}>
+                  {bcCoinsOpen ? (
+                    <ChevronUp size={13} color={colors.dark.textSecondary} />
+                  ) : (
+                    <ChevronDown size={13} color={colors.dark.textSecondary} />
+                  )}
+                </View>
+              </Pressable>
+              {bcCoinsOpen && (
+                <View style={styles.bcCoinsBox}>
+                  {(blockchainCoins ?? []).map((c) => (
+                    <View key={c.symbol} style={styles.bcCoinRow}>
+                      <Text style={styles.bcCoinSym}>
+                        {c.symbol} {c.name && c.name !== c.symbol ? `(${c.name})` : ''}
+                      </Text>
+                      <Text style={styles.bcCoinQty}>
+                        {c.qty < 1 ? c.qty.toPrecision(4) : c.qty.toLocaleString('en-US', { maximumFractionDigits: 4 })} ≈ $
+                        {c.valueUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}
+                      </Text>
+                    </View>
+                  ))}
+                  {(blockchainCoins ?? []).length === 0 && (
+                    <Text style={styles.bcEmpty}>موجودی ارز یافت نشد — دکمه تازه‌سازی را در تب «کیف پول بلاکچین» بزنید.</Text>
+                  )}
+                </View>
+              )}
+            </View>
+          )}
         </>
       )}
     </View>
@@ -1206,6 +1257,64 @@ const styles = createThemedStyles(() =>
       color: colors.dark.textMuted,
       textAlign: 'right',
       marginTop: 8,
+    },
+    /* v1.5.7 — R1: ردیف کیف پول بلاکچین در «دارایی‌های من» */
+    bcRow: {
+      backgroundColor: colors.dark.accent + '0A',
+      borderWidth: 1,
+      borderColor: colors.dark.accent + '2E',
+      borderRadius: 10,
+      padding: 10,
+      marginTop: 6,
+      marginBottom: 2,
+    },
+    bcRowHead: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+    },
+    bcRowTexts: {
+      flex: 1,
+    },
+    bcLabel: {
+      fontSize: 11,
+      fontWeight: '800' as const,
+      color: colors.dark.text,
+    },
+    bcSub: {
+      fontSize: 9.5,
+      color: colors.dark.textSecondary,
+      marginTop: 3,
+      lineHeight: 14,
+    },
+    bcCoinsBox: {
+      marginTop: 8,
+      borderTopWidth: 1,
+      borderTopColor: colors.dark.accent + '22',
+      paddingTop: 6,
+    },
+    bcCoinRow: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      paddingVertical: 4,
+    },
+    bcCoinSym: {
+      flex: 1,
+      fontSize: 10,
+      fontWeight: '700' as const,
+      color: colors.dark.text,
+    },
+    bcCoinQty: {
+      fontSize: 10,
+      color: colors.dark.textSecondary,
+      direction: 'ltr' as const,
+    },
+    bcEmpty: {
+      fontSize: 9.5,
+      color: colors.dark.textMuted,
+      textAlign: 'center',
+      paddingVertical: 6,
     },
   })
 );

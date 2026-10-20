@@ -7,7 +7,6 @@ import {
   Pressable,
   Animated,
   Platform,
-  Alert,
   ActivityIndicator,
 } from 'react-native';
 import {
@@ -40,6 +39,7 @@ import {
   getContractAddress,
 } from '@/utils/hyperliquidApi';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 type SectionTab = 'positions' | 'spot' | 'activity';
 
 // v1.5.3 — «pnl نهنگ‌ها را وقتی روش میزنم وارد اطلاعاتشون بشم نشون بده، نه
@@ -169,7 +169,7 @@ export default function WalletDetailScreen() {
   const handleCopyAddress = useCallback(async () => {
     if (address) {
       await Clipboard.setStringAsync(address);
-      Alert.alert('کپی شد', 'آدرس کیف پول با موفقیت کپی شد');
+      ThemedAlert.alert('کپی شد', 'آدرس کیف پول با موفقیت کپی شد');
     }
   }, [address]);
 

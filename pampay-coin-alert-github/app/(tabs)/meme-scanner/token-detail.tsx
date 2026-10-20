@@ -6,7 +6,6 @@ import {
   ScrollView,
   Pressable,
   TextInput,
-  Alert,
   Animated,
   Linking,
   Platform,
@@ -43,6 +42,7 @@ import { MemeToken, MemeShortBreakdown, MemeScoreDetail, MemeExchangeConfig } fr
 import { EXCHANGES } from '@/constants/exchanges';
 import { ExchangeId } from '@/types/crypto';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 const MEME_EXCHANGE_KEY = '@meme_scanner_exchanges';
 
 async function loadExchangeConfigs(): Promise<MemeExchangeConfig[]> {
@@ -95,7 +95,7 @@ export default function MemeTokenDetailScreen() {
       if (Platform.OS !== 'web') {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }
-      Alert.alert('کپی شد', 'آدرس قرارداد کپی شد');
+      ThemedAlert.alert('کپی شد', 'آدرس قرارداد کپی شد');
     } catch {
       console.log('[MemeDetail] Copy failed');
     }
@@ -406,14 +406,14 @@ export default function MemeTokenDetailScreen() {
               style={styles.executeTradeBtn}
               onPress={() => {
                 if (!tradeApiKey.trim() || !tradeApiSecret.trim()) {
-                  Alert.alert('خطا', 'لطفاً API Key و Secret را وارد کنید');
+                  ThemedAlert.alert('خطا', 'لطفاً API Key و Secret را وارد کنید');
                   return;
                 }
                 if (!tradeQuantity.trim()) {
-                  Alert.alert('خطا', 'لطفاً حجم را وارد کنید');
+                  ThemedAlert.alert('خطا', 'لطفاً حجم را وارد کنید');
                   return;
                 }
-                Alert.alert('ارسال شد', `سفارش شورت ${token?.symbol} با حجم ${tradeQuantity} USDT ارسال شد.`);
+                ThemedAlert.alert('ارسال شد', `سفارش شورت ${token?.symbol} با حجم ${tradeQuantity} USDT ارسال شد.`);
                 setShowTradeModal(false);
               }}
             >

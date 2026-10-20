@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import { View, Text, StyleSheet, Pressable, TextInput, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, StyleSheet, Pressable, TextInput, ActivityIndicator } from 'react-native';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   RefreshCw,
@@ -23,6 +23,7 @@ import {
   ImeFuturesResult,
 } from '@/utils/imeFuturesApi';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 /**
  * GoldPredictionSection — v1.4.14
  *
@@ -306,11 +307,11 @@ function ManualEntrySheet({ onClose, onSaved }: { onClose: () => void; onSaved: 
   const save = useCallback(async () => {
     const price = parseTomanInput(priceText);
     if (!Number.isFinite(price) || price <= 0) {
-      Alert.alert('خطا', 'قیمت آتی شمش خام را به تومان وارد کنید (مثلاً 38460000)');
+      ThemedAlert.alert('خطا', 'قیمت آتی شمش خام را به تومان وارد کنید (مثلاً 38460000)');
       return;
     }
     await setImeManualEntry({ priceToman: price, expiry: `${month} ${year}`, setAt: Date.now() });
-    Alert.alert('ذخیره شد', `پیش‌بینی بر اساس ${formatFullToman(predict18From995(price))} تومان محاسبه می‌شود`);
+    ThemedAlert.alert('ذخیره شد', `پیش‌بینی بر اساس ${formatFullToman(predict18From995(price))} تومان محاسبه می‌شود`);
     onSaved();
   }, [priceText, month, year, onSaved]);
 

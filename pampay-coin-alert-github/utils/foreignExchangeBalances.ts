@@ -1085,104 +1085,149 @@ function lbankEchostr(): string {
   return s;
 }
 
-async function fetchLbank(w: ForeignWallet): Promise<ForeignBalance[]> {
-  const timestamp = Date.now().toString();
-  const echostr = lbankEchostr();
-  // v1.5.4 — کلیدهای جدید LBank از نوع RSA هستند (ارور 10203 = «روش امضا
-  // اشتباه»): اگر Secret یک کلید خصوصی RSA بود، امضا با SHA256withRSA و
-  // signature_method=«RSA» انجام می‌شود؛ در غیر این صورت HmacSHA256 مثل قبل.
-  const useRsa = isRsaSecret(w.apiSecret);
-  const signatureMethod = useRsa ? 'RSA' : 'HmacSHA256';
-  const params: Record<string, string> = {
-    api_key: w.apiKey,
-    echostr,
-    signature_method: signatureMethod,
-    timestamp,
-  };
-  // raw string = sorted key=value joined by & (NO url-encoding, per ccxt rawencode)
-  const raw = Object.keys(params)
-    .sort()
-    .map((k) => `${k}=${params[k]}`)
-    .join('&');
-  const md5Upper = md5Hex(raw).toUpperCase();
-  let sign: string;
-  if (useRsa) {
-    const rsa = rsaSignSha256(md5Upper, w.apiSecret);
-    if (!rsa) {
-      throw new Error(
-        'کلید خصوصی RSA البانک خوانده نشد — Secret کلید را کامل (از اول تا آخر، بدون کم‌وکسر) کپی کنید'
-      );
-    }
-    sign = rsa; // base64 — مثل مثال رسمی LBank (SHA256withRSA)
-  } else {
-    sign = CryptoJS.HmacSHA256(md5Upper, w.apiSecret).toString(CryptoJS.enc.Hex);
-  }
-  const all: Record<string, string> = { ...params, sign };
-  const formBody = Object.keys(all)
-    .sort()
-    .map((k) => `${k}=${encodeURIComponent(all[k])}`)
-    .join('&');
-  const res = await rawFetch('https://api.lbkex.com/v2/supplement/user_info.do', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      timestamp,
-      signature_method: signatureMethod,
+/**
+ * v1.5.7 — یک درخواست امضاشده LBank با روش مشخص (HmacSHA256 یا RSA).
+ * خروجی: { kind: 'ok', body } | { kind: 'err', code, msg } | { kind: 'net', e }
+ * جدا شد تا fetchLbank بتواند در برابر خطای 10203 («روش امضا اشتباه») خودش
+ * روش دیگر را امتحان کند و روی خطای شبکه دامنه قدیمی را هم بیازماید.
+ */
+async function lbankSignedRequest(
+  domain: string,
+  w: ForeignWallet,
+  method: 'HmacSHA256' | 'RSA'
+): Promise<
+  | { kind: 'ok'; body: Record<string, unknown> }
+  | { kind: 'err'; code: string; msg: string }
+  | { kind: 'net'; e: unknown }
+> {
+  try {
+    const timestamp = Date.now().toString();
+    const echostr = lbankEchostr();
+    const params: Record<string, string> = {
+      api_key: w.apiKey,
       echostr,
-    },
-    body: formBody,
-  });
-  const body = parseJson(res.text);
-  if (!body) {
-    // دامنه قدیمی (api.lbank.info) برای این مسیر ۴۰۴ می‌دهد؛ اگر دامنه جدید هم
-    // پاسخ JSON نداد، روی دامنه قبلی retry نمی‌کنیم چون حذف شده است.
-    throw new Error(`پاسخ نامعتبر از LBank (HTTP ${res.status}) — اگر خطا ادامه داشت اطلاع دهید`);
-  }
-  if (String(body.result) === 'true') {
-    const out: ForeignBalance[] = [];
-    // v2 shape: data: [{coin, assetAmt, freezeAmt, usableAmt, ...}]
-    const dataArr = Array.isArray(body.data) ? (body.data as Array<Record<string, unknown>>) : [];
-    if (dataArr.length > 0) {
-      for (const a of dataArr) {
-        const total = toNum(a.assetAmt);
-        const frozen = toNum(a.freezeAmt ?? a.frozenAmount);
-        const usable = toNum(a.usableAmt);
-        const avail = usable > 0 ? usable : Math.max(0, total - frozen);
-        pushBalance(out, String(a.coin ?? a.assetCode ?? ''), avail, Math.min(frozen, Math.max(0, total - avail)));
+      signature_method: method,
+      timestamp,
+    };
+    // raw string = sorted key=value joined by & (NO url-encoding, per ccxt rawencode)
+    const raw = Object.keys(params)
+      .sort()
+      .map((k) => `${k}=${params[k]}`)
+      .join('&');
+    const md5Upper = md5Hex(raw).toUpperCase();
+    let sign: string;
+    if (method === 'RSA') {
+      const rsa = rsaSignSha256(md5Upper, w.apiSecret);
+      if (!rsa) {
+        return { kind: 'err', code: '10203', msg: 'کلید RSA خوانده نشد — Secret را کامل کپی کنید' };
       }
-      return out;
-    }
-    // legacy fallback shapes (kept for safety): datas.assetList / datas map
-    const datas = (body.datas ?? {}) as Record<string, unknown>;
-    const assetList = asArray(datas.assetList);
-    if (assetList.length > 0) {
-      for (const a of assetList as Array<{
-        assetCode?: string;
-        availableAmount?: string;
-        frozenAmount?: string;
-      }>) {
-        pushBalance(out, String(a.assetCode ?? ''), toNum(a.availableAmount), toNum(a.frozenAmount));
-      }
+      sign = rsa; // base64 — مثل مثال رسمی LBank (SHA256withRSA)
     } else {
-      for (const [coin, v] of Object.entries(datas)) {
-        const row = (v ?? {}) as Record<string, unknown>;
-        if (row && typeof row === 'object') {
-          pushBalance(out, coin, toNum(row.available), toNum(row.freeze ?? row.frozen));
-        }
-      }
+      sign = CryptoJS.HmacSHA256(md5Upper, w.apiSecret).toString(CryptoJS.enc.Hex);
     }
-    // v1.5.5 — فیوچرز LBank (best-effort): اگر LBank مسیرهای فیوچرز را برای
-    // کلید API باز کند، ردیف‌های بخش فیوچرز همین‌جا اضافه می‌شوند؛ در غیر
-    // این صورت بی‌صدا [] برمی‌گردد و ولت کارت توضیح محدودیت را نشان می‌دهد.
-    try {
-      const futures = await fetchLbankFuturesBestEffort(w);
-      for (const f of futures) out.push(f);
-    } catch {}
+    const all: Record<string, string> = { ...params, sign };
+    const formBody = Object.keys(all)
+      .sort()
+      .map((k) => `${k}=${encodeURIComponent(all[k])}`)
+      .join('&');
+    const res = await rawFetch(`https://${domain}/v2/supplement/user_info.do`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        timestamp,
+        signature_method: method,
+        echostr,
+      },
+      body: formBody,
+    });
+    const body = parseJson(res.text);
+    if (!body) return { kind: 'net', e: new Error(`HTTP ${res.status}`) };
+    if (String(body.result) === 'true') return { kind: 'ok', body };
+    return { kind: 'err', code: String(body.error_code ?? ''), msg: String(body.msg ?? '') };
+  } catch (e) {
+    return { kind: 'net', e };
+  }
+}
+
+/** تبدیل پاسخ موفق user_info به ردیف‌های موجودی (شکل v2 + fallbackهای قدیمی). */
+function lbankRowsFromBody(body: Record<string, unknown>): ForeignBalance[] {
+  const out: ForeignBalance[] = [];
+  const dataArr = Array.isArray(body.data) ? (body.data as Array<Record<string, unknown>>) : [];
+  if (dataArr.length > 0) {
+    for (const a of dataArr) {
+      const total = toNum(a.assetAmt);
+      const frozen = toNum(a.freezeAmt ?? a.frozenAmount);
+      const usable = toNum(a.usableAmt);
+      const avail = usable > 0 ? usable : Math.max(0, total - frozen);
+      pushBalance(out, String(a.coin ?? a.assetCode ?? ''), avail, Math.min(frozen, Math.max(0, total - avail)));
+    }
     return out;
   }
-  const code = String(body.error_code ?? '');
-  const msg = String(body.msg ?? '');
-  throw lbankErrorMessage(code, msg);
+  // legacy fallback shapes (kept for safety): datas.assetList / datas map
+  const datas = (body.datas ?? {}) as Record<string, unknown>;
+  const assetList = asArray(datas.assetList);
+  if (assetList.length > 0) {
+    for (const a of assetList as Array<{
+      assetCode?: string;
+      availableAmount?: string;
+      frozenAmount?: string;
+    }>) {
+      pushBalance(out, String(a.assetCode ?? ''), toNum(a.availableAmount), toNum(a.frozenAmount));
+    }
+  } else {
+    for (const [coin, v] of Object.entries(datas)) {
+      const row = (v ?? {}) as Record<string, unknown>;
+      if (row && typeof row === 'object') {
+        pushBalance(out, coin, toNum(row.available), toNum(row.freeze ?? row.frozen));
+      }
+    }
+  }
+  return out;
+}
+
+async function fetchLbank(w: ForeignWallet): Promise<ForeignBalance[]> {
+  // v1.5.4/v1.5.7 — کلیدهای LBank دو نوع‌اند: Secret کوتاه (HmacSHA256) و
+  // Secret طولانی PEM (RSA). اگر نوع کلید اشتباه تشخیص داده شود، سرور کد
+  // 10203 («روش امضا با کلید هماهنگ نیست») می‌دهد → v1.5.7 همان‌جا روش دیگر
+  // را خودکار امتحان می‌کند تا «بخش ارز دیجیتال البانک کار نکند» ریشه‌کن شود.
+  const primary: 'HmacSHA256' | 'RSA' = isRsaSecret(w.apiSecret) ? 'RSA' : 'HmacSHA256';
+  const secondary: 'HmacSHA256' | 'RSA' = primary === 'RSA' ? 'HmacSHA256' : 'RSA';
+
+  let lastErr: { code: string; msg: string } | null = null;
+  for (const method of [primary, secondary]) {
+    const res = await lbankSignedRequest('api.lbkex.com', w, method);
+    if (res.kind === 'ok') {
+      const out = lbankRowsFromBody(res.body);
+      // v1.5.5/v1.5.7 — فیوچرز LBank (best-effort): اگر LBank مسیرهای فیوچرز را
+      // برای کلید API باز کند، ردیف‌های بخش فیوچرز همین‌جا اضافه می‌شوند.
+      try {
+        const futures = await fetchLbankFuturesBestEffort(w);
+        for (const f of futures) out.push(f);
+      } catch {}
+      return out;
+    }
+    if (res.kind === 'net') {
+      // دامنه رسمی جدید بی‌جواب بود → یک‌بار دامنه قدیمی هم امتحان می‌شود
+      // (در بررسی تجربی هنوز جواب می‌دهد؛ دامنه اصلی lbkex.com می‌ماند).
+      const legacy = await lbankSignedRequest('api.lbank.info', w, method);
+      if (legacy.kind === 'ok') {
+        const out = lbankRowsFromBody(legacy.body);
+        try {
+          const futures = await fetchLbankFuturesBestEffort(w);
+          for (const f of futures) out.push(f);
+        } catch {}
+        return out;
+      }
+      if (legacy.kind === 'err') lastErr = { code: legacy.code, msg: legacy.msg };
+      continue;
+    }
+    if (res.code !== '10203') {
+      throw lbankErrorMessage(res.code, res.msg);
+    }
+    lastErr = { code: res.code, msg: res.msg };
+  }
+  // هر دو روش امضا 10203 دادند — پیام راهنما (کلید ناقص/ناهماهنگ)
+  throw lbankErrorMessage('10203', lastErr?.msg ?? '');
 }
 
 // ---------------------------------------------------------------------------

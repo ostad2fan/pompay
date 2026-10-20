@@ -6,7 +6,6 @@ import {
   ScrollView,
   Pressable,
   TextInput,
-  Alert,
   ActivityIndicator,
   Platform,
 } from 'react-native';
@@ -40,6 +39,8 @@ import { EXCHANGE_LIST } from '@/constants/exchanges';
 import { ExchangeId } from '@/types/crypto';
 import DropdownPicker from '@/components/DropdownPicker';
 import VpnWarningBanner from '@/components/VpnWarningBanner';
+// v1.5.7 — همه پیغام‌ها با مودال درون‌برنامه‌ای هماهنگ با تم
+import { ThemedAlert } from '@/components/ThemedAlert';
 import { isForeignExchange, checkVpnStatus, VpnStatus } from '@/utils/vpnGuard';
 import { isSanctionedIpMessage, sanctionedIpText } from '@/utils/geoBlock';
 import { useApp } from '@/contexts/AppContext';
@@ -2088,15 +2089,12 @@ export default function WalletScreen() {
   // 4th tab «کیف پول بلاکچین» (read-only blockchain wallets):
   //   ۱. ارز دیجیتال   ۲. دارایی ریالی و فلزات   ۳. پیش‌بینی طلا   ۴. کیف پول بلاکچین
   // Persisted so the user returns to the tab they last used.
-  const [activeMainTab, setActiveMainTab] = useState<'crypto' | 'rial' | 'gold' | 'blockchain'>('crypto');
-  useEffect(() => {
-    AsyncStorage.getItem('@wallet_main_tab_v1').then((t) => {
-      if (t === 'rial' || t === 'gold' || t === 'crypto' || t === 'blockchain') setActiveMainTab(t);
-    }).catch(() => {});
-  }, []);
+  // v1.5.7 — R8: «وقتی وارد تب مدیریت دارایی می‌شم همیشه تب ریالی و فلزات اول
+  // بهم نشون داده بشه» — دیگر آخرین تبِ بازشده ذخیره/بازیابی نمی‌شود؛ هر بار
+  // ورود به «مدیریت دارایی» همیشه از «دارایی ریالی و فلزات» شروع می‌شود.
+  const [activeMainTab, setActiveMainTab] = useState<'crypto' | 'rial' | 'gold' | 'blockchain'>('rial');
   const switchMainTab = useCallback((t: 'crypto' | 'rial' | 'gold' | 'blockchain') => {
     setActiveMainTab(t);
-    AsyncStorage.setItem('@wallet_main_tab_v1', t).catch(() => {});
   }, []);
   const [selectedExchange, setSelectedExchange] = useState<ExchangeId>('binance');
   const [newApiKey, setNewApiKey] = useState('');
@@ -2350,6 +2348,24 @@ export default function WalletScreen() {
   );
   const blockchainToman = usdtToToman > 0 ? blockchainTotalUsd * usdtToToman : 0;
 
+  // v1.5.7 — R1: «در قسمت دارایی من موجودی کیف پول بلاکچین و ارز دیجیتالشون
+  // رو بده» — تجمیع توکن‌های همه‌ی کیف‌پول‌های بلاکچین (برای ردیف داخل
+  // «دارایی‌های من» در تب دارایی ریالی و فلزات).
+  const blockchainCoins = useMemo(() => {
+    const bySymbol: Record<string, { symbol: string; name: string; qty: number; valueUsd: number }> = {};
+    for (const w of bcWallets) {
+      const d = bcBalanceByWallet[w.id]?.data;
+      if (!d?.tokens) continue;
+      for (const t of d.tokens) {
+        if (!(t.qty > 0)) continue;
+        const row = (bySymbol[t.symbol] ??= { symbol: t.symbol, name: t.name ?? t.symbol, qty: 0, valueUsd: 0 });
+        row.qty += t.qty;
+        row.valueUsd += t.valueUsd ?? 0;
+      }
+    }
+    return Object.values(bySymbol).sort((a, b) => b.valueUsd - a.valueUsd).slice(0, 8);
+  }, [bcWallets, bcBalanceByWallet]);
+
   // PnL over all four periods at once — keyed by the aggregated holdings so
   // it recomputes whenever balances change (qty/asset shifts).
   const bcTokensKey = useMemo(
@@ -2480,7 +2496,7 @@ export default function WalletScreen() {
     ): Promise<boolean> => {
       const v = validateAddressForNetworks(networks, address, networkAddresses);
       if (!v.ok) {
-        Alert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
+        ThemedAlert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
         return false;
       }
       const wallet: BlockchainWallet = {
@@ -2524,7 +2540,7 @@ export default function WalletScreen() {
       }
       const v = validateAddressForNetworks(networks, target.address, cleanPer);
       if (!v.ok) {
-        Alert.alert(
+        ThemedAlert.alert(
           'شبکه با آدرس نمی‌خواند',
           `${v.message}`
         );
@@ -2554,7 +2570,7 @@ export default function WalletScreen() {
 
   const handleRemoveBlockchainWallet = useCallback(
     (id: string, name: string) => {
-      Alert.alert('حذف کیف پول', `آیا از حذف "${name}" اطمینان دارید؟`, [
+      ThemedAlert.alert('حذف کیف پول', `آیا از حذف "${name}" اطمینان دارید؟`, [
         { text: 'لغو', style: 'cancel' },
         {
           text: 'حذف',
@@ -2608,7 +2624,7 @@ export default function WalletScreen() {
 
   const handleSendOtp = useCallback(async () => {
     if (!newApiKey.trim()) {
-      Alert.alert('خطا', 'ابتدا ایمیل حساب BitPerp را وارد کنید');
+      ThemedAlert.alert('خطا', 'ابتدا ایمیل حساب BitPerp را وارد کنید');
       return;
     }
     setOtpBusy(true);
@@ -2624,15 +2640,15 @@ export default function WalletScreen() {
 
   const handleAddWallet = useCallback(async () => {
     if (!newApiKey.trim()) {
-      Alert.alert('خطا', isBitperp ? 'لطفاً ایمیل حساب BitPerp را وارد کنید' : 'لطفاً API Key را وارد کنید');
+      ThemedAlert.alert('خطا', isBitperp ? 'لطفاً ایمیل حساب BitPerp را وارد کنید' : 'لطفاً API Key را وارد کنید');
       return;
     }
     if (!newApiSecret.trim()) {
-      Alert.alert('خطا', isBitperp ? 'لطفاً کد یکبارمصرف (OTP) را وارد کنید' : 'لطفاً API Secret را وارد کنید');
+      ThemedAlert.alert('خطا', isBitperp ? 'لطفاً کد یکبارمصرف (OTP) را وارد کنید' : 'لطفاً API Secret را وارد کنید');
       return;
     }
     if (needsPassphrase && !newPassphrase.trim()) {
-      Alert.alert('خطا', 'لطفاً Passphrase را وارد کنید');
+      ThemedAlert.alert('خطا', 'لطفاً Passphrase را وارد کنید');
       return;
     }
 
@@ -2647,7 +2663,7 @@ export default function WalletScreen() {
       setOtpBusy(false);
       if (!v.ok || !v.tokens) {
         setOtpStatus(`❌ ${v.error ?? 'کد تأیید ناموفق بود'}`);
-        Alert.alert('خطا', v.error ?? 'کد یکبارمصرف اشتباه است یا منقضی شده');
+        ThemedAlert.alert('خطا', v.error ?? 'کد یکبارمصرف اشتباه است یا منقضی شده');
         return;
       }
       const newWallet: ExchangeWallet = {
@@ -2665,7 +2681,7 @@ export default function WalletScreen() {
       setNewPassphrase('');
       setOtpStatus(null);
       setShowAddForm(false);
-      Alert.alert('موفق', 'صرافی بیت‌پرپ متصل شد — موجودی و پوزیشن‌هایتان نمایش داده می‌شود');
+      ThemedAlert.alert('موفق', 'صرافی بیت‌پرپ متصل شد — موجودی و پوزیشن‌هایتان نمایش داده می‌شود');
       return;
     }
 
@@ -2685,7 +2701,7 @@ export default function WalletScreen() {
     setNewApiSecret('');
     setNewPassphrase('');
     setShowAddForm(false);
-    Alert.alert('موفق', `صرافی ${exchangeInfo?.name} اضافه شد`);
+    ThemedAlert.alert('موفق', `صرافی ${exchangeInfo?.name} اضافه شد`);
   }, [newApiKey, newApiSecret, newPassphrase, selectedExchange, wallets, needsPassphrase, isBitperp, saveMutation]);
 
   // BitPerp — ورود خودکار: به‌محض کامل شدن کد ۶ رقمی، تأیید و ذخیره انجام می‌شود
@@ -2704,7 +2720,7 @@ export default function WalletScreen() {
 
   const handleRemoveWallet = useCallback(
     (id: string, name: string) => {
-      Alert.alert('حذف صرافی', `آیا از حذف "${name}" اطمینان دارید؟`, [
+      ThemedAlert.alert('حذف صرافی', `آیا از حذف "${name}" اطمینان دارید؟`, [
         { text: 'لغو', style: 'cancel' },
         {
           text: 'حذف',
@@ -3071,6 +3087,8 @@ export default function WalletScreen() {
             blockchainToman={blockchainToman}
             hasBlockchainWallet={hasBlockchainWallet}
             blockchainPnlTomanByPeriod={blockchainPnlTomanByPeriod}
+            blockchainTotalUsd={blockchainTotalUsd}
+            blockchainCoins={blockchainCoins}
           />
         </>
       )}
@@ -3171,7 +3189,7 @@ function WalletItem({
   useEffect(() => {
     if (!sanctionedIp || sanctionedDialogShown.current) return;
     sanctionedDialogShown.current = true;
-    Alert.alert(
+    ThemedAlert.alert(
       `صرافی ${wallet.exchangeName} تحریم است`,
       `IP خروجی فیلترشکن شما توسط این صرافی بلاک جغرافیایی شده (کشور تحریمی/محدود).\n\nبقیه صرافی‌ها اوکی هستند و به کار خود ادامه می‌دهند — می‌توانید فقط همین صرافی را قطع کنید یا با یک IP غیرتحریمی (کشور دیگر) دوباره تلاش کنید.`,
       [

@@ -334,25 +334,46 @@ export async function loadAutoSettings(): Promise<AutoTradeSettings> {
       initialCapitalUsd: typeof parsed.initialCapitalUsd === 'number' && parsed.initialCapitalUsd > 0 ? parsed.initialCapitalUsd : DEFAULT_AUTO_SETTINGS.initialCapitalUsd,
       server247: { ...DEFAULT_AUTO_SETTINGS.server247, ...parsed.server247 },
     };
-    // v1.5.5 — حذف کامل «اعلام تلگرام ۲۴/۷ (سرور)»: بازخورد کاربر — روشن
-    // کردنش چرخه محلی را قطع می‌کرد و نه در برنامه نه در تلگرام چیزی
-    // نمی‌آمد؛ خاموش هم برنامه و هم تلگرام کار می‌کردند. سوییچ حذف شد و
-    // فلگ همیشه خاموش است. اگر قبلاً روشن بوده و سرور فعال است، یک بار
-    // (fire-and-forget) کانفیگ خاموش به سرور می‌رود تا ربات سرور هم بی‌صدا
-    // متوقف شود — پیام «ربات متوقف شد» دیگر ارسال/ثبت نمی‌شود.
-    if (merged.server247.enabled) {
-      merged.server247 = { enabled: false };
-      void pushAutoTradeConfigToServer(merged).catch(() => {});
-      await saveAutoSettings(merged);
-    }
+    // v1.5.7 — حذف مهاجرتِ «خاموش‌کردن قهوه‌ای server247» (v1.5.5): کاربر
+    // می‌خواهد اعلان‌های بک‌تست با برنامه بسته هم در تلگرام بیاید (مثل
+    // اسکنرهای میم‌کوین). حالت ۲۴/۷ دیگر سوییچ دستی نیست؛ وقتی ربات روشن
+    // باشد + آدرس سرور + توکن تلگرام تنظیم باشند، خودکار فعال می‌شود
+    // (enabled = settings.enabled && telegram در pushAutoTradeConfigToServer).
     return merged;
   } catch {
     return DEFAULT_AUTO_SETTINGS;
   }
 }
 
+// ---------------------------------------------------------------------------
+// v1.5.7 — تنظیماتِ خودکار: pub/sub کوچک برای تغییرات بیرونی.
+// «طبق توضیحاتی که درون برنامه دادی با روشن کردن هر استراتژی تنظیمات با
+// همون پارامترهای استراتژی پر نمیشه» — ریشه‌ی باگ: auto-trade.tsx پریست
+// استراتژی را در storage می‌نوشت ولی کامپوننتِ ربات state کهنه داشت و
+// persist بعدی همان مقادیر کهنه را برمی‌گرداند. حالا saveAutoSettings به
+// شنونده‌ها خبر می‌دهد و AutoTradingBotSection تنظیمات را دوباره می‌خواند
+// (اگر خودش ننوشته باشد) — پریست استراتژی هم لحظه‌ای در جدول دیده می‌شود
+// و دیگر با نوشتنِ بعدی پاک نمی‌شود.
+// ---------------------------------------------------------------------------
+
+type AutoSettingsListener = (s: AutoTradeSettings) => void;
+const autoSettingsListeners = new Set<AutoSettingsListener>();
+
+/** اشتراک در تغییرات تنظیمات ربات (برای UI زنده). خروجی = لغو اشتراک. */
+export function subscribeAutoSettings(cb: AutoSettingsListener): () => void {
+  autoSettingsListeners.add(cb);
+  return () => {
+    autoSettingsListeners.delete(cb);
+  };
+}
+
 export async function saveAutoSettings(s: AutoTradeSettings): Promise<void> {
   await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  for (const cb of autoSettingsListeners) {
+    try {
+      cb(s);
+    } catch {}
+  }
 }
 
 export async function loadDemoPositions(): Promise<DemoAutoPosition[]> {
@@ -572,10 +593,13 @@ async function currentStrategyLabel(): Promise<string> {
   }
 }
 
-/** v1.5.3 — اعلام تلگرام سمت برنامه (وقتی برنامه باز است حتی بدون سرور ۲۴/۷). */
+/** v1.5.3 — اعلام تلگرام سمت برنامه (وقتی برنامه باز است حتی بدون سرور ۲۴/۷).
+ *  v1.5.7 — وقتی حالت سرور ۲۴/۷ فعال است، سرور خودش اعلام می‌کند؛ اعلام
+ *  محلی قطع می‌شود تا هر رخداد فقط یک بار به تلگرام برسد. */
 async function announceTelegram(title: string, text: string): Promise<void> {
   try {
     if (Platform.OS === 'web') return;
+    if (await isServerModeActive()) return; // سرور اعلام می‌کند — بدون تکرار
     const raw = await AsyncStorage.getItem('@crypto_scanner_settings');
     if (!raw) return;
     const s = JSON.parse(raw) as { telegramEnabled?: boolean; telegramBotToken?: string; telegramChatId?: string };
@@ -1819,7 +1843,7 @@ export async function resetDemoBacktest(): Promise<{ local: boolean; server: { o
   let server: { ok: boolean; error?: string } = { ok: false };
   try {
     const settings = await loadAutoSettings();
-    if (settings.server247.enabled && (await isServerModeActive())) {
+    if (await isServerModeActive()) {
       server = await pushAutoTradeConfigToServer(settings, true);
     }
   } catch {}
@@ -1910,9 +1934,9 @@ export async function runLightMtm(): Promise<void> {
   try {
     const settings = await loadAutoSettings();
     if (!settings.enabled) return;
-    // حالت سرور ۲۴/۷: state سرور sync می‌شود (سرور خودش چرخه می‌زند).
+    // حالت سرور ۲۴/۷ (خودکار v1.5.7): state سرور sync می‌شود (سرور خودش چرخه می‌زند).
     // v1.5.4 — اگر sync ناموفق بود، MTM محلی ادامه می‌دهد (ربات ساکت نشود).
-    if (settings.server247.enabled && (await isServerModeActive())) {
+    if (await isServerModeActive()) {
       const synced = await syncAutoTradeStateFromServer();
       if (synced) return;
     }
@@ -1965,6 +1989,41 @@ export async function isAutoServerModeActive(): Promise<boolean> {
   return isServerModeActive();
 }
 
+/**
+ * v1.5.7 — وضعیت ۲۴/۷ برای نشانِ داخل کارت ربات:
+ *   active: سرور ربات را اجرا می‌کند و اعلان‌ها حتی با برنامه بسته می‌آیند.
+ *   inactive + reason: دقیقاً می‌گوید چرا (سرور تنظیم نشده / تلگرام تنظیم
+ *   نشده / آخرین push خطا داده / ربات خاموش).
+ */
+export interface AutoServerStatus {
+  active: boolean;
+  reason: string;
+  lastPushError?: string;
+}
+
+export async function getAutoServerStatus(): Promise<AutoServerStatus> {
+  const base = await getServerUrl().catch(() => '');
+  if (!base) {
+    return { active: false, reason: 'آدرس سرور (Railway) در تنظیمات ثبت نشده — اعلان با برنامه بسته فقط با سرور ممکن است' };
+  }
+  const creds = await loadTelegramAnnounceCreds();
+  if (!creds) {
+    return { active: false, reason: 'توکن ربات/چت‌آیدی تلگرام در تنظیمات ثبت نشده — برای اعلان ۲۴/۷ تلگرام لازم است' };
+  }
+  const settings = await loadAutoSettings();
+  if (!settings.enabled) {
+    return { active: false, reason: 'ربات روشن نیست — با روشن کردن ربات، حالت ۲۴/۷ خودکار فعال می‌شود' };
+  }
+  const active = await isServerModeActive();
+  if (active) {
+    return { active: true, reason: 'سرور ربات را ۲۴/۷ اجرا می‌کند — اعلان‌های باز/بسته شدن حتی با برنامه بسته به تلگرام می‌آید' };
+  }
+  return {
+    active: false,
+    reason: 'اتصال به سرور برقرار نشد — با ذخیره تنظیمات/باز شدن برنامه دوباره تلاش می‌شود؛ اگر خطا ماند سرور Railway را redeploy کنید',
+  };
+}
+
 export interface ServerAutoTradeState {
   ok: boolean;
   enabled: boolean;
@@ -2006,7 +2065,12 @@ export async function pushAutoTradeConfigToServer(
     const base = await getServerUrl();
     if (!base) return { ok: false, error: 'آدرس سرور تنظیم نشده' };
     const secret = await getInstallSecret();
-    const serverEnabled = settings.enabled && settings.server247.enabled;
+    // v1.5.7 — حالت ۲۴/۷ خودکار (بدون سوییچ دستی): ربات روشن + توکن تلگرام
+    // برنامه (@crypto_scanner_settings) تنظیم باشد → سرور ربات را ۲۴/۷ اجرا
+    // می‌کند و همه‌ی باز/بسته‌شدن‌ها را با برنامه بسته هم به تلگرام می‌فرستد
+    // (همان الگوی اسکنر میم‌کوین). بدون تلگرام سروری کاری برای اعلام ندارد.
+    const telegram = await loadTelegramAnnounceCreds();
+    const serverEnabled = settings.enabled && !!telegram;
     const keys = settings.mode === 'real' && serverEnabled ? await loadRealKeys() : undefined;
     if (settings.mode === 'real' && serverEnabled && !keys) {
       return { ok: false, error: 'کلید API بایننس برای حالت واقعی پیدا نشد' };
@@ -2017,20 +2081,19 @@ export async function pushAutoTradeConfigToServer(
     let demoPositions: DemoAutoPosition[] = [];
     let realPositions: RealAutoPosition[] = [];
     let logs: AutoEngineLog[] = [];
-    let telegram: { botToken: string; chatId: string } | undefined;
     if (!reset) {
-      [demoPositions, realPositions, logs, telegram] = await Promise.all([
+      [demoPositions, realPositions, logs] = await Promise.all([
         loadDemoPositions(),
         loadRealPositions(),
         getAutoLogs(),
-        loadTelegramAnnounceCreds(),
       ]);
     }
     const payload = {
       secret,
       config: {
-        // سرور فقط وقتی اجرا می‌شود که هم سوییچ ۲۴/۷ روشن باشد و هم خود ربات
-        enabled: settings.enabled && settings.server247.enabled,
+        // v1.5.7 — سرور وقتی اجرا می‌شود که ربات روشن باشد و تلگرام تنظیم
+        // باشد (حالت ۲۴/۷ خودکار — بدون سوییچ دستی).
+        enabled: serverEnabled,
         mode: settings.mode,
         whale: settings.whale,
         indicators: settings.indicators,
@@ -2045,12 +2108,12 @@ export async function pushAutoTradeConfigToServer(
         // v1.5.3 — برچسب استراتژی فعال + پرچم ریست کامل دمو
         strategyLabel: await currentStrategyLabel(),
         reset,
-        // v1.5.4 — توکن تلگرام برنامه → اعلان‌های ۲۴/۷ سرور بدون تنظیم جداگانه
+        // v1.5.4/v1.5.7 — توکن تلگرام برنامه → اعلان‌های ۲۴/۷ سرور بدون تنظیم جداگانه
         telegram,
         // v1.5.4 — وضعیت فعلی بک‌تست (سرور از همین‌جا ادامه می‌دهد)
         state: {
-          demoPositions: demoPositions.slice(0, 200),
-          realPositions: realPositions.slice(0, 200),
+          demoPositions: demoPositions.slice(0, 600),
+          realPositions: realPositions.slice(0, 600),
           logs: logs.slice(0, 60),
         },
         binanceKeys: keys ? { apiKey: keys.apiKey, apiSecret: keys.apiSecret } : undefined,
@@ -2064,7 +2127,7 @@ export async function pushAutoTradeConfigToServer(
     const data = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; telegramConfigured?: boolean };
     if (res.ok && data?.ok) {
       await setServerModeActive(serverEnabled);
-      return { ok: true, telegramConfigured: data?.telegramConfigured };
+      return { ok: true, telegramConfigured: !!telegram || !!data?.telegramConfigured };
     }
     await setServerModeActive(false);
     // v1.5.3 — 404 = سرور هنوز کد موتور بک‌تست را ندارد (Railway دوباره deploy نشده)
@@ -2084,7 +2147,7 @@ export async function pushAutoTradeConfigToServer(
 export async function syncAutoTradeStateFromServer(): Promise<boolean> {
   try {
     const settings = await loadAutoSettings();
-    if (!settings.server247.enabled) return false;
+    if (!settings.enabled) return false;
     const base = await getServerUrl();
     if (!base) return false;
     const secret = await getInstallSecret();

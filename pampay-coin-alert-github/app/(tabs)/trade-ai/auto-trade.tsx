@@ -20,13 +20,14 @@ import {
   StyleSheet,
   ScrollView,
   Switch,
-  Alert,
 } from 'react-native';
 import { useQueryClient } from '@tanstack/react-query';
 import { Bot, Gauge } from 'lucide-react-native';
 import colors from '@/constants/colors';
 import TradeAiSegmentHeader from '@/components/TradeAiSegmentHeader';
 import AutoTradingBotSection from '@/components/AutoTradingBotSection';
+import FeasibilityCalculator from '@/components/FeasibilityCalculator';
+import { ThemedAlert } from '@/components/ThemedAlert';
 import {
   EnabledStrategies,
   STRATEGY_ORDER,
@@ -55,7 +56,7 @@ export default function AutoTradeScreen() {
       setEnabledStrategies((prev) => {
         const next = { ...prev, [key]: !prev[key] };
         if (!STRATEGY_ORDER.some((s) => next[s])) {
-          Alert.alert('غیرممکن', 'حداقل یک استراتژی باید روشن باشد.');
+          ThemedAlert.alert('غیرممکن', 'حداقل یک استراتژی باید روشن باشد.');
           return prev;
         }
         void saveEnabledStrategies(next).then(() => {
@@ -64,6 +65,9 @@ export default function AutoTradeScreen() {
         // v1.5.3 — «هر نوع استراتژی انتخاب میکنم بک‌تست طبق همون جدولشو پر کنه»:
         // با روشن شدن هر استراتژی، جدول تنظیمات هر معامله ربات با پارامترهای
         // همان استراتژی هم‌مقدار می‌شود (اسکالپر → لوریج ۷ / حد ضرر ۱٪ / RR ۱.۲).
+        // v1.5.7 — R7 ریشه‌ی باگ «پر نمیشه برام اصلا»: saveAutoSettings حالا به
+        // کامپوننت ربات خبر می‌دهد (subscribeAutoSettings) → جدول همان لحظه
+        // پریست را نشان می‌دهد و persistهای بعدی مقدار کهنه را برنمی‌گردانند.
         if (next[key]) {
           const preset = STRATEGY_CONFIGS[key];
           void (async () => {
@@ -76,6 +80,10 @@ export default function AutoTradeScreen() {
                 rewardRatio: preset.takeProfitMultiplier,
               };
               await saveAutoSettings(updated);
+              ThemedAlert.alert(
+                'جدول با استراتژی مچ شد ✅',
+                `تنظیمات هر معامله با پارامترهای «${preset.name}» پر شد:\nلوریج ${preset.maxLeverage}x • حد ضرر ${preset.stopLossPercent}٪ • ریوارد ${preset.takeProfitMultiplier}`
+              );
             } catch {}
           })();
         }
@@ -137,6 +145,9 @@ export default function AutoTradeScreen() {
 
         {/* ربات بک‌تست */}
         <AutoTradingBotSection />
+
+        {/* v1.5.7 — R9: محاسبه‌گر بک‌تست واقعی (کارمزد صرافی) */}
+        <FeasibilityCalculator />
 
         <View style={styles.disclaimer}>
           <Bot size={14} color={colors.dark.textMuted} />

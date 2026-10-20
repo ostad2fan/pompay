@@ -216,7 +216,7 @@ function sanitizePositions(rows: unknown[] | undefined): BtPosition[] {
       partialsDone: p.partialsDone !== undefined ? num(p.partialsDone) : undefined,
     });
   }
-  return out.slice(0, 200);
+  return out.slice(0, 600);
 }
 
 function sanitizeLogs(rows: unknown[] | undefined): BtLog[] {
@@ -1101,7 +1101,21 @@ export async function runBacktestCycle(): Promise<void> {
     }
 
     st.updatedAt = Date.now();
-    await putConfig(st);
+    // v1.5.7 — STALE-WRITE GUARD (test-caught): the cycle reads the config at
+    // its START; a config push that arrives mid-cycle (from the app) must NOT
+    // be clobbered by this putConfig. cfg is config-push-owned → newest stored
+    // wins; only the cycle-owned fields (whaleSnapshot/lastSignalAt/daily/
+    // lossStreak) come from this cycle. این همان ریشه‌ی «تنظیمات لحظه‌ای اعمال
+    // نمی‌شود / سوییچ که روشن می‌شد همه‌چیز قطع می‌شد» بود.
+    const latestCfgDoc = await getConfig();
+    await putConfig({
+      cfg: latestCfgDoc?.cfg ?? st.cfg,
+      whaleSnapshot: st.whaleSnapshot,
+      lastSignalAt: st.lastSignalAt,
+      daily: st.daily,
+      lossStreak: st.lossStreak,
+      updatedAt: st.updatedAt,
+    });
     const state = await getState();
     await putState({ ...state, lastCycleAt: Date.now() });
   } catch (e) {
@@ -1142,6 +1156,12 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
     return { status: 403, payload: { ok: false, error: "راز نصب مطابقت ندارد — از همان گوشی که پیکربندی سرور را ثبت کرده فعال کنید" } };
   }
   const c = b.config ?? {};
+  // v1.5.7 — BUG FIX: the app sends `reset` inside `config` (config.reset),
+  // but the server only read the top-level `reset` — so the app's «ریست کامل
+  // دمو» never actually wiped the server state in 24/7 mode. Both are accepted now.
+  const resetFlag =
+    (b as { reset?: unknown }).reset === true ||
+    (c as { reset?: unknown }).reset === true;
   const prev = await getConfig();
   const cfg: AutoCfg = {
     enabled: Boolean(c.enabled),
@@ -1205,7 +1225,7 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
   // فقط وقتی state سرور «دختر/خام» است seed می‌کنیم (نه روی state فعال سرور).
   const cur = await getState();
   const virginState = cur.demo.length === 0 && cur.real.length === 0 && cur.logs.length === 0 && cur.lastCycleAt === null;
-  if (!b.reset && virginState && b.config?.state) {
+  if (!resetFlag && virginState && b.config?.state) {
     const seedDemo = sanitizePositions(b.config.state.demoPositions);
     const seedReal = sanitizePositions(b.config.state.realPositions);
     const seedLogs = sanitizeLogs(b.config.state.logs);
@@ -1223,7 +1243,7 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
   await putConfig(st);
 
   // v1.5.3 — «ریست کامل دمو»: همه‌چیز (حتی تاریخچه) پاک شود
-  if (b.reset) {
+  if (resetFlag) {
     await putState({ demo: [], real: [], logs: [], lastCycleAt: null });
     st.whaleSnapshot = [];
     st.lastSignalAt = Date.now();
@@ -1293,8 +1313,8 @@ export async function getAutoTradeStateFor(secret: string): Promise<{ status: nu
       mode: st?.cfg.mode ?? "demo",
       strategyLabel: st?.cfg.strategyLabel ?? null,
       telegramConfigured,
-      demoPositions: state.demo.slice(0, 200),
-      realPositions: state.real.slice(0, 200),
+      demoPositions: state.demo.slice(0, 600),
+      realPositions: state.real.slice(0, 600),
       logs: state.logs.slice(0, 60),
       lastCycleAt: state.lastCycleAt ?? null,
       serverNow: Date.now(),

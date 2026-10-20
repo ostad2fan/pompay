@@ -6,7 +6,6 @@ import {
   TextInput,
   Pressable,
   FlatList,
-  Alert,
   Animated,
   Platform,
 } from 'react-native';
@@ -36,6 +35,7 @@ import { MOCK_TOP_WHALES } from '@/mocks/whales';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 const TRACKED_WALLETS_KEY = '@tracked_whale_wallets';
 
 // v1.5.3 — PnL چیپ‌های هر نهنگ از کارت لیست حذف شد و به صفحه اطلاعات نهنگ
@@ -135,16 +135,16 @@ export default function WhaleTrackerScreen() {
 
   const handleAddWallet = useCallback(() => {
     if (!addressInput.trim()) {
-      Alert.alert('خطا', 'لطفاً آدرس کیف پول را وارد کنید');
+      ThemedAlert.alert('خطا', 'لطفاً آدرس کیف پول را وارد کنید');
       return;
     }
     if (addressInput.trim().length < 10) {
-      Alert.alert('خطا', 'آدرس کیف پول نامعتبر است');
+      ThemedAlert.alert('خطا', 'آدرس کیف پول نامعتبر است');
       return;
     }
     const exists = trackedWallets.some((w) => w.address === addressInput.trim());
     if (exists) {
-      Alert.alert('توجه', 'این آدرس قبلاً در لیست ردیابی شماست');
+      ThemedAlert.alert('توجه', 'این آدرس قبلاً در لیست ردیابی شماست');
       return;
     }
     const newWallet: WhaleWallet = {
@@ -164,7 +164,7 @@ export default function WhaleTrackerScreen() {
 
   const handleRemoveWallet = useCallback(
     (id: string) => {
-      Alert.alert('حذف نهنگ', 'آیا از حذف این نهنگ از لیست ردیابی اطمینان دارید؟', [
+      ThemedAlert.alert('حذف نهنگ', 'آیا از حذف این نهنگ از لیست ردیابی اطمینان دارید؟', [
         { text: 'انصراف', style: 'cancel' },
         {
           text: 'حذف',
@@ -183,7 +183,7 @@ export default function WhaleTrackerScreen() {
     (whale: TopWhale) => {
       const exists = trackedWallets.some((w) => w.address === whale.address);
       if (exists) {
-        Alert.alert('حذف از لیست ردیابی', `آیا می‌خواهید "${whale.label}" را از لیست ردیابی حذف کنید؟`, [
+        ThemedAlert.alert('حذف از لیست ردیابی', `آیا می‌خواهید "${whale.label}" را از لیست ردیابی حذف کنید؟`, [
           { text: 'انصراف', style: 'cancel' },
           {
             text: 'حذف',
@@ -191,7 +191,7 @@ export default function WhaleTrackerScreen() {
             onPress: () => {
               const updated = trackedWallets.filter((w) => w.address !== whale.address);
               saveMutation.mutate(updated);
-              Alert.alert('حذف شد', `${whale.label} از لیست ردیابی حذف شد`);
+              ThemedAlert.alert('حذف شد', `${whale.label} از لیست ردیابی حذف شد`);
             },
           },
         ]);
@@ -207,7 +207,7 @@ export default function WhaleTrackerScreen() {
       };
       const updated = [...trackedWallets, newWallet];
       saveMutation.mutate(updated);
-      Alert.alert('موفق', `${whale.label} به لیست ردیابی اضافه شد`);
+      ThemedAlert.alert('موفق', `${whale.label} به لیست ردیابی اضافه شد`);
     },
     [trackedWallets]
   );
@@ -215,7 +215,7 @@ export default function WhaleTrackerScreen() {
   const handleCopyAddress = useCallback(async (address: string) => {
     try {
       await Clipboard.setStringAsync(address);
-      Alert.alert('کپی شد', 'آدرس کیف پول کپی شد');
+      ThemedAlert.alert('کپی شد', 'آدرس کیف پول کپی شد');
     } catch {
       console.log('[WhaleTracker] Copy failed');
     }

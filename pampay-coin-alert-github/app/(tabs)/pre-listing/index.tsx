@@ -6,7 +6,6 @@ import {
   FlatList,
   Pressable,
   TextInput,
-  Alert,
   Animated,
   ActivityIndicator,
   ScrollView,
@@ -42,6 +41,7 @@ import { useApp } from '@/contexts/AppContext';
 import { useVpnGate } from '@/contexts/VpnGateContext';
 import { sendTelegramPreListingAlert } from '@/utils/telegramService';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 interface PreListingToken {
   id: string;
   name: string;
@@ -283,7 +283,7 @@ export default function PreListingScreen() {
     try {
       await Clipboard.setStringAsync(address);
       if (Platform.OS !== 'web') Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      Alert.alert('کپی شد', 'آدرس قرارداد کپی شد');
+      ThemedAlert.alert('کپی شد', 'آدرس قرارداد کپی شد');
     } catch {}
   }, []);
 

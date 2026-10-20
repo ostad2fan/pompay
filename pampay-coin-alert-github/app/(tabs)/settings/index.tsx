@@ -7,7 +7,6 @@ import {
   Pressable,
   ScrollView,
   Switch,
-  Alert,
   Platform,
   Modal,
   FlatList,
@@ -36,6 +35,7 @@ import { ExchangeId, CustomIndicator } from '@/types/crypto';
 import DropdownPicker from '@/components/DropdownPicker';
 import IpStatusCard from '@/components/IpStatusCard';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 const POPULAR_COINS = [
   'BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE', 'ADA', 'AVAX', 'DOT', 'MATIC',
   'LINK', 'UNI', 'ATOM', 'LTC', 'ETC', 'FIL', 'APT', 'ARB', 'OP', 'SUI',
@@ -305,15 +305,15 @@ export default function SettingsScreen() {
     const margin = parseFloat(marginAmount);
 
     if (isNaN(interval) || interval < 10) {
-      Alert.alert('خطا', 'بازه اسکن باید حداقل ۱۰ ثانیه باشد');
+      ThemedAlert.alert('خطا', 'بازه اسکن باید حداقل ۱۰ ثانیه باشد');
       return;
     }
     if (isNaN(threshold) || threshold < 1) {
-      Alert.alert('خطا', 'آستانه حجم باید حداقل ۱ باشد');
+      ThemedAlert.alert('خطا', 'آستانه حجم باید حداقل ۱ باشد');
       return;
     }
     if (isNaN(margin) || margin <= 0) {
-      Alert.alert('خطا', 'حجم مارجین باید بیشتر از صفر باشد');
+      ThemedAlert.alert('خطا', 'حجم مارجین باید بیشتر از صفر باشد');
       return;
     }
 
@@ -341,7 +341,7 @@ export default function SettingsScreen() {
       telegramEnabled,
     });
 
-    Alert.alert('ذخیره شد', 'تنظیمات با موفقیت ذخیره شد. تمام بخش‌ها بروزرسانی می‌شوند.');
+    ThemedAlert.alert('ذخیره شد', 'تنظیمات با موفقیت ذخیره شد. تمام بخش‌ها بروزرسانی می‌شوند.');
   }, [scanInterval, volumeThreshold, marginAmount, apiKey, apiSecret, scannerNotifications, whaleNotifications, memeShortNotifications, preListingNotifications, tradeAiNotifications, gainzNotifications, selectedExchange, leverage, riskRewardRatio, useCustomCoinsOnly, customCoins, refreshInterval, scanFilterMode, useVolumeOnlySignals, telegramBotToken, telegramChatId, telegramEnabled, updateSettings]);
 
   const selectedExchangeInfo = EXCHANGES[selectedExchange];
@@ -378,7 +378,7 @@ export default function SettingsScreen() {
 
   const handleAddIndicator = useCallback(() => {
     if (!indicatorCode.trim()) {
-      Alert.alert('خطا', 'کد اندیکاتور را وارد کنید');
+      ThemedAlert.alert('خطا', 'کد اندیکاتور را وارد کنید');
       return;
     }
 
@@ -420,7 +420,7 @@ export default function SettingsScreen() {
 
   const handleDeleteIndicator = useCallback(
     (id: string, name: string) => {
-      Alert.alert('حذف اندیکاتور', `آیا از حذف "${name}" اطمینان دارید؟`, [
+      ThemedAlert.alert('حذف اندیکاتور', `آیا از حذف "${name}" اطمینان دارید؟`, [
         { text: 'لغو', style: 'cancel' },
         { text: 'حذف', style: 'destructive', onPress: () => deleteIndicator(id) },
       ]);
@@ -537,7 +537,7 @@ export default function SettingsScreen() {
           style={({ pressed }) => [styles.saveApiBtn, pressed && { opacity: 0.8 }]}
           onPress={() => {
             updateSettings({ apiKey: apiKey.trim(), apiSecret: apiSecret.trim(), exchange: selectedExchange });
-            Alert.alert('ذخیره شد', `کلید API برای ${selectedExchangeInfo.name} ذخیره شد`);
+            ThemedAlert.alert('ذخیره شد', `کلید API برای ${selectedExchangeInfo.name} ذخیره شد`);
           }}
         >
           <Save size={14} color={colors.dark.background} />
@@ -1021,7 +1021,7 @@ export default function SettingsScreen() {
               style={({ pressed }) => [styles.testTelegramBtn, pressed && { opacity: 0.8 }]}
               onPress={() => {
                 if (!telegramBotToken.trim() || !telegramChatId.trim()) {
-                  Alert.alert('خطا', 'لطفاً توکن ربات و شناسه چت را وارد کنید');
+                  ThemedAlert.alert('خطا', 'لطفاً توکن ربات و شناسه چت را وارد کنید');
                   return;
                 }
                 const token = telegramBotToken.trim();
@@ -1044,10 +1044,10 @@ export default function SettingsScreen() {
                   })
                   .then(() => {
                     startTelegramPolling();
-                    Alert.alert('موفق', 'ربات تلگرام فعال شد!\n\nدستورات زیر در ربات فعال هستند:\n/status /signals /positions /balance /scanner /meme /whale /help\n\nاعلان‌ها به صورت خودکار ارسال می‌شوند.');
+                    ThemedAlert.alert('موفق', 'ربات تلگرام فعال شد!\n\nدستورات زیر در ربات فعال هستند:\n/status /signals /positions /balance /scanner /meme /whale /help\n\nاعلان‌ها به صورت خودکار ارسال می‌شوند.');
                   })
                   .catch(() => {
-                    Alert.alert('خطا', 'خطا در اتصال به سرور تلگرام');
+                    ThemedAlert.alert('خطا', 'خطا در اتصال به سرور تلگرام');
                   });
               }}
             >
@@ -1091,7 +1091,7 @@ export default function SettingsScreen() {
           disabled={serverBusy}
           onPress={async () => {
             if (!serverUrlInput.trim()) {
-              Alert.alert('خطا', 'آدرس سرور را وارد کنید');
+              ThemedAlert.alert('خطا', 'آدرس سرور را وارد کنید');
               return;
             }
             setServerBusy(true);

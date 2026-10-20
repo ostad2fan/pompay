@@ -8,7 +8,6 @@ import {
   Switch,
   TextInput,
   Modal,
-  Alert,
   ActivityIndicator,
 } from 'react-native';
 import { LineChart, Plus, RefreshCw, Trash2, Pencil, Code2, Zap, Activity } from 'lucide-react-native';
@@ -41,6 +40,7 @@ import {
   ServerSignalsResponse,
 } from '@/utils/scanServerApi';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 /** Merges server-computed signals into the local list (dedupe by id). */
 function mergeSignals<T extends { id: string }>(primary: T[], extra: T[]): T[] {
   if (extra.length === 0) return primary;
@@ -244,13 +244,13 @@ export default function IndicatorsScreen() {
     try {
       const result = await runCustomScanCycle();
       await loadCustomData();
-      Alert.alert(
+      ThemedAlert.alert(
         'اسکن کامل شد',
         result.length > 0
           ? `${result.length} سیگنال پیدا شد و به تلگرام ارسال شد.` : 'هیچ سیگنال فعالی یافت نشد.'
       );
     } catch {
-      Alert.alert('خطا', 'در حین اسکن مشکلی پیش آمد.');
+      ThemedAlert.alert('خطا', 'در حین اسکن مشکلی پیش آمد.');
     } finally {
       setIsScanningGainz(false);
     }
@@ -274,11 +274,11 @@ export default function IndicatorsScreen() {
 
   const handleSaveIndicator = async () => {
     if (!editor || !editor.name.trim()) {
-      Alert.alert('خطا', 'لطفاً یک نام برای اندیکاتور وارد کنید.');
+      ThemedAlert.alert('خطا', 'لطفاً یک نام برای اندیکاتور وارد کنید.');
       return;
     }
     if (!editor.code.trim()) {
-      Alert.alert('خطا', 'کد اندیکاتور را وارد کنید.');
+      ThemedAlert.alert('خطا', 'کد اندیکاتور را وارد کنید.');
       return;
     }
     setIsSavingIndicator(true);
@@ -295,16 +295,16 @@ export default function IndicatorsScreen() {
       setEditor(null);
       await loadCustomData();
       syncServer();
-      Alert.alert('ذخیره شد', 'اندیکاتور شما ذخیره شد؛ سیگنال‌های آن در همین صفحه و تلگرام دریافت می‌شود.');
+      ThemedAlert.alert('ذخیره شد', 'اندیکاتور شما ذخیره شد؛ سیگنال‌های آن در همین صفحه و تلگرام دریافت می‌شود.');
     } catch {
-      Alert.alert('خطا', 'ذخیره اندیکاتور موفق نبود.');
+      ThemedAlert.alert('خطا', 'ذخیره اندیکاتور موفق نبود.');
     } finally {
       setIsSavingIndicator(false);
     }
   };
 
   const handleDelete = (indicator: UserIndicator) => {
-    Alert.alert('حذف اندیکاتور', `«${indicator.name}» حذف شود؟`, [
+    ThemedAlert.alert('حذف اندیکاتور', `«${indicator.name}» حذف شود؟`, [
       { text: 'انصراف', style: 'cancel' },
       {
         text: 'حذف',

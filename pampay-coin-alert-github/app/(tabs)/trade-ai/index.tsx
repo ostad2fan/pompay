@@ -6,7 +6,6 @@ import {
   ScrollView,
   Pressable,
   TextInput,
-  Alert,
   ActivityIndicator,
   Animated,
   Platform,
@@ -68,6 +67,7 @@ import { sendTelegramAISignal, sendTelegramTradeNotification } from '@/utils/tel
 import DropdownPicker from '@/components/DropdownPicker';
 import TradeAiSegmentHeader from '@/components/TradeAiSegmentHeader';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 const DEMO_KEY = '@trade_ai_demo';
 const SIGNALS_HISTORY_KEY = '@trade_ai_signals';
 
@@ -162,7 +162,7 @@ export default function TradeAiScreen() {
       const next = { ...prev, [key]: !prev[key] };
       if (!STRATEGY_ORDER.some((s) => next[s])) {
         // حداقل یک استراتژی باید روشن بماند
-        Alert.alert('غیرممکن', 'حداقل یک استراتژی باید روشن باشد.');
+        ThemedAlert.alert('غیرممکن', 'حداقل یک استراتژی باید روشن باشد.');
         return prev;
       }
       void saveEnabledStrategies(next).then(() => {
@@ -273,10 +273,10 @@ export default function TradeAiScreen() {
       return updated;
     },
     onSuccess: () => {
-      Alert.alert('موفق', 'پوزیشن دمو باز شد');
+      ThemedAlert.alert('موفق', 'پوزیشن دمو باز شد');
     },
     onError: (err) => {
-      Alert.alert('خطا', err.message);
+      ThemedAlert.alert('خطا', err.message);
     },
   });
 
@@ -287,12 +287,12 @@ export default function TradeAiScreen() {
       return updated;
     },
     onSuccess: () => {
-      Alert.alert('موفق', 'پوزیشن بسته شد');
+      ThemedAlert.alert('موفق', 'پوزیشن بسته شد');
     },
   });
 
   const handleClosePosition = useCallback((positionId: string, currentPrice: number) => {
-    Alert.alert('بستن پوزیشن', 'آیا مطمئنید؟', [
+    ThemedAlert.alert('بستن پوزیشن', 'آیا مطمئنید؟', [
       { text: 'لغو', style: 'cancel' },
       {
         text: 'بستن',
@@ -303,7 +303,7 @@ export default function TradeAiScreen() {
   }, [closePositionMutation]);
 
   const handleResetDemo = useCallback(() => {
-    Alert.alert('ریست دمو', 'تمام پوزیشن‌ها و تاریخچه پاک می‌شود. مطمئنید؟', [
+    ThemedAlert.alert('ریست دمو', 'تمام پوزیشن‌ها و تاریخچه پاک می‌شود. مطمئنید؟', [
       { text: 'لغو', style: 'cancel' },
       {
         text: 'ریست',

@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import createContextHook from '@nkzw/create-context-hook';
-import { Platform, Alert, AppState, AppStateStatus } from 'react-native';
+import { Platform, AppState, AppStateStatus } from 'react-native';
 import * as Notifications from 'expo-notifications';
 import { TradeSignal, AppSettings, SignalType, CustomIndicator } from '@/types/crypto';
 import { scanAllSignals } from '@/utils/binanceApi';
@@ -39,6 +39,7 @@ import { registerPushOnServer, ensureNotificationPermission } from '@/utils/push
 import { checkVpnStatus } from '@/utils/vpnGuard';
 import { setThemeMode as applyPalette, getThemeMode, type ThemeMode } from '@/constants/colors';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 const TRACKED_WALLETS_KEY = '@tracked_whale_wallets';
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -444,7 +445,7 @@ export const [AppProvider, useApp] = createContextHook(() => {
         console.log('[Notifications] Local notification sent');
       } catch (e) {
         console.log('[Notifications] Error sending notification:', e);
-        Alert.alert(title, body);
+        ThemedAlert.alert(title, body);
       }
     }
   }, []);

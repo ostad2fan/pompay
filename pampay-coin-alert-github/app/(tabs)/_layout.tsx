@@ -39,6 +39,22 @@ export default function TabLayout() {
     } catch {}
   }, [rootNav?.key, router]);
 
+  // v1.5.7 — چهارمین لایه («وقتی برای بار اول برنامه را باز می‌کنم صفحه اول
+  // پیش‌فرض روی تنظیمات باشه»): بازگردانی state اندروید گاهی بعد از belt بالا
+  // کاربر را روی تب دیگری می‌اندازد. یک‌بار در هر اجرا، ۱.۲ ثانیه بعد از mount
+  // ناوبری، اگر چراغ روی صفحه‌ای جز تنظیمات باشد به تنظیمات برمی‌گردیم (فقط
+  // در همان پنجره شروع سرد — بعد از تعامل کاربر دیگر کاری به مسیر نداریم).
+  useEffect(() => {
+    if (!rootNav?.key) return;
+    const t = setTimeout(() => {
+      try {
+        router.replace('/settings');
+      } catch {}
+    }, 1200);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rootNav?.key]);
+
   // v1.4.11 — «باز شدن برنامه = صفحه تنظیمات».
   // v1.4.10 این را با router.replace بعد از اولین mount می‌کرد؛ اما در همان
   // لحظه Root Layout هنوز «ready» نیست (افکت فرزند‌ها قبل از والد اجرا می‌شود)

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { View, Text, StyleSheet, Pressable, TextInput, ActivityIndicator, Alert, ScrollView } from 'react-native';
+import { View, Text, StyleSheet, Pressable, TextInput, ActivityIndicator, ScrollView } from 'react-native';
 import {
   Link as LinkIcon,
   Plus,
@@ -40,6 +40,7 @@ import {
   PnlPeriod,
 } from '@/utils/blockchainWalletApi';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 /**
  * BlockchainWalletsSection — v1.4.17
  *
@@ -641,13 +642,13 @@ function AddBlockchainWalletForm({
     if (busy) return;
     const finalName = name.trim() || `کیف پول ${NETWORKS[networks[0] ?? 'ethereum']?.label ?? 'بلاکچین'}`;
     if (networks.length === 0) {
-      Alert.alert('شبکه انتخاب نشده', 'حداقل یک شبکه از منوی کشویی انتخاب کنید');
+      ThemedAlert.alert('شبکه انتخاب نشده', 'حداقل یک شبکه از منوی کشویی انتخاب کنید');
       return;
     }
     const baseForCheck = (editWallet?.address ?? address).trim();
     const v = validateAddressForNetworks(networks, baseForCheck, perNet);
     if (!v.ok) {
-      Alert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
+      ThemedAlert.alert('آدرس نامعتبر', v.message ?? 'آدرس را بررسی کنید');
       return;
     }
     setBusy(true);

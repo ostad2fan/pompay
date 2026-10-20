@@ -6,7 +6,6 @@ import {
   FlatList,
   Pressable,
   TextInput,
-  Alert,
   Animated,
   ActivityIndicator,
   ScrollView,
@@ -52,6 +51,7 @@ import { useVpnGate } from '@/contexts/VpnGateContext';
 import { useApp } from '@/contexts/AppContext';
 import { sendTelegramMemeShortSignal } from '@/utils/telegramService';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 const MEME_FILTER_KEY = '@meme_scanner_filter';
 const MEME_EXCHANGE_KEY = '@meme_scanner_exchanges';
 
@@ -259,7 +259,7 @@ export default function MemeScannerScreen() {
       if (Platform.OS !== 'web') {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }
-      Alert.alert('کپی شد', 'آدرس قرارداد کپی شد');
+      ThemedAlert.alert('کپی شد', 'آدرس قرارداد کپی شد');
     } catch {
       console.log('[MemeScanner] Copy failed');
     }
@@ -286,15 +286,15 @@ export default function MemeScannerScreen() {
   const handleExecuteShort = useCallback(() => {
     if (!selectedToken) return;
     if (!tradeApiKey.trim() || !tradeApiSecret.trim()) {
-      Alert.alert('خطا', 'لطفاً API Key و Secret صرافی را وارد کنید');
+      ThemedAlert.alert('خطا', 'لطفاً API Key و Secret صرافی را وارد کنید');
       return;
     }
     if (!tradeQuantity.trim() || parseFloat(tradeQuantity) <= 0) {
-      Alert.alert('خطا', 'لطفاً حجم معامله را وارد کنید');
+      ThemedAlert.alert('خطا', 'لطفاً حجم معامله را وارد کنید');
       return;
     }
 
-    Alert.alert(
+    ThemedAlert.alert(
       'تأیید شورت',
       `آیا مطمئنید می‌خواهید ${selectedToken.symbol} را در ${EXCHANGES[tradeExchangeId]?.name ?? tradeExchangeId} شورت کنید؟\n\nحجم: ${tradeQuantity} USDT\nلوریج: ${selectedToken.shortSignal?.recommendedLeverage ?? 3}x\nورود: $${selectedToken.shortSignal?.entry?.toFixed(8) ?? selectedToken.currentPrice}\nSL: $${selectedToken.shortSignal?.stopLoss?.toFixed(8) ?? 'N/A'}`,
       [
@@ -303,7 +303,7 @@ export default function MemeScannerScreen() {
           text: 'اجرا',
           style: 'destructive',
           onPress: () => {
-            Alert.alert(
+            ThemedAlert.alert(
               'ارسال شد',
               `سفارش شورت ${selectedToken.symbol} با حجم ${tradeQuantity} USDT ارسال شد.\n\nبرای مشاهده وضعیت به صرافی مراجعه کنید.`
             );
@@ -318,7 +318,7 @@ export default function MemeScannerScreen() {
 
   const handleSaveExchange = useCallback(() => {
     if (!tradeApiKey.trim() || !tradeApiSecret.trim()) {
-      Alert.alert('خطا', 'لطفاً API Key و Secret را وارد کنید');
+      ThemedAlert.alert('خطا', 'لطفاً API Key و Secret را وارد کنید');
       return;
     }
     const newConfig: MemeExchangeConfig = {
@@ -329,7 +329,7 @@ export default function MemeScannerScreen() {
     };
     const updated = [...exchangeConfigs.filter(c => c.exchangeId !== tradeExchangeId), newConfig];
     saveExchangeMutation.mutate(updated);
-    Alert.alert('ذخیره شد', `API صرافی ${EXCHANGES[tradeExchangeId]?.name} ذخیره شد`);
+    ThemedAlert.alert('ذخیره شد', `API صرافی ${EXCHANGES[tradeExchangeId]?.name} ذخیره شد`);
     setShowExchangeModal(false);
   }, [tradeApiKey, tradeApiSecret, tradeExchangeId, exchangeConfigs, saveExchangeMutation]);
 

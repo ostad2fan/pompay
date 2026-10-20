@@ -6,7 +6,6 @@ import {
   ScrollView,
   Pressable,
   Platform,
-  Alert,
 } from 'react-native';
 import {
   Copy,
@@ -28,6 +27,7 @@ import { createThemedStyles } from '@/utils/themeStyles';
 import { ExchangeListing } from '@/types/whale';
 import { fetchUsdtTomanPrice, formatToman } from '@/utils/nobitexApi';
 
+import { ThemedAlert } from '@/components/ThemedAlert';
 export default function TokenDetailScreen() {
   const {
     symbol,
@@ -69,7 +69,7 @@ export default function TokenDetailScreen() {
   const handleCopyContract = async () => {
     if (contractAddress) {
       await Clipboard.setStringAsync(contractAddress);
-      Alert.alert('کپی شد', 'آدرس قرارداد کپی شد');
+      ThemedAlert.alert('کپی شد', 'آدرس قرارداد کپی شد');
     }
   };
 
