@@ -598,14 +598,14 @@ async function currentStrategyLabel(): Promise<string> {
  *  اعلام می‌کند. سرور وقتی برنامه باز است با heartbeat مکث می‌کند (v1.5.9)،
  *  پس دیگر خبری از دوبله‌شدن نیست — و اگر سرور قطع/خواب باشد هم اعلام
  *  دیر نمی‌شود (بازخورد: «دیگه اعلان‌ها در تلگرام نمی‌آمد»). */
-async function announceTelegram(title: string, text: string): Promise<void> {
+async function announceTelegram(title: string, text: string): Promise<boolean> {
   try {
-    if (Platform.OS === 'web') return;
+    if (Platform.OS === 'web') return false;
     const raw = await AsyncStorage.getItem('@crypto_scanner_settings');
-    if (!raw) return;
+    if (!raw) return false;
     const s = JSON.parse(raw) as { telegramEnabled?: boolean; telegramBotToken?: string; telegramChatId?: string };
-    if (!s?.telegramEnabled || !s?.telegramBotToken || !s?.telegramChatId) return;
-    await fetch(`https://api.telegram.org/bot${s.telegramBotToken}/sendMessage`, {
+    if (!s?.telegramEnabled || !s?.telegramBotToken || !s?.telegramChatId) return false;
+    const res = await fetch(`https://api.telegram.org/bot${s.telegramBotToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -615,9 +615,84 @@ async function announceTelegram(title: string, text: string): Promise<void> {
         disable_web_page_preview: true,
       }),
     });
+    return res.ok;
+  } catch {
+    // never fatal
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.11 — «وقتی الارمی را یبار فرستاد از تکرارش جلوگیری کنه»:
+// هر رخدادِ پوزیشن (باز/بسته/بستن‌بخشی) یک «کلید» دارد؛ اگر همان کلید قبلاً
+// به تلگرام فرستاده شده باشد، دوباره فرستاده نمی‌شود — هر چقدر هم رفرش
+// کنید یا برنامه را دوباره باز کنید. ریشه‌ی تکرار (sync که رکورد بسته‌ی
+// محلی را با نسخه‌ی بازِ قدیمیِ سرور برمی‌گرداند) هم جداگانه در
+// utils/autoMerge.ts («بسته‌شدن قطعی است») ریشه‌کن شد؛ این لایه، تضمین
+// نهایی است.
+// ---------------------------------------------------------------------------
+
+const ANNOUNCED_KEY = '@auto_trade_announced_v1';
+const ANNOUNCED_CAP = 500;
+
+async function loadAnnouncedMap(): Promise<Record<string, number>> {
+  try {
+    const raw = await AsyncStorage.getItem(ANNOUNCED_KEY);
+    if (raw) return JSON.parse(raw) as Record<string, number>;
+  } catch {}
+  return {};
+}
+
+async function saveAnnouncedMap(map: Record<string, number>): Promise<void> {
+  try {
+    const keys = Object.keys(map);
+    if (keys.length > ANNOUNCED_CAP) {
+      // قدیمی‌ترین‌ها حذف می‌شوند (محدودیت حافظه)
+      const sorted = keys.sort((a, b) => (map[a] ?? 0) - (map[b] ?? 0));
+      const keep = sorted.slice(keys.length - ANNOUNCED_CAP);
+      const trimmed: Record<string, number> = {};
+      for (const k of keep) trimmed[k] = map[k];
+      await AsyncStorage.setItem(ANNOUNCED_KEY, JSON.stringify(trimmed));
+      return;
+    }
+    await AsyncStorage.setItem(ANNOUNCED_KEY, JSON.stringify(map));
+  } catch {}
+}
+
+/** اعلام یک‌بارِ یک رخداد پوزیشن به تلگرام (کلید = شناسه‌ی رخداد). */
+async function announceOnce(key: string, title: string, text: string): Promise<void> {
+  // v1.5.11 — هر رخداد محلی، حداکثر ۲ ثانیه بعد به سرور هم push می‌شود تا
+  // sync دیگر نسخه‌ی «بازِ» قدیمی سرور را روی بسته‌شدنِ محلی ننویسد.
+  schedulePostEventServerPush();
+  try {
+    const sent = await loadAnnouncedMap();
+    if (sent[key]) return;
+    const ok = await announceTelegram(title, text);
+    if (ok) {
+      sent[key] = Date.now();
+      await saveAnnouncedMap(sent);
+    }
   } catch {
     // never fatal
   }
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.11 — push بی‌درنگِ وضعیت بعد از هر رخداد محلی (debounce ۲ ثانیه):
+// قبلاً بسته‌شدنِ محلی فقط با heartbeat چرخه‌ی ۶۰ ثانیه‌ای به سرور می‌رسید؛
+// در این فاصله sync نسخه‌ی بازِ سرور را برمی‌گرداند و چرخه بعدی دوباره
+// می‌بست و دوباره اعلام می‌کرد (الارم تکراری!). حالا هر رخداد، همان لحظه
+// (جمع‌شده در ۲ ثانیه) به سرور push می‌شود.
+// ---------------------------------------------------------------------------
+
+let postEventPushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function schedulePostEventServerPush(): void {
+  if (postEventPushTimer) return;
+  postEventPushTimer = setTimeout(() => {
+    postEventPushTimer = null;
+    void sendAppOpenHeartbeat(true);
+  }, 2_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +839,7 @@ async function openDemo(
     `ورود ${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)} (${sourceLabel} — دمو)`
   );
   // v1.5.3 — اعلام تلگرام از خود برنامه (وقتی برنامه باز است)
-  await announceTelegram(
+  await announceOnce(`open:${pos.id}`, 
     `بک‌تست (دمو): ${side === 'long' ? '🟢 خرید' : '🔴 فروش'} ${symbol}`,
     `ورود ${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)}\nمنبع: ${sourceLabel} • لوریج ${settings.leverage}x • استراتژی ${strategyName}`
   );
@@ -793,7 +868,7 @@ async function closeDemo(
     `🤖 ربات: بستن ${p.symbol}`,
     `${reason === 'stop' ? 'استاپ' : reason === 'take' ? 'تیک‌پرافیت' : reason === 'whale-close' ? 'بستن نهنگ' : 'سیگنال'} • ${pnl >= 0 ? 'سود' : 'ضرر'} $${Math.abs(pnl).toFixed(2)} (دمو)`
   );
-  await announceTelegram(
+  await announceOnce(`close:${id}:${reason}`, 
     `بک‌تست (دمو): بستن ${p.symbol}`,
     `${reason === 'stop' ? 'استاپ' : reason === 'take' ? 'تیک‌پرافیت' : reason === 'whale-close' ? 'نهنگ بست' : 'سیگنال'} • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} $${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ''}`
   );
@@ -852,7 +927,7 @@ async function partialCloseDemo(
     `🤖 ربات: نصف حجم ${p.symbol} بسته شد`,
     `${label} • ${pnl >= 0 ? 'سود' : 'ضرر'} $${Math.abs(pnl).toFixed(2)} (دمو)`
   );
-  await announceTelegram(
+  await announceOnce(`partial:${id}:${reason}:${(p.partialsDone ?? 0) + 1}`, 
     `بک‌تست (دمو): نصف حجم ${p.symbol} بسته شد`,
     `${label} • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} $${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ''}`
   );
@@ -900,7 +975,7 @@ async function partialCloseReal(
   await recordClosedPnl(pnl);
   const label = reason === 'partial' ? 'برداشت سود پله‌ای (نصف حجم)' : 'بستن دستی نصف حجم';
   await appendLog('close', `${label} — واقعی ${pos.symbol}: ${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)} تقریبی`);
-  await announceTelegram(
+  await announceOnce(`partial:${pos.id}:${reason}:${(pos.partialsDone ?? 0) + 1}`, 
     `بک‌تست (واقعی): نصف حجم ${pos.symbol} بسته شد`,
     `${label} • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} ~$${Math.abs(pnl).toFixed(2)}${pos.strategyName ? ` • استراتژی ${pos.strategyName}` : ''}`
   );
@@ -972,7 +1047,7 @@ async function markDemoPositions(prices: Record<string, number>, settings: AutoT
         `🤖 ربات: بستن ${p.symbol}`,
         `${hitStop ? 'استاپ' : 'تیک‌پرافیت'} • ${pnl >= 0 ? 'سود' : 'ضرر'} $${Math.abs(pnl).toFixed(2)} (دمو)`
       );
-      await announceTelegram(
+      await announceOnce(`close:${p.id}:${hitStop ? 'stop' : 'take'}`, 
         `بک‌تست (دمو): بستن ${p.symbol}`,
         `${hitStop ? 'استاپ' : 'تیک‌پرافیت'}${hitStop && pnl >= 0 ? ' (ریسک‌فری)' : ''} • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} $${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ''}`
       );
@@ -1390,7 +1465,7 @@ async function openReal(
     `🤖 ربات واقعی: ${side === 'long' ? 'خرید' : 'فروش'} ${symbol}`,
     `ورود ~${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)} (${sourceLabel})`
   );
-  await announceTelegram(
+  await announceOnce(`open:${pos.id}`, 
     `بک‌تست (واقعی): ${side === 'long' ? '🟢 خرید' : '🔴 فروش'} ${symbol}`,
     `ورود ~${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)}\nمنبع: ${sourceLabel} • لوریج ${settings.leverage}x • استراتژی ${strategyName}`
   );
@@ -1446,7 +1521,7 @@ async function manageRealPositions(
         `🤖 ربات واقعی: بستن ${p.symbol}`,
         `بسته شد روی صرافی • ${pnl >= 0 ? 'سود' : 'ضرر'} ~$${Math.abs(pnl).toFixed(2)}`
       );
-      await announceTelegram(
+      await announceOnce(`close:${p.id}:take`, 
         `بک‌تست (واقعی): بستن ${p.symbol}`,
         `بسته شد روی صرافی (استاپ/تیک‌پرافیت) • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} ~$${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ''}`
       );
@@ -1947,7 +2022,7 @@ export async function runLightMtm(): Promise<void> {
       void syncAutoTradeStateFromServer().catch(() => {});
     }
     // قیمت با کش ۲.۵ ثانیه‌ای تا PnL نمایش واقعاً هر ۳ ثانیه تازه شود
-    const prices = await getBinancePrices(2_500).catch(() => ({}) as Record<string, number>);
+    const prices = await getBinancePrices(1_500).catch(() => ({}) as Record<string, number>);
     try {
       await markDemoPositions(prices, settings);
     } catch {}

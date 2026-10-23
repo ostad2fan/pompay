@@ -21,8 +21,8 @@ import { Linking, Platform } from 'react-native';
 import { getServerUrl } from './scanServerApi';
 
 /** Must match app.json «version» at release time. */
-export const APP_VERSION = '1.5.10';
-export const APP_VERSION_CODE = 35;
+export const APP_VERSION = '1.5.11';
+export const APP_VERSION_CODE = 36;
 
 const REPO_OWNER = 'ostad2fan';
 const REPO_NAME = 'pompay';

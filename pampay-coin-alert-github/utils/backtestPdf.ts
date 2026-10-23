@@ -1,23 +1,24 @@
 /**
- * backtestPdf.ts — v1.5.4 → v1.5.10
+ * backtestPdf.ts — v1.5.4 → v1.5.11
  *
  * «در بک تست بتونم کل تاریخچه را در هر تایم‌فریمی که انتخاب می‌کنم به‌صورت
  * پی‌دی‌اف دانلود کنم یا اشتراک‌گذارم و در پی‌دی‌اف تمام مشخصات پوزیشن
  * مثل نام، نقطه ورود، استاپ، تی‌پی، حجم مارجین، نوع بسته شدن (دستی / تیک
  * پروفیت / استاپ / بستن بخش حجم) باشد»
  *
- * v1.5.10 — «PDF مثل عکسِ قبلی با همه جزئیات، هم تایم‌فریم امروز هم ۷ روزه»:
- *  • در بازه‌ی «امروز» و «۷ روز»: جدول ریزِ «همه‌ی» معاملات همان بازه با
- *    «تمام ستون‌ها» درج می‌شود — بدون حالت فشرده، هر تعداد معامله که باشد:
- *    ارز، جهت/لوریج، استراتژی، اندیکاتور/منبع، نقطه ورود، استاپ،
- *    تیک‌پرافیت، قیمت خروج (جدید)، حجم مارجین، ساعت باز/بسته شدن،
- *    نوع بسته شدن و سود/زیان.
- *  • سرعت حفظ شد: کلاس‌های CSS به‌جای استایل درون‌خطیِ هر سلول، بدون
- *    ایموجی هر ردیف، ساخت رشته با join یک‌باره — حتی ۲۰۰۰ معامله در چند
- *    ثانیه روی گوشی ساخته می‌شود.
- *  • بازه‌های «۳۰ روز» و «همه»: طبق درخواست قبلی کاربر، فقط خلاصه‌ی آمار
- *    درج می‌شود + یادداشت راهنما که برای ریز معاملات بازه‌ی ۷ روز یا
- *    امروز را انتخاب کند.
+ * v1.5.11 — «کاری کن سریعتر ساخته بشه؛ اگه لازمه فقط متنو جداول باشن از
+ * بکگراند استفاده نکن» (PDF هفت‌روزه اصلا ساخته نمی‌شد — ۱ ساعت انتظار):
+ *  • قالب «چاپ سریع»: پس‌زمینه سفید، بدون کارت/گرادیان/بک‌گراند — فقط
+ *    متن و جدول (طبق اجازه‌ی خود کاربر).
+ *  • جدول اصلی «تکه‌تکه» می‌شود: هر ۴۰ ردیف یک <table> جدا با تکرار
+ *    سربرگ — موتور چاپ اندروید جدول‌های کوچک را صدها برابر سریع‌تر
+ *    صفحه‌بندی می‌کند (ریشه‌ی هنگِ ۱ ساعته: یک جدول غول‌پیکر با
+ *    border-collapse).
+ *  • فقط خطوط افقی (بدون خط عمودی سلول‌ها)، فونت ریز، سربرگِ قابل
+ *    شکستن (بدون white-space:nowrap) → جدول در عرض صفحه جا می‌شود.
+ *  • بدون ایموجی در سند (شکل‌دهی فونت ارزان‌تر).
+ *  • همه‌ی ۱۴ ستون + «قیمت خروج» حفظ شدند؛ ۳۰ روز/«همه» مثل قبل فقط
+ *    خلاصه‌ی آمار (درخواست قبلی کاربر).
  *
  * سازنده‌ی HTML راست‌به‌چپ فارسی برای expo-print (printToFileAsync → PDF).
  * تابع خالص است تا هم در اپ و هم در تست قابل استفاده باشد.
@@ -65,6 +66,9 @@ export interface BacktestPdfMeta {
   windowDays?: number;
 }
 
+/** v1.5.11 — اندازه‌ی هر تکه از جدول (ردیف در هر <table>). */
+export const PDF_TABLE_CHUNK = 40;
+
 const PERSIAN_CLOSE_REASON: Record<string, string> = {
   stop: 'استاپ‌لاس',
   take: 'تیک‌پرافیت',
@@ -87,18 +91,13 @@ function faDateTime(ms?: number): string {
   }
 }
 
-function faNum(n: number, digits = 2): string {
-  return n.toLocaleString('fa-IR', { minimumFractionDigits: digits, maximumFractionDigits: digits });
-}
-
 function usd(n: number, digits = 2): string {
   return Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
 /**
- * v1.5.10 — همیشه ردیف کامل: جدول فشرده حذف شد («PDF مثل عکسِ قبلی با
- * همه جزئیات، هم امروز هم ۷ روزه — هر تعداد معامله که باشد»). فقط با
- * کلاس CSS (بدون استایل درون‌خطی) تا ساختش سریع بماند.
+ * v1.5.11 — ردیف کامل، فقط کلاس CSS (بدون استایل درون‌خطی و بدون
+ * بک‌گراند) — ساخت رشته با join یک‌باره.
  */
 function fullRowHtml(r: BacktestPdfRow, i: number): string {
   const pnl = r.realizedPnl ?? 0;
@@ -127,7 +126,7 @@ const FULL_TABLE_HEAD =
   '<th>نقطه ورود</th><th>استاپ</th><th>تیک‌پرافیت</th><th>قیمت خروج</th><th>حجم مارجین</th>' +
   '<th>باز شد</th><th>بسته شد</th><th>نوع بسته شدن</th><th>سود/زیان</th></tr>';
 
-/** ساخت HTML گزارش PDF تاریخچه بک‌تست (RTL فارسی، سبک فیوچرز بایننس). */
+/** ساخت HTML گزارش PDF تاریخچه بک‌تست — قالب چاپ سریع v1.5.11 (RTL فارسی). */
 export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMeta): string {
   const totalTrades = rows.length;
   const wins = rows.filter((r) => (r.realizedPnl ?? 0) >= 0).length;
@@ -142,14 +141,17 @@ export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMe
   const windowDays = meta.windowDays ?? 1;
   const includeTrades = Number.isFinite(windowDays) ? windowDays <= 7 : false;
 
-  // ردیف‌ها با join یک‌باره ساخته می‌شوند (بدون تابع map+template سنگین).
-  let rowsHtml = '';
+  // v1.5.11 — جدول‌های تکه‌تکه‌ی ۴۰ ردیفی (چاپ سریع اندروید)
+  let tablesHtml = '';
   if (includeTrades && totalTrades > 0) {
-    const parts = new Array<string>(totalTrades);
-    for (let i = 0; i < totalTrades; i++) {
-      parts[i] = fullRowHtml(rows[i], i);
+    const parts: string[] = [];
+    for (let start = 0; start < totalTrades; start += PDF_TABLE_CHUNK) {
+      const end = Math.min(start + PDF_TABLE_CHUNK, totalTrades);
+      const chunk: string[] = [];
+      for (let i = start; i < end; i++) chunk.push(fullRowHtml(rows[i], i));
+      parts.push(`<table class="t"><thead>${FULL_TABLE_HEAD}</thead><tbody>${chunk.join('')}</tbody></table>`);
     }
-    rowsHtml = parts.join('');
+    tablesHtml = parts.join('');
   }
 
   return `<!DOCTYPE html>
@@ -157,72 +159,62 @@ export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMe
 <head>
 <meta charset="UTF-8" />
 <style>
-  * { box-sizing: border-box; }
-  body { font-family: 'Tahoma', 'Segoe UI', sans-serif; background: #0b0e11; color: #eaecef; margin: 0; padding: 24px; }
-  .card { background: #181a20; border: 1px solid #2b3139; border-radius: 12px; padding: 18px; margin-bottom: 16px; }
-  h1 { font-size: 20px; margin: 0 0 4px; color: #f0b90b; }
-  .sub { font-size: 11px; color: #848e9c; margin-bottom: 12px; }
-  .grid { display: flex; flex-wrap: wrap; gap: 8px; }
-  .stat { flex: 1 1 30%; min-width: 150px; background: #0b0e11; border: 1px solid #2b3139; border-radius: 10px; padding: 10px 12px; margin: 3px; }
-  .stat .k { font-size: 10px; color: #848e9c; margin-bottom: 4px; }
-  .stat .v { font-size: 14px; font-weight: 700; direction: ltr; text-align: right; }
-  .green { color: #0ecb81; } .red { color: #f6465d; }
-  .g { color: #0ecb81; } .r { color: #f6465d; }
-  table { width: 100%; border-collapse: collapse; font-size: 9px; }
-  th { background: #0b0e11; color: #f0b90b; padding: 5px 3px; border: 1px solid #2b3139; font-size: 8.5px; white-space: nowrap; }
-  td { padding: 4px 3px; border: 1px solid #232830; vertical-align: middle; text-align: center; }
+  body { font-family: Tahoma, 'Segoe UI', sans-serif; color: #000; background: #fff; margin: 10px 12px; font-size: 10px; }
+  h1 { font-size: 14px; margin: 0 0 2px; }
+  .sub { font-size: 8.5px; color: #555; margin: 0 0 8px; }
+  .stats { width: 100%; border-collapse: collapse; margin-bottom: 10px; }
+  .stats td { width: 33.33%; border: 1px solid #999; padding: 3px 5px; font-size: 8.5px; }
+  .stats .k { display: block; color: #555; font-size: 7.5px; }
+  .stats .v { display: block; font-weight: 700; direction: ltr; text-align: right; font-size: 10px; }
+  .g { color: #0a7a45; }
+  .r { color: #a32222; }
+  table.t { width: 100%; border-collapse: collapse; font-size: 7.5px; margin: 0 0 10px 0; }
+  th { border-top: 1.2px solid #000; border-bottom: 1.2px solid #000; padding: 3px 2px; font-size: 7px; text-align: center; }
+  td { border-bottom: 0.4px solid #bbb; padding: 2px 2px; text-align: center; vertical-align: middle; }
   .b { font-weight: 700; }
-  .mono { font-family: 'Courier New', monospace; direction: ltr; text-align: center; }
-  .empty { text-align: center; color: #848e9c; padding: 18px; }
-  .note { font-size: 10px; color: #f0b90b; line-height: 1.7; padding: 10px; border: 1px dashed #f0b90b55; border-radius: 8px; margin-top: 8px; }
-  .footer { font-size: 9px; color: #707a8a; text-align: center; margin-top: 10px; }
-  /* v1.5.7 — R6: راهنمای زیر جدول */
-  .guide h2 { font-size: 13px; color: #f0b90b; margin: 0 0 8px; }
-  .guide p { font-size: 9.5px; color: #9aa0aa; line-height: 1.75; margin: 0 0 7px; text-align: justify; }
-  .guide p strong { color: #eaecef; }
+  .mono { font-family: 'Courier New', monospace; direction: ltr; }
+  .empty { text-align: center; color: #555; padding: 14px; font-size: 9px; }
+  .note { font-size: 8px; color: #333; border: 1px solid #999; padding: 5px 7px; margin: 6px 0; }
+  .footer { font-size: 7.5px; color: #555; text-align: center; margin-top: 6px; }
+  .guide p { font-size: 8px; color: #222; line-height: 1.6; margin: 0 0 5px; text-align: justify; }
+  .guide b { font-weight: 700; }
 </style>
 </head>
 <body>
-  <div class="card">
-    <h1>🤖 گزارش تاریخچه بک‌تست — PampDumpCoins</h1>
-    <div class="sub">
-      حالت: ${meta.mode === 'demo' ? 'دمو (بک‌تست)' : 'واقعی'} • بازه: ${meta.periodLabel} • فیلتر: ${meta.filterLabel}
-      • تاریخ گزارش: ${faDateTime(meta.generatedAt)}
-    </div>
-    <div class="grid">
-      <div class="stat"><div class="k">تعداد معاملات</div><div class="v">${totalTrades.toLocaleString('fa-IR')}</div></div>
-      <div class="stat"><div class="k">سودده / ضررده</div><div class="v">${wins.toLocaleString('fa-IR')} / ${losses.toLocaleString('fa-IR')}</div></div>
-      <div class="stat"><div class="k">نرخ برد</div><div class="v">٪${winRate.toLocaleString('fa-IR')}</div></div>
-      <div class="stat"><div class="k">PNL بسته‌شده (خالص)</div><div class="v ${realized >= 0 ? 'green' : 'red'}">${realized >= 0 ? '+' : '−'}$${usd(realized)}</div></div>
-      <div class="stat"><div class="k">PNL باز (لحظه‌ای)</div><div class="v ${meta.openPnlUsd >= 0 ? 'green' : 'red'}">${meta.openPnlUsd >= 0 ? '+' : '−'}$${usd(meta.openPnlUsd)}</div></div>
-      <div class="stat"><div class="k">سرمایه اولیه</div><div class="v">$${usd(meta.initialCapitalUsd, 0)}</div></div>
-      <div class="stat"><div class="k">موجودی (سرمایه ± PNL بسته‌شده)</div><div class="v ${balance >= meta.initialCapitalUsd ? 'green' : 'red'}">$${usd(balance)}</div></div>
-      <div class="stat"><div class="k">مارجین درگیر (پوزیشن‌های باز)</div><div class="v">$${usd(meta.engagedMarginUsd)}</div></div>
-      <div class="stat"><div class="k">مارجین آزاد</div><div class="v">$${usd(freeMargin)}</div></div>
-    </div>
+  <h1>گزارش تاریخچه بک‌تست — PampDumpCoins</h1>
+  <div class="sub">
+    حالت: ${meta.mode === 'demo' ? 'دمو (بک‌تست)' : 'واقعی'} • بازه: ${meta.periodLabel} • فیلتر: ${meta.filterLabel}
+    • تاریخ گزارش: ${faDateTime(meta.generatedAt)}
   </div>
-  <div class="card">
-    ${
-      !includeTrades
-        ? `<div class="empty">این بازه (${meta.periodLabel}) فقط خلاصه‌ی آمار دارد.</div>
+  <table class="stats">
+    <tr>
+      <td><span class="k">تعداد معاملات</span><span class="v">${totalTrades.toLocaleString('fa-IR')}</span></td>
+      <td><span class="k">سودده / ضررده</span><span class="v">${wins.toLocaleString('fa-IR')} / ${losses.toLocaleString('fa-IR')}</span></td>
+      <td><span class="k">نرخ برد</span><span class="v">٪${winRate.toLocaleString('fa-IR')}</span></td>
+    </tr>
+    <tr>
+      <td><span class="k">PNL بسته‌شده (خالص)</span><span class="v ${realized >= 0 ? 'g' : 'r'}">${realized >= 0 ? '+' : '−'}$${usd(realized)}</span></td>
+      <td><span class="k">PNL باز (لحظه‌ای)</span><span class="v ${meta.openPnlUsd >= 0 ? 'g' : 'r'}">${meta.openPnlUsd >= 0 ? '+' : '−'}$${usd(meta.openPnlUsd)}</span></td>
+      <td><span class="k">سرمایه اولیه</span><span class="v">$${usd(meta.initialCapitalUsd, 0)}</span></td>
+    </tr>
+    <tr>
+      <td><span class="k">موجودی (سرمایه ± PNL بسته‌شده)</span><span class="v ${balance >= meta.initialCapitalUsd ? 'g' : 'r'}">$${usd(balance)}</span></td>
+      <td><span class="k">مارجین درگیر (پوزیشن‌های باز)</span><span class="v">$${usd(meta.engagedMarginUsd)}</span></td>
+      <td><span class="k">مارجین آزاد</span><span class="v">$${usd(freeMargin)}</span></td>
+    </tr>
+  </table>
+  ${
+    !includeTrades
+      ? `<div class="empty">این بازه (${meta.periodLabel}) فقط خلاصه‌ی آمار دارد.</div>
     <div class="note">برای سرعتِ ساخت PDF، در بازه‌های بیشتر از ۷ روز جدول ریز معاملات درج نمی‌شود — بازه‌ی «۷ روز» یا «امروز» را انتخاب کنید تا همه‌ی ریز معاملات همان بازه با تمام مشخصات (ورود، استاپ، تیک‌پرافیت، قیمت خروج، حجم مارجین، نوع بسته شدن) در PDF بیاید.</div>`
-        : totalTrades === 0
-          ? '<div class="empty">در این بازه/فیلتر معامله‌ای نیست.</div>'
-          : `<table><thead>${FULL_TABLE_HEAD}</thead><tbody>${rowsHtml}</tbody></table>`
-    }
-    <div class="footer">PampDumpCoins — گزارش تاریخچه بک‌تست • ${faNum(meta.engagedMarginUsd)}$ مارجین درگیر لحظه‌ی ساخت گزارش</div>
-  </div>
-  <div class="card guide">
-    <h2>📖 راهنمای گزارش (توضیح ستون‌ها و اصطلاح‌ها)</h2>
-    <p><strong>بک‌فیل (Backfill):</strong> وقتی ربات برای اولین بار روشن می‌شود یا بعد از «ریست کامل»، سیگنال‌های ۷ روز گذشته را دوباره (تا سقف پوزیشن‌های همزمان باز) به‌عنوان معامله باز می‌کند تا تاریخچه‌ای برای تحلیل داشته باشد. معاملاتی که منبعشان بک‌فیل است، همان منطق استاپ/تیک‌پرافیت را طی می‌کنند و مثل بقیه مدیریت می‌شوند.</p>
-    <p><strong>استاپ با لوریج (SL):</strong> حد ضرر بر اساس «ضرر حساب» است؛ فاصله قیمت = درصد ضرر ÷ لوریج. مثال: حد ضرر ۳٪ با لوریج ۵ یعنی قیمت فقط ۰.۶٪ خلاف جهت برود، استاپ می‌خورد و حساب دقیقاً ۳٪ (مارجین همان معامله) ضرر می‌کند. ستون «استاپ» قیمت استاپ‌لاس و «تیک‌پرافیت» قیمت هدف (حد ضرر × ریوارد) است.</p>
-    <p><strong>قیمت خروج:</strong> قیمت لحظه‌ی بسته شدن معامله (نزدیک‌ترین قیمت به نقطه‌ی اجرای استاپ/تیک‌پرافیت/بستن دستی). در «نقطه ورود» و «قیمت خروج» فاصله سود/زیان قیمتی دیده می‌شود و سود/زیان دلاری = (خروج − ورود) × جهت × حجم.</p>
-    <p><strong>نوع بسته شدن:</strong> استاپ‌لاس (رسیدن به حد ضرر)، تیک‌پرافیت (رسیدن به هدف)، دستی (بستن توسط خودتان)، بستن نهنگ (نهنگِ کپی‌شده پوزیشنش را بست)، سیگنال، «برداشت سود» (ربات در ۲۵٪ و ۵۰٪ سود، خودش بخشی از حجم را بست) و «بستن حجمی» (✂ دستیِ شما روی بخشی از حجم).</p>
-    <p><strong>تریل استاپ:</strong> وقتی معامله ۱٪ به سود برود (قیمت اسپات)، استاپ روی نقطه ورود + کارمزد می‌رود (ریسک‌فری) و بعد روی «نصفِ بیشترین سود» دنبال می‌شود تا معامله سودده با ضرر بسته نشود.</p>
-    <p><strong>حجم مارجین:</strong> ارزش دلاریِ پوزیشن ÷ لوریج = مبلغی از حساب که این معامله قفل کرده است. «مارجین درگیر» مجموع این مبلغ برای پوزیشن‌های بازِ لحظه‌ی ساخت گزارش است و «مارجین آزاد» = موجودی − مارجین درگیر.</p>
-    <p><strong>PNL بسته‌شده (خالص):</strong> مجموع سود/زیان «تمام» معاملات همین بازه/فیلتر — نه فقط ۱۰۰ ردیف روی صفحه؛ در بازه‌های ۷ روز و کوتاه‌تر، این گزارش PDF همه‌ی معاملات بازه را با تمام ستون‌ها شامل می‌شود. «PNL باز» سود/زیان لحظه‌ای پوزیشن‌های هنوز باز است و در آن جمع نمی‌شود.</p>
-    <p><strong>اندیکاتور/منبع:</strong> نشان می‌دهد معامله از کدام سیگنال باز شده: نهنگِ کپی‌شده (Hyperliquid)، هوک ریورسال، GainzAlgo، اندیکاتور دستی شما، یا بک‌فیل.</p>
-    <p><strong>نکته کارمزد:</strong> در حالت دمو، ارزش‌گذاری تقریبی است و کارمزد دقیق صرافی شما (تیکر/میکر) لحظه‌به‌لحظه کم نمی‌شود؛ در حالت واقعی، کارمزد واقعی صرافی به PnL اعمال می‌شود. برای بررسی اینکه با کارمزد صرافی شما این تنظیمات می‌صرفد یا نه، از «محاسبه‌گر بک‌تست واقعی» در تب بک‌تست استفاده کنید.</p>
+      : totalTrades === 0
+        ? '<div class="empty">در این بازه/فیلتر معامله‌ای نیست.</div>'
+        : tablesHtml
+  }
+  <div class="footer">PampDumpCoins — گزارش تاریخچه بک‌تست • ${faDateTime(meta.generatedAt)}</div>
+  <div class="guide">
+    <p><b>راهنمای گزارش:</b> <b>بک‌فیل</b> یعنی ربات بعد از روشن‌شدن/ریست، سیگنال‌های ۷ روز گذشته را تا سقف پوزیشن‌های همزمان به‌عنوان معامله باز کرده (ورود با قیمت و زمان همان سیگنال). <b>استاپ با لوریج:</b> فاصله قیمت استاپ = درصد ضرر ÷ لوریج (حد ضرر ۳٪ با لوریج ۵ = دقیقاً ۱۵٪ ضرر حساب). <b>قیمت خروج</b> قیمت لحظه‌ی بسته شدن است؛ سود دلاری = (خروج − ورود) × جهت × حجم.</p>
+    <p><b>نوع بسته شدن:</b> استاپ‌لاس، تیک‌پرافیت، دستی، بستن نهنگ، سیگنال، «برداشت سود» (ربات در ۲۵٪ و ۵۰٪ سود نصف حجم را بست) و «بستن حجمی» (دستیِ شما). <b>تریل استاپ:</b> با ۱٪ حرکت به سود (اسپات)، استاپ ریسک‌فری و بعد روی نصفِ بیشترین سود دنبال می‌شود. <b>حجم مارجین</b> = ارزش پوزیشن ÷ لوریج؛ «مارجین آزاد» = موجودی − مارجین درگیر. <b>PNL بسته‌شده</b> جمع سود/زیان «همه‌ی» معاملات همین بازه/فیلتر است (نه فقط ۱۰۰ ردیف صفحه).</p>
   </div>
 </body>
 </html>`;

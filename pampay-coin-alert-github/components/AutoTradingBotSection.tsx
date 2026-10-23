@@ -153,7 +153,9 @@ import {
 const APP_LOGO = require('@/assets/images/icon-dark.png');
 
 /** v1.5.4 (بازیابی‌شده در v1.5.6) — رفرش پوزیشن‌های باز هر ۵ ثانیه. */
-const UI_REFRESH_MS = 5_000;
+// v1.5.11 — «با رفرش بخش پی ان ال خیلی سریعتر همیشه بروز باشه»: چرخه‌ی
+// سبک + ریلود ویو هر ۲ ثانیه (قبلاً ۵) و کش قیمت ۱.۵ ثانیه‌ای در موتور.
+const UI_REFRESH_MS = 2_000;
 
 /** v1.5.4 (بازیابی‌شده در v1.5.6) — صفحه‌بندی تاریخچه: ۱۰۰ معامله در هر صفحه
  * («بالای ۱۰۰ بره صفحه دو و بشه دید در صفحات بعدی»). */
@@ -288,6 +290,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [histPage, setHistPage] = useState(1);
   const [realHistPage, setRealHistPage] = useState(1);
   const [pdfBusy, setPdfBusy] = useState(false);
+  // v1.5.11 — وضعیت ساخت PDF (تعداد معامله + مرحله) تا کاربر بداند چه
+  // چیزی در حال ساخت است و چقدر طول می‌کشد (قبلاً فقط «در حال ساخت…»).
+  const [pdfStatus, setPdfStatus] = useState('');
   /** v1.5.4 (بازیابی‌شده در v1.5.6) — دقت قیمت بایننس (symbol → pricePrecision). */
   const [pricePrecision, setPricePrecision] = useState<Record<string, number>>({});
   const pnlCardRef = useRef<View>(null);
@@ -779,6 +784,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const handleExportHistoryPdf = async () => {
     if (pdfBusy) return;
     setPdfBusy(true);
+    setPdfStatus('در حال آماده‌سازی داده‌ها…');
     try {
       if (Platform.OS === 'web') {
         ThemedAlert.alert('وب', 'خروجی PDF فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
@@ -790,6 +796,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         ThemedAlert.alert('تاریخچه خالی', 'در این بازه/فیلتر معامله‌ای برای PDF نیست.');
         return;
       }
+      setPdfStatus(`در حال ساخت PDF (${source.length.toLocaleString('fa-IR')} معامله)…`);
       const rows: BacktestPdfRow[] = source.map((p) => ({
         symbol: p.symbol,
         side: p.side,
@@ -822,7 +829,34 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         // v1.5.8 — R3: امروز/۷ روز → جدول ریز همه‌ی معاملات؛ بیشتر از ۷ روز → فقط خلاصه
         windowDays: histWindowMs(histPeriod) / 86400000,
       });
-      const { uri } = await Print.printToFileAsync({ html });
+      // v1.5.11 — قالب چاپ سریع (جدول‌های ۴۰ ردیفی، بدون بک‌گراند) چند
+      // ثانیه‌ای ساخته می‌شود؛ این مهلت فقط بیمه است تا دکمه هیچ‌وقت
+      // «همیشه در حال ساخت» نماند (مشکل ۱ ساعته‌ی نسخه قبل).
+      const PDF_TIMEOUT_MS = 120_000;
+      let timedOut = false;
+      const timeout = new Promise<null>((resolve) => {
+        setTimeout(() => {
+          timedOut = true;
+          resolve(null);
+        }, PDF_TIMEOUT_MS);
+      });
+      const printResult = await Promise.race([
+        Print.printToFileAsync({ html }).catch(() => null),
+        timeout,
+      ]);
+      if (timedOut && !printResult) {
+        ThemedAlert.alert(
+          'ساخت PDF طول کشید',
+          `ساخت PDF برای ${source.length.toLocaleString('fa-IR')} معامله بیش از ۲ دقیقه طول کشید و لغو شد.\n\nپیشنهاد: بازه‌ی کوچک‌تر (امروز) یا فیلتر «سودها/ضررها» را انتخاب کنید — یا چند لحظه صبر کنید و دوباره امتحان کنید.`
+        );
+        return;
+      }
+      if (!printResult) {
+        ThemedAlert.alert('خطا', 'ساخت PDF انجام نشد — دوباره تلاش کنید.');
+        return;
+      }
+      const { uri } = printResult;
+      setPdfStatus('آماده شد — باز کردن اشتراک‌گذاری…');
       const available = await Sharing.isAvailableAsync().catch(() => false);
       if (!available) {
         ThemedAlert.alert('PDF ساخته شد', 'فایل ساخته شد اما اشتراک‌گذاری روی این دستگاه در دسترس نیست.');
@@ -833,8 +867,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       ThemedAlert.alert('خطا', 'ساخت PDF انجام نشد — دوباره تلاش کنید.');
     } finally {
       setPdfBusy(false);
+      setPdfStatus('');
     }
-  };
+  };;
 
   // v1.5.3 — ساعت + تاریخ شمسی باز شدن معامله
   const fmtOpenTime = (ms?: number): string => {
@@ -1744,6 +1779,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       <Text style={styles.histPdfBtnText}>{pdfBusy ? 'در حال ساخت…' : 'PDF'}</Text>
                     </Pressable>
                   </View>
+                  {pdfBusy && pdfStatus ? (
+                    <Text style={{ color: colors.dark.textSecondary, fontSize: 10, marginBottom: 4 }}>{pdfStatus}</Text>
+                  ) : null}
                   <View style={styles.histPeriodRow}>
                     {AUTO_PNL_PERIODS.map((p) => (
                       <Pressable
@@ -1975,6 +2013,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       <Text style={styles.histPdfBtnText}>{pdfBusy ? 'در حال ساخت…' : 'PDF'}</Text>
                     </Pressable>
                   </View>
+                  {pdfBusy && pdfStatus ? (
+                    <Text style={{ color: colors.dark.textSecondary, fontSize: 10, marginBottom: 4 }}>{pdfStatus}</Text>
+                  ) : null}
                   <View style={styles.histPeriodRow}>
                     {AUTO_PNL_PERIODS.map((p) => (
                       <Pressable

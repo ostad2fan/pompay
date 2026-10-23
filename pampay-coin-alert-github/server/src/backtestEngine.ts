@@ -280,6 +280,49 @@ async function announce(title: string, text: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// v1.5.11 — اعلام یک‌بار برای همیشه: هر رخداد پوزیشن یک کلید دارد
+// (`open:<id>` / `close:<id>:<reason>` / `partial:<id>:<reason>:<step>`)؛
+// کلیدهای ارسال‌شده در حافظه + store نگه داشته می‌شوند تا حتی بعد از
+// ری‌استارتِ سرور یا seed مجدد وضعیت از اپ، همان رخداد دوباره اعلام
+// نشود («وقتی الارمی را یبار فرستاد از تکرارش جلوگیری کنه»).
+// ---------------------------------------------------------------------------
+
+const ANNOUNCED_KEYS_STORE = "autoTradeAnnouncedKeys";
+const ANNOUNCED_KEYS_CAP = 800;
+const announcedKeys = new Map<string, number>();
+
+async function loadAnnouncedKeys(): Promise<void> {
+  if (announcedKeys.size > 0) return;
+  try {
+    const raw = await store.get<Record<string, number>>(ANNOUNCED_KEYS_STORE);
+    if (raw) for (const [k, v] of Object.entries(raw)) announcedKeys.set(k, v);
+  } catch {}
+}
+
+async function persistAnnouncedKeys(): Promise<void> {
+  try {
+    if (announcedKeys.size > ANNOUNCED_KEYS_CAP) {
+      const sorted = [...announcedKeys.entries()].sort((a, b) => a[1] - b[1]);
+      for (const [k] of sorted.slice(0, announcedKeys.size - ANNOUNCED_KEYS_CAP)) {
+        announcedKeys.delete(k);
+      }
+    }
+    await store.put(ANNOUNCED_KEYS_STORE, Object.fromEntries(announcedKeys));
+  } catch {}
+}
+
+/** اعلام یک‌بارِ یک رخداد پوزیشن (کلید = شناسه‌ی رخداد). */
+async function announceOnce(key: string, title: string, text: string): Promise<void> {
+  try {
+    await loadAnnouncedKeys();
+    if (announcedKeys.has(key)) return;
+    announcedKeys.set(key, Date.now());
+    await persistAnnouncedKeys();
+  } catch {}
+  await announce(title, text);
+}
+
+// ---------------------------------------------------------------------------
 // Binance public prices + exchangeInfo (qty step)
 // ---------------------------------------------------------------------------
 
@@ -661,7 +704,7 @@ async function openDemo(cfg: AutoCfg, st: StoredAutoConfig, symbol: string, side
     "open",
     `دمو ${side === "long" ? "خرید" : "فروش"} ${symbol} @ ${price} (${sourceLabel}${cfg.strategyLabel ? ` • استراتژی ${cfg.strategyLabel}` : ""}) — SL ${stopPrice.toFixed(4)} / TP ${takePrice.toFixed(4)}${sizeUsd !== cfg.positionSizeUsd ? ` • حجم هوشمند: $${sizeUsd.toFixed(1)}` : ""}`
   );
-  await announce(
+  await announceOnce(`open:${pos.id}`, 
     `🤖 بک‌تست (دمو): ${side === "long" ? "🟢 خرید" : "🔴 فروش"} ${symbol}`,
     `ورود ${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)}\nمنبع: ${sourceLabel} • لوریج ${cfg.leverage}x${cfg.strategyLabel ? ` • استراتژی ${cfg.strategyLabel}` : ""}`
   );
@@ -682,7 +725,7 @@ async function closeDemo(st: StoredAutoConfig, id: string, price: number, reason
     "close",
     `بستن دمو ${p.symbol} (${reason === "stop" ? "استاپ" : reason === "take" ? "تیک‌پرافیت" : reason === "whale-close" ? "بستن نهنگ" : reason === "signal" ? "سیگنال" : "دستی"}): ${pnl >= 0 ? "+" : "−"}$${Math.abs(pnl).toFixed(2)}`
   );
-  await announce(
+  await announceOnce(`close:${id}:${reason}`, 
     `🤖 بک‌تست (دمو): بستن ${p.symbol}`,
     `${reason === "stop" ? "استاپ" : reason === "take" ? "تیک‌پرافیت" : reason === "whale-close" ? "نهنگ بست" : reason === "partial" ? "برداشت سود (نصف حجم)" : "سیگنال"} • ${pnl >= 0 ? "✅ سود" : "❌ ضرر"} $${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ""}`
   );
@@ -724,7 +767,7 @@ async function partialCloseDemo(st: StoredAutoConfig, id: string, price: number,
   await putState(state);
   const label = reason === "partial" ? "برداشت سود پله‌ای (نصف حجم)" : "بستن دستی نصف حجم";
   await appendLog("close", `${label} — ${p.symbol}: ${pnl >= 0 ? "+" : "−"}$${Math.abs(pnl).toFixed(2)}`);
-  await announce(
+  await announceOnce(`partial:${id}:${reason}:${(p.partialsDone ?? 0) + 1}`, 
     `🤖 بک‌تست (دمو): نصف حجم ${p.symbol} بسته شد`,
     `${label} • ${pnl >= 0 ? "✅ سود" : "❌ ضرر"} $${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ""}`
   );
@@ -770,7 +813,7 @@ async function partialCloseReal(
   await putState(state);
   const label = reason === "partial" ? "برداشت سود پله‌ای (نصف حجم)" : "بستن دستی نصف حجم";
   await appendLog("close", `${label} — واقعی ${pos.symbol}: ${pnl >= 0 ? "+" : "−"}$${Math.abs(pnl).toFixed(2)} تقریبی`);
-  await announce(
+  await announceOnce(`partial:${pos.id}:${reason}:${(pos.partialsDone ?? 0) + 1}`, 
     `🤖 بک‌تست (واقعی): نصف حجم ${pos.symbol} بسته شد`,
     `${label} • ${pnl >= 0 ? "✅ سود" : "❌ ضرر"} ~$${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ""}`
   );
@@ -832,7 +875,7 @@ async function markDemo(cfg: AutoCfg, st: StoredAutoConfig, prices: Record<strin
         "close",
         `بستن دمو ${p.symbol} (${hitStop ? "استاپ‌لاس" : "تیک‌پرافیت"}${hitStop && pnl >= 0 ? " — ریسک‌فری" : ""}): ${pnl >= 0 ? "+" : "−"}$${Math.abs(pnl).toFixed(2)}`
       );
-      await announce(
+      await announceOnce(`close:${p.id}:${hitStop ? 'stop' : 'take'}`, 
         `🤖 بک‌تست (دمو): بستن ${p.symbol}`,
         `${hitStop ? "استاپ" : "تیک‌پرافیت"}${hitStop && pnl >= 0 ? " (ریسک‌فری)" : ""} • ${pnl >= 0 ? "✅ سود" : "❌ ضرر"} $${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ""}`
       );
@@ -897,7 +940,7 @@ async function openReal(cfg: AutoCfg, st: StoredAutoConfig, symbol: string, side
     "open",
     `واقعی ${side === "long" ? "خرید" : "فروش"} ${symbol} @ ~${price} (${sourceLabel}) — SL ${stopPrice.toFixed(4)} / TP ${takePrice.toFixed(4)}`
   );
-  await announce(
+  await announceOnce(`open:${pos.id}`, 
     `🤖 بک‌تست (واقعی): ${side === "long" ? "🟢 خرید" : "🔴 فروش"} ${symbol}`,
     `ورود ~${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)}\nمنبع: ${sourceLabel} • لوریج ${cfg.leverage}x`
   );
@@ -916,7 +959,7 @@ async function closeReal(st: StoredAutoConfig, keys: { apiKey: string; apiSecret
     st.daily = { ...st.daily, realized: st.daily.realized + pnl };
     st.lossStreak = pnl < 0 ? Math.min(10, st.lossStreak + 1) : pnl > 0 ? 0 : st.lossStreak;
     await appendLog("close", `بستن واقعی ${symbol} (${reason}): ${pnl >= 0 ? "+" : "−"}$${Math.abs(pnl).toFixed(2)} تقریبی`);
-    await announce(
+    await announceOnce(`close:${p.id}:${reasonKind}`, 
       `🤖 بک‌تست (واقعی): بستن ${symbol}`,
       `${reason} • ${pnl >= 0 ? "✅ سود" : "❌ ضرر"} ~$${Math.abs(pnl).toFixed(2)}`
     );
@@ -951,7 +994,7 @@ async function manageReal(cfg: AutoCfg, st: StoredAutoConfig): Promise<void> {
       st.daily = { ...st.daily, realized: st.daily.realized + pnl };
       st.lossStreak = pnl < 0 ? Math.min(10, st.lossStreak + 1) : pnl > 0 ? 0 : st.lossStreak;
       await appendLog("close", `بستن واقعی ${p.symbol} (روی صرافی): ${pnl >= 0 ? "+" : "−"}$${Math.abs(pnl).toFixed(2)} تقریبی`);
-      await announce(
+      await announceOnce(`close:${p.id}:take`, 
         `🤖 بک‌تست (واقعی): بستن ${p.symbol}`,
         `بسته شد روی صرافی (استاپ/تیک‌پرافیت) • ${pnl >= 0 ? "✅ سود" : "❌ ضرر"} ~$${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ""}`
       );

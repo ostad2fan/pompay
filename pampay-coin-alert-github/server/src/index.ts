@@ -237,7 +237,7 @@ const server = http.createServer(async (req, res) => {
           appOpen,
         },
         heartbeatAt: heartbeatAt ?? null,
-        serverCode: "1.5.9",
+        serverCode: "1.5.11",
         push: await pushStatus(),
       });
     }
