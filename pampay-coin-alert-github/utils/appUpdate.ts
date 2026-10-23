@@ -21,8 +21,8 @@ import { Linking, Platform } from 'react-native';
 import { getServerUrl } from './scanServerApi';
 
 /** Must match app.json «version» at release time. */
-export const APP_VERSION = '1.5.9';
-export const APP_VERSION_CODE = 34;
+export const APP_VERSION = '1.5.10';
+export const APP_VERSION_CODE = 35;
 
 const REPO_OWNER = 'ostad2fan';
 const REPO_NAME = 'pompay';
@@ -266,11 +266,48 @@ export function apkFileNameFor(info: { latestVersion?: string } | null | undefin
 }
 
 /**
+ * v1.5.10 — probe each candidate with a tiny ranged GET (2 bytes) and return
+ * the first URL that really exists (HTTP 200/206). Fixes the observed
+ * failure where the versioned APK file was not uploaded to GitHub: the
+ * browser opened a 404 page and the fallback chain never ran, because
+ * Linking.openURL only throws when NO handler exists — not when the file is
+ * missing. Probing is capped (4s per URL, 20s total) so a blocked mirror can
+ * never hang the download button.
+ */
+async function firstReachableUrl(urls: string[]): Promise<string | null> {
+  const deadline = Date.now() + 20_000;
+  for (const url of urls) {
+    if (Date.now() > deadline) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4_000);
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers: { Range: 'bytes=0-1', Accept: '*/*' },
+        signal: controller.signal,
+      });
+      // 206 Partial Content or a plain 200 both mean the file exists.
+      if (res.ok || res.status === 206) return url;
+    } catch {
+      // unreachable mirror → try the next candidate
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return null;
+}
+
+/**
  * Opens the APK URL → the browser downloads the file directly. The download
  * filename carries the version (PampDumpCoins-v1.4.10.apk) and every URL
  * gets a cache-buster so no cached older APK can ever be served. Falls back
  * through the mirrors (ending with the Railway server relay) when a URL
  * cannot be opened at all.
+ *
+ * v1.5.10: the first candidate that actually EXISTS is opened (a 2-byte
+ * ranged GET probe), so a missing versioned APK on GitHub falls through to
+ * the fixed-name mirror automatically — the browser can no longer land on a
+ * dead 404 page.
  */
 export async function openApkDownload(apkUrl: string): Promise<void> {
   const candidates = [...apkDownloadCandidates(apkUrl)];
@@ -278,8 +315,17 @@ export async function openApkDownload(apkUrl: string): Promise<void> {
     const serverUrl = await getServerUrl();
     if (serverUrl) candidates.push(`${serverUrl}/latest-apk`);
   } catch {}
+  // v1.5.10 — pick the first URL that really exists. If probing is not
+  // possible at all (no network / every mirror blocked), fall back to the
+  // old behaviour and open the primary URL — the browser may still succeed
+  // through its own network stack (e.g. with a VPN).
+  let ordered = candidates;
+  try {
+    const reachable = await firstReachableUrl(candidates);
+    if (reachable) ordered = [reachable, ...candidates.filter((u) => u !== reachable)];
+  } catch {}
   let lastError: unknown = null;
-  for (const url of candidates) {
+  for (const url of ordered) {
     try {
       if (Platform.OS === 'web') {
         window.open(url, '_blank');

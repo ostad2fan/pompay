@@ -808,6 +808,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         entryText: fmtPrice(p.symbol, p.entryPrice),
         stopText: fmtPrice(p.symbol, p.stopPrice),
         takeText: fmtPrice(p.symbol, p.takePrice),
+        // v1.5.10 — «نقطه خروج» در PDF: قیمت لحظه‌ی بسته شدن
+        exitText: p.lastPrice > 0 ? fmtPrice(p.symbol, p.lastPrice) : '—',
       }));
       const html = buildBacktestPdfHtml(rows, {
         mode: settings.mode,

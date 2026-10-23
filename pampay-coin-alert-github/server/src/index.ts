@@ -494,6 +494,38 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`[Server] PamPay Coin Alert backend listening on :${PORT}`);
   console.log(`[Server] push configured: ${process.env.EXPO_ACCESS_TOKEN ? "yes (access token)" : "no token (open mode)"}`);
+  // v1.5.10 — KEEP-ALIVE SELF-PING («اعلان‌ها با برنامه‌ی بسته نمی‌آید»):
+  // سرویس‌های Railway بعد از مدتی بی‌حرکتی می‌خوابند (spin-down) → همه‌ی
+  // پایش ۲۴/۷ (اسکنر، اندیکاتورها، نهنگ‌ها، ربات بک‌تست) با برنامه‌ی بسته
+  // متوقف می‌شد و تا باز شدن بعدی برنامه بیدار نمی‌شد. یک self-ping سبک
+  // هر ۴ دقیقه به آدرس عمومی خود سرویس، آن را همیشه بیدار نگه می‌دارد.
+  // Railway متغیر RAILWAY_PUBLIC_DOMAIN را خودکار تنظیم می‌کند؛ اگر نبود،
+  // هیچ‌کاری نمی‌کنیم (مثلاً در محیط dev).
+  const publicDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
+  if (publicDomain) {
+    const selfPing = async (): Promise<void> => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 10_000);
+        try {
+          const res = await fetch(`https://${publicDomain}/ping`, {
+            signal: controller.signal,
+            headers: { Accept: "application/json" },
+          });
+          if (!res.ok) console.log(`[KeepAlive] ping status ${res.status}`);
+        } finally {
+          clearTimeout(timer);
+        }
+      } catch {
+        // بی‌خطر — تیک بعدی دوباره امتحان می‌کند
+      }
+    };
+    setTimeout(() => void selfPing(), 30_000);
+    setInterval(() => void selfPing(), 4 * 60_000);
+    console.log(`[KeepAlive] self-ping enabled -> https://${publicDomain}/ping every 4 min`);
+  } else {
+    console.log("[KeepAlive] RAILWAY_PUBLIC_DOMAIN not set — self-ping disabled");
+  }
   // v1.4.3: server-side Telegram command processing (24/7, even with the
   // app closed). Starts polling getUpdates as soon as a bot token is synced.
   // v1.4.5: boot-wrapped so a poller startup bug can never kill the service.
