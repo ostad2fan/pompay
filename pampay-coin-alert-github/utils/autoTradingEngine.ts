@@ -594,12 +594,13 @@ async function currentStrategyLabel(): Promise<string> {
 }
 
 /** v1.5.3 — اعلام تلگرام سمت برنامه (وقتی برنامه باز است حتی بدون سرور ۲۴/۷).
- *  v1.5.7 — وقتی حالت سرور ۲۴/۷ فعال است، سرور خودش اعلام می‌کند؛ اعلام
- *  محلی قطع می‌شود تا هر رخداد فقط یک بار به تلگرام برسد. */
+ *  v1.5.9 — برگشت به الگوی قدیمی: برنامه «همیشه» رخدادهای خودش را مستقیم
+ *  اعلام می‌کند. سرور وقتی برنامه باز است با heartbeat مکث می‌کند (v1.5.9)،
+ *  پس دیگر خبری از دوبله‌شدن نیست — و اگر سرور قطع/خواب باشد هم اعلام
+ *  دیر نمی‌شود (بازخورد: «دیگه اعلان‌ها در تلگرام نمی‌آمد»). */
 async function announceTelegram(title: string, text: string): Promise<void> {
   try {
     if (Platform.OS === 'web') return;
-    if (await isServerModeActive()) return; // سرور اعلام می‌کند — بدون تکرار
     const raw = await AsyncStorage.getItem('@crypto_scanner_settings');
     if (!raw) return;
     const s = JSON.parse(raw) as { telegramEnabled?: boolean; telegramBotToken?: string; telegramChatId?: string };
@@ -1699,6 +1700,10 @@ async function runGlobalCycle(): Promise<void> {
     const realKeys = settings.mode === 'real' ? await loadRealKeys() : undefined;
     const res = await runAutoCycle({ settings, realKeys });
     for (const e of res.errors.slice(0, 2)) await appendLog('error', e);
+    // v1.5.9 — heartbeat برنامه‌باز: تا برنامه باز است سرور موتور خودش را
+    // مکث می‌کند (نه دوبله‌معامله، نه دوبله‌اعلان) و پوزیشن‌های محلی روی
+    // سرور merge می‌شوند تا بعد از بسته‌شدن برنامه از همان‌جا ادامه دهد.
+    await sendAppOpenHeartbeat();
   } catch {
     // never let the loop die
   } finally {
@@ -1934,11 +1939,12 @@ export async function runLightMtm(): Promise<void> {
   try {
     const settings = await loadAutoSettings();
     if (!settings.enabled) return;
-    // حالت سرور ۲۴/۷ (خودکار v1.5.7): state سرور sync می‌شود (سرور خودش چرخه می‌زند).
-    // v1.5.4 — اگر sync ناموفق بود، MTM محلی ادامه می‌دهد (ربات ساکت نشود).
+    // v1.5.9 — sync سرور همیشه «غیرمسدودکننده» است: در بک‌گراند و حداکثر
+    // هر ۱۰ ثانیه؛ دیگر چرخه سبک روی سرورِ خواب معطل نمی‌ماند (بازخورد:
+    // «بروزرسانی اطلاعات و موجودی در PnL دیر انجام می‌شد»). MTM محلی همیشه
+    // همان لحظه اجرا می‌شود.
     if (await isServerModeActive()) {
-      const synced = await syncAutoTradeStateFromServer();
-      if (synced) return;
+      void syncAutoTradeStateFromServer().catch(() => {});
     }
     // قیمت با کش ۲.۵ ثانیه‌ای تا PnL نمایش واقعاً هر ۳ ثانیه تازه شود
     const prices = await getBinancePrices(2_500).catch(() => ({}) as Record<string, number>);
@@ -2070,10 +2076,38 @@ export interface ServerAutoTradeState {
   serverNow: number;
   /** v1.5.4 — آیا توکن/چت‌آیدی تلگرام روی سرور تنظیم شده (اعلان‌ها می‌روند؟). */
   telegramConfigured?: boolean;
+  /** v1.5.9 — مکان‌نمای آخرین سیگنالِ معامله‌شده روی سرور (تا برنامه بعد از
+   *  باز شدن، سیگنالی که سرور شبانه معامله کرده را دوباره باز نکند). */
+  lastSignalAt?: number | null;
+  /** v1.5.9 — سرور به‌خاطر باز بودن برنامه مکث کرده است؟ */
+  appOpen?: boolean;
 }
 
 // v1.5.4 — منطق merge در فایل مستقل utils/autoMerge.ts (قابل تست در Node)
 export { mergePositionsById } from './autoMerge';
+
+/** v1.5.9 — merge لاگ‌ها بر اساس id + حذف پیام‌های تکراریِ پشت‌سرهم
+ *  (ریشه‌ی «رفرش که می‌زنی فقط یه تاریخچه اعلان تکرار می‌شود»: sync قدیمی
+ *  لاگ‌های محلی را با لاگ سرور «جایگزین» می‌کرد و رکوردهای تکراریِ سرور
+ *  همه‌ی تاریخچه را می‌پوشاندند). سرور برنده‌ی id یکسان است. */
+export function mergeLogsById(local: AutoEngineLog[], incoming: AutoEngineLog[]): AutoEngineLog[] {
+  const byId = new Map<string, AutoEngineLog>();
+  for (const l of local) byId.set(l.id, l);
+  for (const l of incoming) byId.set(l.id, l);
+  const all = [...byId.values()].sort((a, b) => (b.at ?? 0) - (a.at ?? 0));
+  const out: AutoEngineLog[] = [];
+  let lastMessage = '';
+  let lastAt = -Infinity;
+  for (const l of all) {
+    // پیام یکسانِ تکراری داخل ۱۰ دقیقه فقط یک‌بار نمایش داده می‌شود
+    // (Math.abs چون لیست جدیدترین-اول است و فاصله دوسویه معنی‌دار است)
+    if (l.message === lastMessage && Math.abs((l.at ?? 0) - lastAt) < 10 * 60_000) continue;
+    out.push(l);
+    lastMessage = l.message;
+    lastAt = l.at ?? 0;
+  }
+  return out.slice(0, 60);
+}
 
 /**
  * v1.5.4 — توکن/چت‌آیدی تلگرام که برنامه برای اعلان‌های خودش استفاده می‌کند
@@ -2194,14 +2228,31 @@ export async function pushAutoTradeConfigToServer(
   }
 }
 
-export async function syncAutoTradeStateFromServer(): Promise<boolean> {
+// v1.5.9 — حداقل فاصله بین دو sync (هر ۱۰ ثانیه) — sync قبلی هر ۳ ثانیه
+// فرستاده می‌شد و روی سرور خواب‌آلود تا ۳۰-۶۰ ثانیه معطل می‌ماند؛ نتیجه
+// «بروزرسانی اطلاعات و موجودی در PnL دیر انجام می‌شد».
+let lastStateSyncAt = 0;
+
+export async function syncAutoTradeStateFromServer(force = false): Promise<boolean> {
   try {
     const settings = await loadAutoSettings();
     if (!settings.enabled) return false;
     const base = await getServerUrl();
     if (!base) return false;
+    if (!force && Date.now() - lastStateSyncAt < 10_000) return true;
     const secret = await getInstallSecret();
-    const res = await fetch(`${base}/autotrade/state?secret=${encodeURIComponent(secret)}`);
+    // v1.5.9 — timeout کوتاه (۵ ثانیه): sync هرگز نباید چرخه سبک / رفرش را
+    // معطل کند؛ سرور خواب که باشد، MTM محلی همان لحظه ادامه می‌دهد.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5_000);
+    let res: Response;
+    try {
+      res = await fetch(`${base}/autotrade/state?secret=${encodeURIComponent(secret)}`, {
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!res.ok) return false;
     const data = (await res.json()) as ServerAutoTradeState;
     if (!data?.ok) return false;
@@ -2223,12 +2274,142 @@ export async function syncAutoTradeStateFromServer(): Promise<boolean> {
         await saveRealPositions(mergePositionsById(localReal, data.realPositions));
       }
     }
-    if (Array.isArray(data.logs) && data.logs.length > 0) {
-      await AsyncStorage.setItem(LOG_KEY, JSON.stringify(data.logs.slice(0, 60)));
+    // v1.5.9 — merge لاگ‌ها (نه جایگزینی) + حذف تکراری‌های پشت‌سرهم
+    if (Array.isArray(data.logs)) {
+      const merged = mergeLogsById(await getAutoLogs(), data.logs);
+      if (merged.length > 0) {
+        await AsyncStorage.setItem(LOG_KEY, JSON.stringify(merged));
+      }
+    }
+    // v1.5.9 — مکان‌نمای سیگنال سرور روی محلی اعمال شود تا سیگنالی که
+    // سرور (مثلاً شب گذشته) معامله کرده، دوباره باز نشود.
+    if (typeof data.lastSignalAt === 'number' && data.lastSignalAt > 0) {
+      try {
+        const cur = Number((await AsyncStorage.getItem(LAST_SIGNAL_AT_KEY)) ?? '0') || 0;
+        if (data.lastSignalAt > cur) {
+          await AsyncStorage.setItem(LAST_SIGNAL_AT_KEY, String(data.lastSignalAt));
+        }
+      } catch {}
     }
     if (typeof data.lastCycleAt === 'number') lastGlobalCycleAt = data.lastCycleAt;
+    lastStateSyncAt = Date.now();
     return true;
   } catch {
     return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.9 — APP-OPEN HEARTBEAT (لیزِ برنامه‌باز):
+//   • تا قبل: برنامه با هر باز شدن، کل کانفیگ را push می‌کرد و سرورِ قدیمی
+//     روی «هر» push پیام «ربات بک‌تست فعال شد» به تلگرام می‌فرستاد
+//     (بازخورد: «هر بار برنامه را باز می‌کنم در تلگرام می‌زنه فعال شد»).
+//   • حالا: برنامه باز است → هر ۶۰ ثانیه فقط یک heartbeat سبک می‌فرستد
+//     (بدون هیچ پیام تلگرامی). سرور تا ۳ دقیقه heartbeat تازه داشته باشد
+//     موتور خودش را مکث می‌کند → نه دوبله‌شدن معامله، نه دوبله‌شدن اعلان.
+//     برنامه که بسته شد، heartbeat قطع می‌شود و سرور ۲۴/۷ ادامه می‌دهد.
+//   • heartbeat همزمان پوزیشن‌های محلی را هم merge می‌کند تا سرور بعد از
+//     بسته‌شدن برنامه از همان‌جا ادامه دهد + مکان‌نمای سیگنال sync می‌شود.
+// ---------------------------------------------------------------------------
+
+let lastHeartbeatAt = 0;
+
+export async function sendAppOpenHeartbeat(force = false): Promise<void> {
+  try {
+    if (!force && Date.now() - lastHeartbeatAt < 50_000) return;
+    const settings = await loadAutoSettings();
+    if (!settings.enabled) return;
+    if (!(await isServerModeActive())) return;
+    const base = await getServerUrl();
+    if (!base) return;
+    const secret = await getInstallSecret();
+    const [demoPositions, realPositions] = await Promise.all([
+      loadDemoPositions(),
+      loadRealPositions(),
+    ]);
+    let lastSignalAt = 0;
+    try {
+      lastSignalAt = Number((await AsyncStorage.getItem(LAST_SIGNAL_AT_KEY)) ?? '0') || 0;
+    } catch {}
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5_000);
+    try {
+      await fetch(`${base}/autotrade/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          secret,
+          demoPositions: demoPositions.slice(0, 600),
+          realPositions: realPositions.slice(0, 600),
+          lastSignalAt,
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+      lastHeartbeatAt = Date.now();
+    }
+  } catch {
+    // never fatal
+  }
+}
+
+/**
+ * v1.5.9 — «یه گزینه بستن همه پوزیشن‌های باز با پیغام تایید در بک‌تست»:
+ * همه پوزیشن‌های باز همان حالت (دمو یا واقعی) را با قیمت لحظه‌ای می‌بندد.
+ */
+export async function closeAllOpenPositions(
+  settings: AutoTradeSettings,
+  keys: RealKeys | undefined
+): Promise<{ closed: number; failed: number }> {
+  let closed = 0;
+  let failed = 0;
+  if (settings.mode === 'demo') {
+    const positions = await loadDemoPositions();
+    const open = positions.filter((p) => p.status === 'open');
+    if (open.length === 0) return { closed: 0, failed: 0 };
+    const symbols = [...new Set(open.map((p) => `${p.symbol}USDT`))];
+    const prices = await getBinancePrices(5_000).catch(() => ({}) as Record<string, number>);
+    for (const p of open) {
+      const price = prices[`${p.symbol}USDT`] ?? p.lastPrice ?? p.entryPrice;
+      const ok = await closeDemo(p.id, price, 'manual').catch(() => false);
+      if (ok) closed++;
+      else failed++;
+    }
+    await appendLog('info', `بستن همه پوزیشن‌های باز (دستی گروهی): ${closed} بسته شد${failed > 0 ? ` • ${failed} ناموفق` : ''}`);
+    return { closed, failed };
+  }
+  // حالت واقعی — بستن مارکت هر پوزیشن روی بایننس
+  if (!keys) return { closed: 0, failed: 0 };
+  const positions = await loadRealPositions();
+  const open = positions.filter((p) => p.status === 'open');
+  for (const p of open) {
+    try {
+      // positionAmt امضادار: مثبت = لانگ، منفی = شورت
+      const positionAmt = (p.side === 'long' ? 1 : -1) * p.qty;
+      await closeRealPosition(keys.apiKey, keys.apiSecret, `${p.symbol}USDT`, positionAmt);
+      const dir = p.side === 'long' ? 1 : -1;
+      const pnl = ((p.lastPrice ?? p.entryPrice) - p.entryPrice) * dir * p.qty;
+      const idx = positions.findIndex((x) => x.id === p.id && x.status === 'open');
+      if (idx >= 0) {
+        positions[idx] = {
+          ...positions[idx],
+          status: 'closed',
+          closedAt: Date.now(),
+          closeReason: 'manual',
+          realizedPnl: pnl,
+        };
+      }
+      await recordClosedPnl(pnl);
+      closed++;
+    } catch {
+      failed++;
+    }
+  }
+  await saveRealPositions(positions);
+  await appendLog(
+    'info',
+    `بستن همه پوزیشن‌های واقعی (دستی گروهی): ${closed} بسته شد${failed > 0 ? ` • ${failed} ناموفق` : ''}`
+  );
+  return { closed, failed };
 }

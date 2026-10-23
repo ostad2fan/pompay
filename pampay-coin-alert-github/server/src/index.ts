@@ -29,7 +29,7 @@ import { sendTelegram, getLastTelegramError } from "./telegram";
 import { runWhaleWatch } from "./whaleWatch";
 // v1.5.8 — R4: پیام سلامت روزانه (تشخیص «سکوت طبیعی» از «مسیر قطع»)
 import { runDailyHeartbeat } from "./heartbeat";
-import { startBacktestEngine, handleAutoTradeConfig, getAutoTradeStateFor } from "./backtestEngine";
+import { startBacktestEngine, handleAutoTradeConfig, getAutoTradeStateFor, handleAutoTradeHeartbeat } from "./backtestEngine";
 import {
   startBotCommandPoller,
   getPendingForApp,
@@ -200,6 +200,9 @@ const server = http.createServer(async (req, res) => {
       const heartbeatAt = await store.get<number>("heartbeatAt");
       const autoDoc = await store.get<{ cfg?: { enabled?: boolean; mode?: string } }>("autoTradeConfig");
       const autoState = await store.get<{ lastCycleAt?: number | null }>("autoTradeState");
+      // v1.5.9 — برنامه باز است؟ (سرور موتورش را مکث کرده و برنامه محلی کار می‌کند)
+      const appHeartbeatAt = await store.get<number>("autoTradeAppHeartbeatAt");
+      const appOpen = Date.now() - (appHeartbeatAt ?? 0) < 180_000;
       return json(res, 200, {
         ok: true,
         hasConfig: Boolean(config),
@@ -231,8 +234,10 @@ const server = http.createServer(async (req, res) => {
           enabled: !!autoDoc?.cfg?.enabled,
           mode: autoDoc?.cfg?.mode === "real" ? "real" : "demo",
           lastCycleAt: autoState?.lastCycleAt ?? null,
+          appOpen,
         },
         heartbeatAt: heartbeatAt ?? null,
+        serverCode: "1.5.9",
         push: await pushStatus(),
       });
     }
@@ -252,6 +257,19 @@ const server = http.createServer(async (req, res) => {
       const secret = String(url.searchParams.get("secret") ?? "");
       const result = await getAutoTradeStateFor(secret);
       return json(res, result.status, result.payload);
+    }
+    // ---- v1.5.9: app-open heartbeat — سرور تا وقتی برنامه باز است موتور
+    // خودش را مکث می‌کند (بدون آن، هر دو طرف معامله/اعلام دوبله می‌کردند).
+    // بدون هیچ پیام تلگرامی — فقط lease + merge پوزیشن‌ها + مکان‌نمای سیگنال.
+    if (req.method === "POST" && url.pathname === "/autotrade/heartbeat") {
+      const raw = await readBody(req);
+      try {
+        const body = JSON.parse(raw || "{}") as Record<string, unknown>;
+        const result = await handleAutoTradeHeartbeat(body);
+        return json(res, result.status, result.payload);
+      } catch {
+        return json(res, 400, { ok: false, error: "invalid json" });
+      }
     }
 
     // ---- v1.5.8 — R4: بازپس‌گیری سرور با کد تلگرام -------------------------

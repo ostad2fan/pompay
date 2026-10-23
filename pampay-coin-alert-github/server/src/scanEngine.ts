@@ -774,43 +774,10 @@ class ScanEngine {
       }
     } catch {}
 
-    // v1.5.7 — R4 «اعلان‌های اندیکاتورها/نهنگ‌ها با برنامه بسته نمی‌آید»:
-    // هر بار که «محتوای» کانفیگ تغییر کند (نه هر sync)، یک پیام تأیید کوتاه
-    // به تلگرام می‌رود تا کاربر بداند سرور در حال پایش است — throttle: حداکثر
-    // یک پیام در هر ۱۰ دقیقه + فقط وقتی چیزی واقعاً عوض شده باشد.
-    try {
-      const whales = cfg.whaleWallets ?? [];
-      const summary =
-        `${cfg.gainzAlgoEnabled ? `GainzAlgo(${(cfg.gainzTimeframes ?? []).join("/")})` : ""}` +
-        `${cfg.hookEnabled ? `${cfg.gainzAlgoEnabled ? " + " : ""}هوک(${(cfg.hookTimeframes ?? []).join("/")})` : ""}` +
-        `${cfg.indicators.some((i) => i.receiveSignals) ? ` + ${cfg.indicators.filter((i) => i.receiveSignals).length} اندیکاتور دستی` : ""}` +
-        `${cfg.whaleNotifications && whales.length > 0 ? ` + ${whales.length} نهنگ` : ""}` +
-        `${cfg.scannerEnabled ? " + اسکنر پامپ/دامپ" : ""}${cfg.memeEnabled ? " + شورت میم" : ""}${cfg.preListingEnabled ? " + پیش‌لیستینگ" : ""}`;
-      const prev = (await store.get<string>("configAnnounceSummary")) ?? "";
-      const lastAt = (await store.get<number>("configAnnounceAt")) ?? 0;
-      if (
-        cfg.botToken &&
-        cfg.chatId &&
-        summary !== prev &&
-        Date.now() - lastAt > 10 * 60_000
-      ) {
-        await store.put("configAnnounceSummary", summary);
-        await store.put("configAnnounceAt", Date.now());
-        await sendTelegram(
-          cfg,
-          [
-            "📡 <b>پایش ۲۴/۷ سرور فعال است</b>",
-            "حتی وقتی برنامه بسته است، سرور این بخش‌ها را اسکن و همین‌جا اعلام می‌کند:",
-            summary || "—",
-            "اگر این پیام می‌بینید یعنی مسیر اعلان تلگرام سالم است؛ سیگنال جدید = پیام بعدی.",
-          ].join("\n")
-        );
-      } else if (summary !== prev) {
-        // تغییر بود اما throttle → فقط خلاصه را ذخیره تا بعد از ۱۰ دقیقه
-        // sync بعدی پیام بدهد (syncها مدام از برنامه می‌آیند).
-        await store.put("configAnnounceSummary", `__pending__${summary}`);
-      }
-    } catch {}
+    // v1.5.9 — پیام تلگرامی «پایش ۲۴/۷ سرور فعال است» حذف شد (بازخورد کاربر:
+    // متن‌های اعلان تلگرام اضافی نیازی نیست — فقط رخدادهای واقعی). سلامت
+    // مسیر از طریق «بررسی سلامت اعلان‌های ۲۴/۷» در تنظیمات و پیام سلامت
+    // روزانه قابل اثبات است.
 
     // Catch-up: if today's scan hasn't happened yet (app was closed across
     // midnight), run it right away so the user gets missed signals.

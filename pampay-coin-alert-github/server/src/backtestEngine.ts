@@ -113,6 +113,10 @@ interface BtLog {
 const CFG_KEY = "autoTradeConfig";
 const STATE_KEY = "autoTradeState";
 const CYCLE_MS = 60_000;
+// v1.5.9 — لیزِ برنامه‌باز: تا این مقدار از آخرین heartbeat تازه باشد، سرور
+// موتور خودش را مکث می‌کند (برنامه باز است و خودش معامله/اعلام می‌کند).
+const APP_OPEN_LEASE_MS = 180_000;
+const APP_HEARTBEAT_KEY = "autoTradeAppHeartbeatAt";
 const FEE_ROUNDTRIP = 0.001;
 const LOG_MAX = 60;
 // v1.5.3 — تریلینگ جدید (طبق مشخصات کاربر)
@@ -133,6 +137,21 @@ async function putConfig(c: StoredAutoConfig): Promise<void> {
   await store.put(CFG_KEY, c);
 }
 
+// v1.5.9 — CONFIG LOCK: تمام تغییرات کانفیگ (push اپ، پایان چرخه، heartbeat)
+// پشت یک زنجیره‌ی پرلگِ مشترک اجرا می‌شوند تا «خواندن→نوشتن» اتمیک باشد.
+// ریشه‌ی باگ تست‌گرفته: چرخه‌ی در حال اجرا وسط push جدید، کانفیگ قدیمی را
+// روی جدید می‌نوشت (guard قبلی خودش بین read و write پنجره داشت) — همان
+// «تنظیمات لحظه‌ای اعمال نمی‌شود».
+let configLock: Promise<unknown> = Promise.resolve();
+function withConfigLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = configLock.then(fn, fn);
+  configLock = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
 async function getState(): Promise<{ demo: BtPosition[]; real: BtPosition[]; logs: BtLog[]; lastCycleAt: number | null }> {
   return (
     (await store.get<{ demo: BtPosition[]; real: BtPosition[]; logs: BtLog[]; lastCycleAt: number | null }>(STATE_KEY)) ?? {
@@ -150,6 +169,10 @@ async function putState(s: { demo: BtPosition[]; real: BtPosition[]; logs: BtLog
 
 async function appendLog(kind: BtLog["kind"], message: string): Promise<void> {
   const s = await getState();
+  // v1.5.9 — نگهبان تکرار: پیامِ یکسانِ پشت‌سرهم (تا ۶۰ ثانیه) فقط یک‌بار
+  // ثبت می‌شود — ریشه‌ی «رفرش که می‌زنی یک تاریخچه اعلان هی تکرار می‌شد».
+  const top = s.logs[0];
+  if (top && top.message === message && Date.now() - (top.at ?? 0) < 60_000) return;
   s.logs.unshift({ id: `l-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, at: Date.now(), kind, message });
   await putState({ ...s, logs: s.logs.slice(0, LOG_MAX) });
 }
@@ -990,6 +1013,11 @@ export async function runBacktestCycle(): Promise<void> {
     const st = await getConfig();
     if (!st || !st.cfg.enabled) return;
     const cfg = st.cfg;
+    // v1.5.9 — برنامه باز است؟ (heartbeat تازه) → سرور مکث می‌کند تا نه
+    // معامله دوبله شود و نه اعلان (برنامه خودش هر دو کار را می‌کند).
+    // برنامه که بسته شد، lease در حداکثر ۳ دقیقه منقضی و سرور ۲۴/۷ ادامه می‌دهد.
+    const lastHb = (await store.get<number>(APP_HEARTBEAT_KEY)) ?? 0;
+    if (Date.now() - lastHb < APP_OPEN_LEASE_MS) return;
     // daily rollover
     if (st.daily.date !== todayKey()) {
       st.daily = { date: todayKey(), realized: 0, entries: 0 };
@@ -1107,14 +1135,17 @@ export async function runBacktestCycle(): Promise<void> {
     // wins; only the cycle-owned fields (whaleSnapshot/lastSignalAt/daily/
     // lossStreak) come from this cycle. این همان ریشه‌ی «تنظیمات لحظه‌ای اعمال
     // نمی‌شود / سوییچ که روشن می‌شد همه‌چیز قطع می‌شد» بود.
-    const latestCfgDoc = await getConfig();
-    await putConfig({
-      cfg: latestCfgDoc?.cfg ?? st.cfg,
-      whaleSnapshot: st.whaleSnapshot,
-      lastSignalAt: st.lastSignalAt,
-      daily: st.daily,
-      lossStreak: st.lossStreak,
-      updatedAt: st.updatedAt,
+    // v1.5.9 — داخل config lock (تست: push وسط چرخه دیگر گم نمی‌شود).
+    await withConfigLock(async () => {
+      const latestCfgDoc = await getConfig();
+      await putConfig({
+        cfg: latestCfgDoc?.cfg ?? st.cfg,
+        whaleSnapshot: st.whaleSnapshot,
+        lastSignalAt: st.lastSignalAt,
+        daily: st.daily,
+        lossStreak: st.lossStreak,
+        updatedAt: st.updatedAt,
+      });
     });
     const state = await getState();
     await putState({ ...state, lastCycleAt: Date.now() });
@@ -1162,6 +1193,9 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
   const resetFlag =
     (b as { reset?: unknown }).reset === true ||
     (c as { reset?: unknown }).reset === true;
+  // v1.5.9 — کل «خواندن قبلی → ساختن کانفیگ → نوشتن» داخل config lock:
+  // pushهای همزمان (اپ + پایان چرخه) دیگر روی هم نمی‌نویسند.
+  const { prev, st, cfg, wasOff } = await withConfigLock(async () => {
   const prev = await getConfig();
   const cfg: AutoCfg = {
     enabled: Boolean(c.enabled),
@@ -1241,15 +1275,20 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
   }
 
   await putConfig(st);
+  return { prev, st, cfg, wasOff: prev ? !prev.cfg.enabled : true };
+  });
 
-  // v1.5.3 — «ریست کامل دمو»: همه‌چیز (حتی تاریخچه) پاک شود
+  // v1.5.3 — «ریست کامل دمو»: همه‌چیز (حتی تاریخچه) پاک شود — داخل lock تا
+  // همزمانی با پایان چرخه، تنظیمات ریست را برنگرداند.
   if (resetFlag) {
-    await putState({ demo: [], real: [], logs: [], lastCycleAt: null });
-    st.whaleSnapshot = [];
-    st.lastSignalAt = Date.now();
-    st.daily = { date: todayKey(), realized: 0, entries: 0 };
-    st.lossStreak = 0;
-    await putConfig(st);
+    await withConfigLock(async () => {
+      await putState({ demo: [], real: [], logs: [], lastCycleAt: null });
+      st.whaleSnapshot = [];
+      st.lastSignalAt = Date.now();
+      st.daily = { date: todayKey(), realized: 0, entries: 0 };
+      st.lossStreak = 0;
+      await putConfig(st);
+    });
     await appendLog("info", "ریست کامل بک‌تست انجام شد — همه‌چیز از صفر شروع می‌شود (حتی تاریخچه پاک شد)");
     if (cfg.enabled) {
       await announce(
@@ -1262,33 +1301,30 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
   }
 
   if (cfg.enabled) {
-    // v1.5.3 — ری‌استارت: لاگ قدیمی «متوقف شد» حذف می‌شود تا دیگر به‌عنوان
-    // خطا دیده نشود («ربات را استپ و مجدد شروع کردم می‌زنه متوقف شد»).
+    // v1.5.9 — «هر بار برنامه را باز می‌کنم در تلگرام می‌زنه فعال شد» ریشه‌یاب شد:
+    // اپ با هر باز شدن، کل کانفیگ را push می‌کرد و سرور روی «هر» push پیام
+    // 🚀/🔄 می‌فرستاد + لاگ اضافه می‌کرد (همان یک تاریخچه‌ی تکراری!).
+    // حالا: فقط در گذارِ واقعیِ خاموش→روشن (wasOff از داخل lock) اعلام و لاگ
+    // ثبت می‌شود؛ pushهای تکراری (باز شدن برنامه/تغییر پارامتر) کاملاً بی‌صدا
+    // فقط کانفیگ را به‌روز می‌کنند.
     await dropStoppedLogs();
-    const wasOff = prev ? !prev.cfg.enabled : true;
-    await appendLog(
-      "info",
-      wasOff
-        ? "ربات بک‌تست روی سرور فعال شد — اعلام‌ها به تلگرام می‌روند"
-        : "ربات بک‌تست با تنظیمات جدید دوباره فعال شد"
-    );
-    // v1.5.3 — اعلام شروع/ری‌استارت با خلاصه تنظیمات (کاربر بلافاصله در
-    // تلگرام می‌بیند که ربات روی سرور روشن شده — علت سکوت قبلی معلوم می‌شود)
-    await announce(
-      wasOff ? "🚀 ربات بک‌تست روی سرور فعال شد (۲۴/۷)" : "🔄 ربات بک‌تست با تنظیمات جدید دوباره فعال شد",
-      `حالت: ${cfg.mode === "real" ? "واقعی 💰" : "دمو"} • استراتژی: ${cfg.strategyLabel ?? "—"}\n` +
-        `لوریج ${cfg.leverage}x • حد ضرر ${cfg.maxLossPercent}٪ (= ضرر حساب ${Math.round(cfg.maxLossPercent * cfg.leverage)}٪) • R:R 1:${cfg.rewardRatio}\n` +
-        `حجم $${cfg.positionSizeUsd} • حداکثر ${cfg.maxOpenPositions} پوزیشن • سرمایه اولیه $${cfg.initialCapitalUsd}\n` +
-        `منبع: ${cfg.whale.enabled ? `نهنگ ${cfg.whale.label || cfg.whale.address.slice(0, 8)}` : ""}${cfg.whale.enabled && cfg.indicators.enabled ? " + " : ""}${cfg.indicators.enabled ? `اندیکاتورها (${cfg.indicators.selections.length} انتخاب)` : ""}\n` +
-        `موتور ۲۴/۷ هر ۶۰ ثانیه چرخه می‌زند — باز/بسته شدن پوزیشن‌ها همین‌جا اعلام می‌شود.`
-    );
+    if (wasOff) {
+      await appendLog("info", "ربات بک‌تست روی سرور فعال شد — اعلام‌ها به تلگرام می‌روند");
+      // v1.5.3 — اعلام شروع با خلاصه تنظیمات (فقط وقتی کاربر واقعاً ربات را روشن کرده)
+      await announce(
+        "🚀 ربات بک‌تست روی سرور فعال شد (۲۴/۷)",
+        `حالت: ${cfg.mode === "real" ? "واقعی 💰" : "دمو"} • استراتژی: ${cfg.strategyLabel ?? "—"}\n` +
+          `لوریج ${cfg.leverage}x • حد ضرر ${cfg.maxLossPercent}٪ (= ضرر حساب ${Math.round(cfg.maxLossPercent * cfg.leverage)}٪) • R:R 1:${cfg.rewardRatio}\n` +
+          `حجم $${cfg.positionSizeUsd} • حداکثر ${cfg.maxOpenPositions} پوزیشن • سرمایه اولیه $${cfg.initialCapitalUsd}\n` +
+          `منبع: ${cfg.whale.enabled ? `نهنگ ${cfg.whale.label || cfg.whale.address.slice(0, 8)}` : ""}${cfg.whale.enabled && cfg.indicators.enabled ? " + " : ""}${cfg.indicators.enabled ? `اندیکاتورها (${cfg.indicators.selections.length} انتخاب)` : ""}\n` +
+          `با برنامه بسته، باز/بسته شدن پوزیشن‌ها همین‌جا اعلام می‌شود؛ با برنامه باز، خود برنامه اعلام می‌کند.`
+      );
+    }
     // immediate cycle so the user sees action right away
     void runBacktestCycle();
   } else if (prev?.cfg.enabled) {
-    // v1.5.5 — توقف کامل بی‌صدا: سوییچ «اعلام تلگرام ۲۴/۷ (سرور)» از برنامه
-    // حذف شد (بازخورد کاربر: روشن‌کردنش چرخه محلی را قطع می‌کرد). وقتی
-    // برنامه کانفیگ خاموش می‌فرستد، سرور بدون هیچ پیام/لاگی متوقف می‌شود —
-    // پیام‌های «ربات متوقف شد» برای همیشه حذف شدند.
+    // v1.5.5 — توقف کامل بی‌صدا: وقتی برنامه کانفیگ خاموش می‌فرستد، سرور
+    // بدون هیچ پیام/لاگی متوقف می‌شود — پیام‌های «ربات متوقف شد» حذف شدند.
   }
   return {
     status: 200,
@@ -1305,6 +1341,10 @@ export async function getAutoTradeStateFor(secret: string): Promise<{ status: nu
   const state = await getState();
   // v1.5.4 — آیا اعلان‌های تلگرام روی سرور تنظیم شده (توکن اپ یا ربات سرور)؟
   const telegramConfigured = !!(st?.cfg.telegram?.botToken || serverCfg?.botToken);
+  // v1.5.9 — مکان‌نمای سیگنال + وضعیت برنامه‌باز (برای اپ: نه سیگنال دوباره
+  // معامله شود نه نمایش «سرور متوقف» گیج‌کننده شود).
+  const lastHb = (await store.get<number>(APP_HEARTBEAT_KEY)) ?? 0;
+  const appOpen = Date.now() - lastHb < APP_OPEN_LEASE_MS;
   return {
     status: 200,
     payload: {
@@ -1318,6 +1358,62 @@ export async function getAutoTradeStateFor(secret: string): Promise<{ status: nu
       logs: state.logs.slice(0, 60),
       lastCycleAt: state.lastCycleAt ?? null,
       serverNow: Date.now(),
+      lastSignalAt: st?.lastSignalAt ?? null,
+      appOpen,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// v1.5.9 — APP-OPEN HEARTBEAT: برنامه باز است → سرور مکث کند (نه معامله/اعلان
+// دوبله). heartbeat همزمان پوزیشن‌های محلی اپ را روی سرور merge می‌کند تا
+// بعد از بسته‌شدن برنامه، سرور از همان‌جا ادامه دهد + مکان‌نمای سیگنال
+// sync می‌شود تا سیگنالِ قبلاً معامله‌شده دوباره باز نشود.
+// ---------------------------------------------------------------------------
+
+function mergeById<T extends { id: string }>(local: T[], incoming: T[]): T[] {
+  const byId = new Map<string, T>();
+  for (const p of local) byId.set(p.id, p);
+  for (const p of incoming) byId.set(p.id, p); // incoming (app) wins on same id
+  return [...byId.values()];
+}
+
+export async function handleAutoTradeHeartbeat(body: unknown): Promise<{ status: number; payload: Record<string, unknown> }> {
+  const b = body as {
+    secret?: string;
+    demoPositions?: unknown[];
+    realPositions?: unknown[];
+    lastSignalAt?: number;
+  };
+  const serverCfg = await store.get<{ secret?: string }>("config");
+  if (!serverCfg?.secret || !b?.secret || serverCfg.secret !== b.secret) {
+    return { status: 403, payload: { ok: false, error: "راز نصب مطابقت ندارد" } };
+  }
+  const st = await getConfig();
+  if (st?.cfg.enabled) {
+    const incomingCursor = Number(b.lastSignalAt ?? 0) || 0;
+    const state = await getState();
+    const appDemo = sanitizePositions(b.demoPositions);
+    const appReal = sanitizePositions(b.realPositions);
+    const demo = appDemo.length > 0 ? mergeById(state.demo, appDemo) : state.demo;
+    const real = appReal.length > 0 ? mergeById(state.real, appReal) : state.real;
+    await putState({
+      demo: demo.slice(0, 600),
+      real: real.slice(0, 600),
+      logs: state.logs,
+      lastCycleAt: state.lastCycleAt,
+    });
+    // مکان‌نمای سیگنال: بزرگ‌ترینِ دو طرف — داخل config lock (اتمیک با pushها)
+    if (incomingCursor > (st.lastSignalAt ?? 0)) {
+      await withConfigLock(async () => {
+        const latest = await getConfig();
+        if (latest && incomingCursor > (latest.lastSignalAt ?? 0)) {
+          latest.lastSignalAt = incomingCursor;
+          await putConfig(latest);
+        }
+      });
+    }
+  }
+  await store.put(APP_HEARTBEAT_KEY, Date.now());
+  return { status: 200, payload: { ok: true } };
 }

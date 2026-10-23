@@ -565,29 +565,38 @@ export interface ScanHealth {
   };
   autotrade?: { enabled: boolean; mode: string; lastCycleAt: number | null };
   heartbeatAt?: number | null;
+  /** v1.5.9 — نسخه کد سرور (برای تشخیص سرور قدیمی از جدید). */
+  serverCode?: string;
 }
 
-/** وضعیت کامل ۲۴/۷ سرور — هر بخش فعال/خاموش، آخرین ارسال تلگرام و… (بدون راز). */
+/** وضعیت کامل ۲۴/۷ سرور — هر بخش فعال/خاموش، آخرین ارسال تلگرام و… (بدون راز).
+ *  v1.5.9 — برای سرورِ خوابِ Railway: اولین تلاش با timeout بلندتر (۲۰s)؛
+ *  اگر شبکه قطع/timeout شد، ۳ ثانیه صبر و یک بار دیگر (بیدار شدن سرور) —
+ *  دیگر سلامت‌سنجی «همیشه» خطای بارگذاری سرور نمی‌دهد. */
 export async function fetchScanHealth(): Promise<ScanHealth | null> {
   const serverUrl = await getServerUrl();
   if (!serverUrl) return null;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 12_000);
-    let res: Response;
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      res = await fetch(`${serverUrl}/scan/status`, {
-        signal: controller.signal,
-        headers: { Accept: 'application/json' },
-      });
-    } finally {
-      clearTimeout(timer);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20_000);
+      let res: Response;
+      try {
+        res = await fetch(`${serverUrl}/scan/status`, {
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) return null;
+      return (await res.json()) as ScanHealth;
+    } catch {
+      // خطای شبکه/timeout — اگر تلاش اول بود، ۳ ثانیه صبر و دوباره (بیدار شدن)
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 3_000));
     }
-    if (!res.ok) return null;
-    return (await res.json()) as ScanHealth;
-  } catch {
-    return null;
   }
+  return null;
 }
 
 /** جزئیات اندیکاتورهای روی سرور + خطاهای ارزیابی (محافظت‌شده با راز نصب). */
