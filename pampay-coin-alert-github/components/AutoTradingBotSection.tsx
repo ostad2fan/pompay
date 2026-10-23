@@ -126,8 +126,8 @@ import {
   AUTO_PNL_PERIOD_LABEL,
   AUTO_TF_LABEL,
   computeAutoPnlStats,
+  closeAllOpenPositions,
   getAutoLogs,
-  getAutoServerStatus,
   getLastGlobalCycleAt,
   listIndicatorOptions,
   listTrackedWhales,
@@ -143,7 +143,9 @@ import {
   runGlobalCycleNow,
   runLightMtm,
   saveAutoSettings,
+  sendAppOpenHeartbeat,
   subscribeAutoSettings,
+  syncAutoTradeStateFromServer,
   updatePositionTpsl,
 } from '@/utils/autoTradingEngine';
 
@@ -290,16 +292,11 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [pricePrecision, setPricePrecision] = useState<Record<string, number>>({});
   const pnlCardRef = useRef<View>(null);
 
-  /** v1.5.7 — وضعیت ۲۴/۷ سرور برای نشانِ داخل کارت. */
-  const [serverStatus, setServerStatus] = useState<{ active: boolean; reason: string }>({ active: false, reason: '' });
   /** v1.5.8 — R2: پریست‌های محاسبه‌گر (حالت واقعی) */
   const [feasPresets, setFeasPresets] = useState<FeasibilityPreset[]>([]);
   const [feasOpen, setFeasOpen] = useState(true);
-  const refreshServerStatus = useCallback(async () => {
-    try {
-      setServerStatus(await getAutoServerStatus());
-    } catch {}
-  }, []);
+  /** v1.5.9 — بستن همه پوزیشن‌های باز (با پیغام تایید). */
+  const [closeAllBusy, setCloseAllBusy] = useState(false);
 
   // load everything on mount
   useEffect(() => {
@@ -322,17 +319,16 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       setRealKeys(keys);
       setLastCycleAt(getLastGlobalCycleAt());
       setLoaded(true);
-      // v1.5.7 — شروع برنامه: اگر ربات روشن است و سرور/تلگرام تنظیم است،
-      // ۲۴/۷ خودکار فعال شود (push کانفیگ) و نشان وضعیت تازه شود.
+      // v1.5.9 — شروع برنامه: فقط sync سبک + heartbeat برنامه‌باز. دیگر
+      // کانفیگ با هر باز شدن برنامه push نمی‌شود — ریشه‌ی «هر بار برنامه را
+      // باز می‌کنم در تلگرام می‌زنه ربات بک‌تست فعال شد». سرور کانفیگ خودش
+      // را دارد؛ فقط وضعیتِ شبانه برمی‌گردد و lease برنامه‌باز تازه می‌شود.
       if (s.enabled) {
-        void pushAutoTradeConfigToServer(s)
-          .then(() => refreshServerStatus())
-          .catch(() => refreshServerStatus());
-      } else {
-        void refreshServerStatus();
+        void syncAutoTradeStateFromServer(true).catch(() => {});
+        void sendAppOpenHeartbeat(true).catch(() => {});
       }
     })().catch(() => setLoaded(true));
-  }, [realKeysProp, refreshServerStatus]);
+  }, [realKeysProp]);
 
   const persist = useCallback(
     async (next: AutoTradeSettings) => {
@@ -341,11 +337,11 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       // v1.5.7 — حالت ۲۴/۷ خودکار: با هر تغییر تنظیمات (روشن/خاموش ربات یا
       // پارامترها)، کانفیگ به سرور push می‌شود. ربات روشن + تلگرام تنظیم →
       // سرور ۲۴/۷ اجرا و اعلام می‌کند؛ ربات خاموش → سرور متوقف. غیرfatal.
-      void pushAutoTradeConfigToServer(next)
-        .then(() => refreshServerStatus())
-        .catch(() => refreshServerStatus());
+      // v1.5.9 — سرور جدید فقط در گذارِ خاموش→روشن اعلام می‌کند؛ تغییر
+      // پارامترها هیچ پیام/لاگ تکراری تولید نمی‌کند.
+      void pushAutoTradeConfigToServer(next).catch(() => {});
     },
-    [refreshServerStatus]
+    []
   );
 
   // v1.5.7 — R7 ریشه‌ی باگ «پریست استراتژی جدول را پر نمی‌کند»: وقتی بیرونِ
@@ -880,6 +876,46 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     );
   };
 
+  // v1.5.9 — «یه گزینه بستن همه پوزیشن‌های باز با پیغام تایید در بک‌تست»:
+  // اول پیغام تایید (تعداد + حالت)، بعد از تأیید همه پوزیشن‌های باز همان
+  // حالت با قیمت لحظه‌ای بسته می‌شوند (واقعی: سفارش مارکت روی بایننس).
+  const handleCloseAllPositions = () => {
+    const count = settings.mode === 'demo' ? openPositions.length : realOpen.length;
+    if (count === 0) {
+      ThemedAlert.alert('پوزیشنی نیست', 'هیچ پوزیشن بازی برای بستن وجود ندارد.');
+      return;
+    }
+    ThemedAlert.alert(
+      'بستن همه پوزیشن‌های باز',
+      `همه ${count.toLocaleString('fa-IR')} پوزیشن بازِ ${settings.mode === 'demo' ? 'دمو' : 'واقعی'} با قیمت لحظه‌ای بسته می‌شود${settings.mode === 'real' ? ' (سفارش مارکت روی بایننس — برگشت‌ناپذیر است)' : ''}. مطمئن هستید؟`,
+      [
+        { text: 'لغو', style: 'cancel' },
+        {
+          text: `بله، همه بسته شود (${count.toLocaleString('fa-IR')})`,
+          style: 'destructive',
+          onPress: () => {
+            if (closeAllBusy) return;
+            setCloseAllBusy(true);
+            void (async () => {
+              try {
+                const res = await closeAllOpenPositions(settings, realKeys);
+                await refreshPositions();
+                ThemedAlert.alert(
+                  'بسته شد ✅',
+                  `${res.closed.toLocaleString('fa-IR')} پوزیشن بسته شد${res.failed > 0 ? ` • ${res.failed.toLocaleString('fa-IR')} ناموفق (دوباره تلاش کنید)` : ''}`
+                );
+              } catch {
+                ThemedAlert.alert('خطا', 'بستن گروهی انجام نشد — دوباره تلاش کنید.');
+              } finally {
+                setCloseAllBusy(false);
+              }
+            })();
+          },
+        },
+      ]
+    );
+  };
+
   return (
     <View style={styles.card}>
       <Pressable style={styles.header} onPress={() => setShowDetail((v) => !v)}>
@@ -1016,17 +1052,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               </Text>
             </View>
           )}
-          {/* v1.5.7 — R4: نشان وضعیت ۲۴/۷ سرور (اعلام تلگرام با برنامه بسته) */}
-          {settings.enabled && (
-            <View style={[styles.serverBadge, serverStatus.active ? styles.serverBadgeOn : styles.serverBadgeOff]}>
-              <Text style={styles.serverBadgeIcon}>{serverStatus.active ? '📢' : '🔕'}</Text>
-              <Text style={[styles.serverBadgeText, serverStatus.active ? { color: colors.dark.green } : { color: '#F0B90B' }]}>
-                {serverStatus.active
-                  ? 'اعلام تلگرام ۲۴/۷ (سرور): فعال — باز/بسته شدن معاملات حتی با برنامه بسته به تلگرام شما می‌آید.'
-                  : `اعلام تلگرام ۲۴/۷ (سرور): غیرفعال — ${serverStatus.reason || 'سرور تنظیم نشده'}`}
-              </Text>
-            </View>
-          )}
+          {/* v1.5.9 — نشان «اعلام تلگرام ۲۴/۷» از کارت بک‌تست حذف شد
+              (بازخورد کاربر: «گزینه متن اعلان تلگرام ۷/۲۴ را از بک‌تست حذف کن»)
+              — وضعیت کامل اعلان‌های ۲۴/۷ در تنظیمات ← «بررسی سلامت اعلان‌های ۲۴/۷». */}
 
           {/* whale source — on/off like whale-tracking toggles */}
           <View style={styles.sourceBox}>
@@ -1578,6 +1606,16 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={totalPnl >= 0 ? colors.dark.green : colors.dark.red} />
                 <Text style={styles.sourceTitle}>پوزیشن‌های ربات (دمو)</Text>
+                {/* v1.5.9 — بستن همه پوزیشن‌های باز با تایید */}
+                {openPositions.length > 0 && (
+                  <Pressable style={styles.closeAllBtn} onPress={handleCloseAllPositions} disabled={closeAllBusy} hitSlop={4} testID="close-all-btn">
+                    {closeAllBusy ? (
+                      <ActivityIndicator size="small" color={colors.dark.red} />
+                    ) : (
+                      <Text style={styles.closeAllBtnText}>بستن همه</Text>
+                    )}
+                  </Pressable>
+                )}
                 <Pressable onPress={() => void runCycleAndRefresh()} hitSlop={8}>
                   {cycleBusy ? (
                     <ActivityIndicator size="small" color={colors.dark.accent} />
@@ -1800,6 +1838,16 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={realTotalPnl >= 0 ? colors.dark.green : colors.dark.red} />
                 <Text style={styles.sourceTitle}>پوزیشن‌های ربات (واقعی)</Text>
+                {/* v1.5.9 — بستن همه پوزیشن‌های باز با تایید */}
+                {realOpen.length > 0 && (
+                  <Pressable style={styles.closeAllBtn} onPress={handleCloseAllPositions} disabled={closeAllBusy} hitSlop={4}>
+                    {closeAllBusy ? (
+                      <ActivityIndicator size="small" color={colors.dark.red} />
+                    ) : (
+                      <Text style={styles.closeAllBtnText}>بستن همه</Text>
+                    )}
+                  </Pressable>
+                )}
                 <Pressable onPress={() => void runCycleAndRefresh()} hitSlop={8}>
                   {cycleBusy ? (
                     <ActivityIndicator size="small" color={colors.dark.accent} />
@@ -2195,32 +2243,19 @@ const styles = StyleSheet.create({
     color: colors.dark.green,
     lineHeight: 13,
   },
-  /* v1.5.7 — R4: نشان وضعیت اعلام ۲۴/۷ سرور */
-  serverBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
+  /* v1.5.9 — دکمه «بستن همه» پوزیشن‌های باز (کنار عنوان پوزیشن‌ها) */
+  closeAllBtn: {
+    backgroundColor: colors.dark.red + '18',
     borderWidth: 1,
-    borderRadius: 8,
-    padding: 7,
-    marginBottom: 8,
+    borderColor: colors.dark.red + '44',
+    borderRadius: 7,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
   },
-  serverBadgeOn: {
-    backgroundColor: colors.dark.green + '10',
-    borderColor: colors.dark.green + '33',
-  },
-  serverBadgeOff: {
-    backgroundColor: '#F0B90B10',
-    borderColor: '#F0B90B33',
-  },
-  serverBadgeIcon: {
-    fontSize: 12,
-  },
-  serverBadgeText: {
-    flex: 1,
+  closeAllBtnText: {
     fontSize: 9,
-    lineHeight: 13,
-    fontWeight: '700',
+    fontWeight: '800',
+    color: colors.dark.red,
   },
   sourceBox: {
     backgroundColor: colors.dark.background,
