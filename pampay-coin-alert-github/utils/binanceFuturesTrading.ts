@@ -551,3 +551,102 @@ export async function setTrailingStop(
 
   return placeTrailingStopOrder(apiKey, apiSecret, symbol, closeSide as 'BUY' | 'SELL', quantity, callbackRate, activationPrice);
 }
+
+// ---------------------------------------------------------------------------
+// v1.5.12 — Funding rate + commissions per position
+// «در ترید واقعی اگه فاندینگ ریت یا کارمزدی کم میشه در اون پوزیشن باز نشون
+// بده هم در تاریخچه» — درآمد حساب (/fapi/v1/income) یک‌جا گرفته می‌شود و
+// رخدادهای FUNDING_FEE و COMMISSION هر نماد در بازه‌ی هر پوزیشن جمع می‌شود.
+// ---------------------------------------------------------------------------
+
+/** یک رخداد درآمد حساب فیوچرز بایننس. */
+export interface BinanceIncomeRow {
+  symbol: string;
+  incomeType: string;
+  /** مبلغ دلاری — پرداختی منفی است (کارمزد/فاندینگ). */
+  income: string;
+  time: number;
+}
+
+/** جمع کارمزد + فاندینگ یک پوزیشن (هر دو عدد مثبت = پولی که کم شده). */
+export interface PositionFees {
+  funding: number;
+  commission: number;
+}
+
+const incomeCache = new Map<string, { at: number; rows: BinanceIncomeRow[] }>();
+const INCOME_CACHE_TTL = 60_000;
+
+/**
+ * رخدادهای درآمد حساب از sinceMs تا الان (صفحه‌بندی رو به عقب، حداکثر ۸
+ * صفحه = ۸۰۰۰ رخداد) — با کش ۶۰ ثانیه‌ای تا رفرش‌های ۲ ثانیه‌ای UI به API
+ * فشار نیاورد. یک فراخوانی برای «همه‌ی» نمادها؛ تفکیک سمت کلاینت انجام می‌شود.
+ */
+export async function fetchIncomeRows(
+  apiKey: string,
+  apiSecret: string,
+  sinceMs: number,
+): Promise<BinanceIncomeRow[]> {
+  if (!apiKey || !apiSecret) return [];
+  // کش بر اساس ابتدای روزِ sinceMs تا فراخوانی‌های نزدیک به هم cache-hit شوند.
+  const dayBucket = Math.floor(sinceMs / 86_400_000);
+  const cacheKey = `${apiKey.slice(-6)}:${dayBucket}`;
+  const hit = incomeCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < INCOME_CACHE_TTL) return hit.rows;
+
+  const rows: BinanceIncomeRow[] = [];
+  let endTime = Date.now();
+  try {
+    for (let i = 0; i < 8; i++) {
+      const data = (await signedRequest(
+        'GET',
+        '/fapi/v1/income',
+        { startTime: Math.floor(sinceMs), endTime: Math.floor(endTime), limit: 1000 },
+        apiKey,
+        apiSecret,
+      )) as BinanceIncomeRow[];
+      if (!Array.isArray(data) || data.length === 0) break;
+      rows.push(...data.filter((r) => r && typeof r.time === 'number'));
+      if (data.length < 1000) break;
+      const oldest = data[data.length - 1]?.time;
+      if (!oldest || oldest >= endTime) break;
+      endTime = oldest - 1;
+    }
+  } catch {
+    // خطای API → همان رخدادهای گرفته‌شده (شاید خالی) برگردد؛ UI بدون کارمزد نمایش می‌دهد.
+  }
+  incomeCache.set(cacheKey, { at: Date.now(), rows });
+  return rows;
+}
+
+/**
+ * جمع FUNDING_FEE + COMMISSION یک نماد در بازه‌ی [startMs, endMs] —
+ * (endMs برای پوزیشن باز undefined است = تا الان). خروجی مثبت است.
+ */
+export function summarizeFeesForPosition(
+  rows: BinanceIncomeRow[],
+  symbol: string,
+  startMs: number,
+  endMs?: number,
+): PositionFees {
+  const funding = { v: 0 };
+  const commission = { v: 0 };
+  for (const r of rows) {
+    if (r.symbol !== `${symbol}USDT` && r.symbol !== symbol) continue;
+    if (r.time < startMs) continue;
+    if (endMs && r.time > endMs) continue;
+    const v = parseFloat(r.income);
+    if (!Number.isFinite(v)) continue;
+    if (r.incomeType === 'FUNDING_FEE') {
+      // بایننس پرداختیِ فاندینگ را منفی ثبت می‌کند؛ دریافتی مثبت.
+      funding.v += -v;
+    } else if (
+      r.incomeType === 'COMMISSION' ||
+      r.incomeType === 'LIMIT_MAKER' ||
+      r.incomeType === 'MARKET_TAKER'
+    ) {
+      commission.v += -v;
+    }
+  }
+  return { funding: funding.v, commission: commission.v };
+}

@@ -60,6 +60,8 @@ function WhalePnlChips({ address }: { address: string }) {
   }
   const d: WhalePnl = q.data;
   const rows: { label: string; v: number; t: number }[] = [
+    // v1.5.12 — «تایم‌فریم امروز» به PnL نهنگ‌ها هم اضافه شد.
+    { label: 'امروز', v: d.d1.realized, t: d.d1.trades },
     { label: '۷ روزه', v: d.d7.realized, t: d.d7.trades },
     { label: '۳۰ روزه', v: d.d30.realized, t: d.d30.trades },
     { label: '۹۰ روزه', v: d.d90.realized, t: d.d90.trades },

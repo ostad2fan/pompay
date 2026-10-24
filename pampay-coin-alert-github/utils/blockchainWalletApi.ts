@@ -1792,7 +1792,8 @@ export async function fetchBlockchainWalletData(
 // market_chart for CG-known tokens (TOSHI, MOONKIN-style coverage).
 // ---------------------------------------------------------------------------
 
-export const PNL_PERIODS = [7, 30, 90, 180] as const;
+// v1.5.12 — «تایم‌فریم امروز» به همه‌ی PnLها اضافه شد (۱ = از ابتدای روز محلی).
+export const PNL_PERIODS = [1, 7, 30, 90, 180] as const;
 export type PnlPeriod = (typeof PNL_PERIODS)[number];
 
 export interface BlockchainTokenPnl {
@@ -1962,7 +1963,15 @@ async function addEntryToPeriods(
         ? series[series.length - 1].c
         : 0;
   for (const p of PNL_PERIODS) {
-    const target = Date.now() - p * 86_400_000;
+    // v1.5.12 — «امروز» = ابتدای روزِ محلی (۰۰:۰۰)؛ بقیه N روز به عقب.
+    const target =
+      p === 1
+        ? (() => {
+            const d = new Date();
+            d.setHours(0, 0, 0, 0);
+            return d.getTime();
+          })()
+        : Date.now() - p * 86_400_000;
     let thenPrice: number | null = null;
     if (e.stable) thenPrice = 1;
     else if (series) thenPrice = closeAtOrBefore(series, target);

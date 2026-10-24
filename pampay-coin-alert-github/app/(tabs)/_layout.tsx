@@ -1,87 +1,78 @@
-import { Tabs, useRouter, useRootNavigationState } from 'expo-router';
+import { Tabs, useRouter, useRootNavigationState, useSegments } from 'expo-router';
 import { Radar, Settings, Fish, Wallet, Brain, Skull, Rocket, TrendingUp } from 'lucide-react-native';
-import { useEffect, useRef } from 'react';
-import { AppState } from 'react-native';
+import { useEffect } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import colors from '@/constants/colors';
+import {
+  LAST_TAB_KEY,
+  KNOWN_TABS,
+  getCachedLastTab,
+  setLastTab,
+  tabToHref,
+  warmLastTabCache,
+  type KnownTab,
+} from '@/utils/lastTab';
 
 /**
- * v1.5.4 — «وقتی برنامه باز میشه صفحه پیش فرض همیشه روی تب تنظیمات باشه».
- * سه لایه محکم (کاربر هنوز گاهی روی اسکنر دامپ‌وپامپ فرود می‌آمد):
- *   ۱) initialRouteName="settings" (شروع معمول)
- *   ۲) app/+native-intent.tsx مسیر «/» را به «/settings» هدایت می‌کند
- *   ۳) پس از آماده شدن ناوبری ریشه، یک‌بار در هر اجرای برنامه اگر چراغ
- *      روی صفحه‌ای جز تنظیمات روشن باشد (بازگردانی state اندروید)، به
- *      تنظیمات برگردانده می‌شود (ماژول-level flag تا با تعویض تم دوباره
- *      اجرا نشود).
- * برگشتن از بک‌گراند: از هر مدتی خارج از برنامه (حتی چند ثانیه — قبلاً ۱۵
- * دقیقه بود) دوباره روی تنظیمات باز می‌شود.
+ * v1.5.12 — «وقتی برنامه را باز میکنم از روی تب اسکن نپره رو تب تنظیمات …
+ * گوشی اسکرین میره دوباره گوشی باز میکنم روی اخرین تب بمونه نره روی تنظیمات باز»
+ *
+ * رفتار جدید (برعکسِ v1.4.11/v1.5.4/v1.5.7):
+ *   • هر تعویض تب، در کش ماژول + AsyncStorage ذخیره می‌شود (setLastTab).
+ *   • هنگام باز شدن برنامه (شروع سرد، بسته‌شدن توسط سیستم، یا خاموش/روشن شدن
+ *     صفحه) یک‌بار تبِ ذخیره‌شده‌ی آخر بازیابی می‌شود — دیگر همیشه «تنظیمات»
+ *     باز نمی‌شود؛ کاربر روی همان تبی است که آخرین بار بوده.
+ *   • فول‌بک: بار اول نصب (هیچ تبی ذخیره نشده) روی «تنظیمات» می‌ماند
+ *     (initialRouteName) — همان رفتار قبلی.
+ *
+ * حذف‌شده‌های نسخه‌های قبل:
+ *   • forced replace به تنظیمات بعد از ۱.۲ ثانیه (v1.5.7)
+ *   • بازگشت اجباری به تنظیمات بعد از ۵ ثانیه بک‌گراند (v1.5.4)
+ *   • AppState listener مربوط به آن
  */
 
-/** After this long in the background, re-opening the app returns to settings. */
-const RETURN_TO_SETTINGS_AFTER_MS = 5 * 1_000;
+// کش را در همان لحظه‌ی لود ماژول گرم می‌کنیم تا زودتر از mount ناوبری آماده شود.
+warmLastTabCache();
 
-/** v1.5.4 — only ONE boot redirect per app run (survives theme remounts). */
-let bootRedirectDone = false;
+/** بازیابیِ تبِ آخر فقط یک‌بار در هر اجرای برنامه (بقا با تعویض تم/ری‌مانت). */
+let bootRestoreDone = false;
 
 export default function TabLayout() {
   const router = useRouter();
   const rootNav = useRootNavigationState();
-  const backgroundedAt = useRef<number | null>(null);
+  // v1.5.12 — cast: overload تایپ‌شده‌ی useSegments تاپل تک‌عضوی برمی‌گرداند.
+  const segments = useSegments() as readonly string[];
 
-  // v1.5.4 — boot belt: after the root navigator is mounted, land on settings
-  // exactly once per app run (covers Android activity-state restoration that
-  // can override initialRouteName and drop the user on the scanner tab).
+  // v1.5.12 — هر تعویض تب ذخیره می‌شود (کش هم‌زمان + دیسک، fire-and-forget).
   useEffect(() => {
-    if (bootRedirectDone || !rootNav?.key) return;
-    bootRedirectDone = true;
-    try {
-      router.replace('/settings');
-    } catch {}
-  }, [rootNav?.key, router]);
+    if (segments[0] === '(tabs)' && typeof segments[1] === 'string') {
+      void setLastTab(segments[1]);
+    }
+  }, [segments]);
 
-  // v1.5.7 — چهارمین لایه («وقتی برای بار اول برنامه را باز می‌کنم صفحه اول
-  // پیش‌فرض روی تنظیمات باشه»): بازگردانی state اندروید گاهی بعد از belt بالا
-  // کاربر را روی تب دیگری می‌اندازد. یک‌بار در هر اجرا، ۱.۲ ثانیه بعد از mount
-  // ناوبری، اگر چراغ روی صفحه‌ای جز تنظیمات باشد به تنظیمات برمی‌گردیم (فقط
-  // در همان پنجره شروع سرد — بعد از تعامل کاربر دیگر کاری به مسیر نداریم).
+  // v1.5.12 — بازیابی آخرین تب: یک‌بار، بعد از آماده شدن ناوبری ریشه.
+  // (قبلاً اینجا router.replace('/settings') بود — حالا به تب ذخیره‌شده می‌رود.)
   useEffect(() => {
-    if (!rootNav?.key) return;
-    const t = setTimeout(() => {
+    if (bootRestoreDone || !rootNav?.key) return;
+    bootRestoreDone = true;
+    (async () => {
       try {
-        router.replace('/settings');
-      } catch {}
-    }, 1200);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rootNav?.key]);
-
-  // v1.4.11 — «باز شدن برنامه = صفحه تنظیمات».
-  // v1.4.10 این را با router.replace بعد از اولین mount می‌کرد؛ اما در همان
-  // لحظه Root Layout هنوز «ready» نیست (افکت فرزند‌ها قبل از والد اجرا می‌شود)
-  // و expo-router این استثنا را می‌انداخت:
-  //   «Attempted to navigate before mounting the Root Layout component»
-  // → کرش فوری هنگام باز شدن برنامه.
-  // حالا شروع روی تنظیمات بدون هیچ navigate برنامه‌ای انجام می‌شود:
-  //   • app/+native-intent.tsx مسیر «/» را به «/settings» هدایت می‌کند
-  //   • initialRouteName="settings" روی خود تب‌ها (فول‌بک)
-  // «برگشتن به تنظیمات بعد از بک‌گراند» (v1.5.4: از ۵ ثانیه به بعد = همیشه)
-  // با router.replace انجام می‌شود — آن موقع برنامه کاملاً mount و stable است.
-  useEffect(() => {
-    const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'background' || state === 'inactive') {
-        backgroundedAt.current = Date.now();
-      } else if (state === 'active' && backgroundedAt.current !== null) {
-        const awayMs = Date.now() - backgroundedAt.current;
-        backgroundedAt.current = null;
-        if (awayMs >= RETURN_TO_SETTINGS_AFTER_MS) {
-          // Opening the app again → back to settings.
-          // v1.4.11 — مسیر بدون گروه؛ مسیر گروه‌دار کرش استارتاپ ۱.۴.۱۰ بود.
-          router.replace('/settings');
+        let tab = getCachedLastTab();
+        if (!tab) {
+          const saved = await AsyncStorage.getItem(LAST_TAB_KEY);
+          if (saved && (KNOWN_TABS as readonly string[]).includes(saved)) {
+            tab = saved as KnownTab;
+          }
         }
+        // اگر تبِ ذخیره‌شده «تنظیمات» است، هیچ کاری لازم نیست (همان جا هستیم).
+        if (tab && tab !== 'settings') {
+          router.replace(tabToHref(tab) as Parameters<typeof router.replace>[0]);
+        }
+      } catch {
+        // هر خطا = ماندن روی تب پیش‌فرض (تنظیمات).
       }
-    });
-    return () => sub.remove();
-  }, [router]);
+    })();
+  }, [rootNav?.key, router]);
 
   return (
     <Tabs

@@ -330,6 +330,8 @@ export interface WhalePnlByPeriod {
 }
 
 export interface WhalePnl {
+  /** v1.5.12 — امروز (از ابتدای روزِ محلی). */
+  d1: WhalePnlByPeriod;
   d7: WhalePnlByPeriod;
   d30: WhalePnlByPeriod;
   d90: WhalePnlByPeriod;
@@ -352,6 +354,11 @@ export async function fetchWhalePnl(address: string): Promise<WhalePnl> {
   ]);
 
   const now = Date.now();
+  // v1.5.12 — «امروز» = از ابتدای روزِ محلی (۰۰:۰۰)، نه ۲۴ ساعت اخیر.
+  const dayStart = new Date();
+  dayStart.setHours(0, 0, 0, 0);
+  const dayStartMs = dayStart.getTime();
+  const d1 = { realized: 0, trades: 0 };
   const acc: Record<number, { realized: number; trades: number }> = {
     7: { realized: 0, trades: 0 },
     30: { realized: 0, trades: 0 },
@@ -361,6 +368,10 @@ export async function fetchWhalePnl(address: string): Promise<WhalePnl> {
   for (const f of fills) {
     const pnl = parseFloat(f.closedPnl ?? '0');
     if (!Number.isFinite(pnl) || pnl === 0) continue;
+    if (f.time >= dayStartMs) {
+      d1.realized += pnl;
+      d1.trades += 1;
+    }
     const ageDays = (now - f.time) / DAY_MS;
     for (const d of [7, 30, 90, 180] as const) {
       if (ageDays <= d) {
@@ -384,6 +395,7 @@ export async function fetchWhalePnl(address: string): Promise<WhalePnl> {
     : 0;
 
   return {
+    d1,
     d7: acc[7],
     d30: acc[30],
     d90: acc[90],

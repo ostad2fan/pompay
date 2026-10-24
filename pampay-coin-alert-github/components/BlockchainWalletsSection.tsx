@@ -58,6 +58,7 @@ import { ThemedAlert } from '@/components/ThemedAlert';
  */
 
 const PNL_PERIOD_LABEL: Record<PnlPeriod, string> = {
+  1: 'امروز',
   7: '۷ روز',
   30: '۳۰ روز',
   90: '۹۰ روز',

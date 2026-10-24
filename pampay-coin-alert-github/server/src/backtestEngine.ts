@@ -101,6 +101,8 @@ interface BtPosition {
   strategyName?: string;
   /** v1.5.3 — ۰/۱/۲ — چند بار ربات نصف حجم بسته (آستانه ۲۵٪/۵۰٪). */
   partialsDone?: number;
+  /** v1.5.12 — جمع سود/زیان بخش‌های بسته‌شده‌ی همین پوزیشن باز (نمایش روی ردیف). */
+  partialRealizedPnl?: number;
 }
 
 interface BtLog {
@@ -237,6 +239,7 @@ function sanitizePositions(rows: unknown[] | undefined): BtPosition[] {
       trailArmed: p.trailArmed === true,
       strategyName: p.strategyName !== undefined ? String(p.strategyName) : undefined,
       partialsDone: p.partialsDone !== undefined ? num(p.partialsDone) : undefined,
+      partialRealizedPnl: p.partialRealizedPnl !== undefined ? num(p.partialRealizedPnl) : undefined,
     });
   }
   return out.slice(0, 600);
@@ -751,7 +754,8 @@ async function partialCloseDemo(st: StoredAutoConfig, id: string, price: number,
     return closeDemo(st, id, price, reason === "partial" ? "take" : "manual");
   }
   const pnl = (price - p.entryPrice) * dir * closedQty;
-  state.demo[idx] = { ...p, qty: remainingQty, partialsDone: (p.partialsDone ?? 0) + 1, lastPrice: price };
+  // v1.5.12 — سود بخش بسته‌شده روی پوزیشن باز انباشته می‌شود (پاریتی با اپ).
+  state.demo[idx] = { ...p, qty: remainingQty, partialsDone: (p.partialsDone ?? 0) + 1, lastPrice: price, partialRealizedPnl: (p.partialRealizedPnl ?? 0) + pnl };
   const partialRecord: BtPosition = {
     ...p,
     id: `${p.id}-p${(p.partialsDone ?? 0) + 1}`,
@@ -762,6 +766,7 @@ async function partialCloseDemo(st: StoredAutoConfig, id: string, price: number,
     realizedPnl: pnl,
     lastPrice: price,
     partialsDone: undefined,
+    partialRealizedPnl: undefined,
   };
   state.demo.splice(idx + 1, 0, partialRecord);
   await putState(state);
@@ -797,7 +802,8 @@ async function partialCloseReal(
   const remainingQty = p.qty - closedQty;
   const dir = p.side === "long" ? 1 : -1;
   const pnl = (price - p.entryPrice) * dir * closedQty;
-  state.real[idx] = { ...p, qty: remainingQty, partialsDone: (p.partialsDone ?? 0) + 1, lastPrice: price };
+  // v1.5.12 — سود بخش بسته‌شده روی پوزیشن باز انباشته می‌شود (پاریتی با اپ).
+  state.real[idx] = { ...p, qty: remainingQty, partialsDone: (p.partialsDone ?? 0) + 1, lastPrice: price, partialRealizedPnl: (p.partialRealizedPnl ?? 0) + pnl };
   const partialRecord: BtPosition = {
     ...p,
     id: `${p.id}-p${(p.partialsDone ?? 0) + 1}`,
@@ -808,6 +814,7 @@ async function partialCloseReal(
     realizedPnl: pnl,
     lastPrice: price,
     partialsDone: undefined,
+    partialRealizedPnl: undefined,
   };
   state.real.splice(idx + 1, 0, partialRecord);
   await putState(state);

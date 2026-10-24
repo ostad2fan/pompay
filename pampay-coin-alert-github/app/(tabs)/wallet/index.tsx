@@ -133,17 +133,32 @@ interface ExchangeBalanceData {
 }
 
 // ---------------------------------------------------------------------------
-// PnL periods (30 / 90 / 180 / 360 روز) — per exchange, exchange-native data
+// PnL periods (امروز / 30 / 90 / 180 / 360 روز) — per exchange, exchange-native data
+// v1.5.12 — «تایم‌فریم امروز را در همه جای برنامه که در پی ان ال ها نداره بیار»
 // ---------------------------------------------------------------------------
 
-export type PnlPeriodDays = 30 | 90 | 180 | 360;
-const PNL_PERIODS: PnlPeriodDays[] = [30, 90, 180, 360];
+export type PnlPeriodDays = 1 | 30 | 90 | 180 | 360;
+const PNL_PERIODS: PnlPeriodDays[] = [1, 30, 90, 180, 360];
 const PNL_PERIOD_LABEL: Record<PnlPeriodDays, string> = {
+  1: 'امروز',
   30: '۳۰ روز',
   90: '۹۰ روز',
   180: '۱۸۰ روز',
   360: '۳۶۰ روز',
 };
+
+/**
+ * v1.5.12 — شروع بازه‌ی PnL: «امروز» = ابتدای روزِ محلی (۰۰:۰۰)؛ بقیه
+ * بازه‌ها به اندازه‌ی N روز به عقب. همه‌ی صرافی‌ها از همین استفاده می‌کنند.
+ */
+function periodStartMs(days: PnlPeriodDays): number {
+  if (days === 1) {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  return Date.now() - days * 86_400_000;
+}
 
 export interface PeriodPnl {
   periodDays: number;
@@ -809,7 +824,7 @@ async function fetchBinanceFullAccount(wallet: ExchangeWallet): Promise<BinanceF
 // ---------------------------------------------------------------------------
 
 async function fetchBinancePeriodPnl(wallet: ExchangeWallet, days: PnlPeriodDays): Promise<PeriodPnl> {
-  const startTime = Date.now() - days * 86_400_000;
+  const startTime = periodStartMs(days);
   const income: Array<{ incomeType: string; income: string; time: number }> = [];
 
   // /fapi/v1/income returns newest-first (max 1000 per call) — walk endTime
@@ -1138,7 +1153,7 @@ async function fetchBybitBalance(wallet: ExchangeWallet): Promise<WalletBalance[
 }
 
 async function fetchBybitPeriodPnl(wallet: ExchangeWallet, days: PnlPeriodDays): Promise<PeriodPnl> {
-  const startTime = Date.now() - days * 86_400_000;
+  const startTime = periodStartMs(days);
   let closedPnlSum = 0;
   let closedCount = 0;
 
@@ -1382,7 +1397,7 @@ async function fetchOkxBalance(wallet: ExchangeWallet): Promise<WalletBalance[]>
 }
 
 async function fetchOkxPeriodPnl(wallet: ExchangeWallet, days: PnlPeriodDays): Promise<PeriodPnl> {
-  const windowStart = Date.now() - days * 86_400_000;
+  const windowStart = periodStartMs(days);
   let realizedPnl = 0;
   let closedCount = 0;
 
@@ -1878,7 +1893,7 @@ async function fetchBitperpPeriodPnl(wallet: ExchangeWallet, days: PnlPeriodDays
     };
   }
 
-  const windowStart = Date.now() - days * 86_400_000;
+  const windowStart = periodStartMs(days);
   let realizedPnl = 0;
   let closedCount = 0;
   for (const p of history.positions) {
@@ -2394,6 +2409,7 @@ export default function WalletScreen() {
   /** Per-period TOMAN PnL of the blockchain holdings (market change incl. FX). */
   const blockchainPnlTomanByPeriod = useMemo(() => {
     const out: Record<number, { pnlToman: number; basisToman: number } | null> = {
+      1: null,
       7: null,
       30: null,
       90: null,
@@ -2402,11 +2418,21 @@ export default function WalletScreen() {
     const summary = bcPnlQuery.data;
     const series = bcDollarQuery.data;
     if (!summary) return out;
-    for (const p of [7, 30, 90, 180] as const) {
+    for (const p of [1, 7, 30, 90, 180] as const) {
       const per = summary.byPeriod[p];
       if (!per || per.usdThen <= 0 || usdtToToman <= 0) continue;
       if (!series || series.length === 0) continue;
-      const dollarThen = closeAtOrBefore(series, Date.now() - p * 86_400_000);
+      // v1.5.12 — «امروز» = ابتدای روز محلی؛ بقیه N روز به عقب.
+      const dollarThen = closeAtOrBefore(
+        series,
+        p === 1
+          ? (() => {
+              const d = new Date();
+              d.setHours(0, 0, 0, 0);
+              return d.getTime();
+            })()
+          : Date.now() - p * 86_400_000
+      );
       if (dollarThen === null || dollarThen <= 0) continue;
       const basisToman = per.usdThen * dollarThen;
       out[p] = { pnlToman: per.usdNow * usdtToToman - basisToman, basisToman };

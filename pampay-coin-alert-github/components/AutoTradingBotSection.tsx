@@ -79,6 +79,7 @@ import {
   ChevronDown,
   ChevronUp,
   Camera,
+  CalendarDays,
   Share2,
   Save,
   ShieldCheck,
@@ -110,7 +111,13 @@ import {
 import { saveEnabledStrategies, STRATEGY_ORDER } from '@/utils/tradeAiService';
 import type { TradingStrategy } from '@/types/tradeAi';
 // v1.5.6 — بازیابی دقت قیمت بایننس (getFuturesPricePrecisionMap از v1.5.4)
-import { formatBinancePrice, getFuturesPricePrecisionMap } from '@/utils/binanceFuturesTrading';
+import {
+  formatBinancePrice,
+  getFuturesPricePrecisionMap,
+  fetchIncomeRows,
+  summarizeFeesForPosition,
+  type BinanceIncomeRow,
+} from '@/utils/binanceFuturesTrading';
 import { BacktestPdfRow, buildBacktestPdfHtml } from '@/utils/backtestPdf';
 import {
   AutoPnlPeriod,
@@ -160,6 +167,17 @@ const UI_REFRESH_MS = 2_000;
 /** v1.5.4 (بازیابی‌شده در v1.5.6) — صفحه‌بندی تاریخچه: ۱۰۰ معامله در هر صفحه
  * («بالای ۱۰۰ بره صفحه دو و بشه دید در صفحات بعدی»). */
 const HIST_PAGE_SIZE = 100;
+
+/**
+ * v1.5.12 — سقف ردیفِ جدول PDF («۷ روزه اصلا ساخته نمیشه»): هزاران معامله
+ * یعنی HTML چند مگابایتی که موتور چاپ اندروید را عملاً معلق می‌کند. ۸۰۰ ردیف
+ * آخر (جدیدترین‌ها) با همه‌ی ۱۴ ستون چاپ می‌شود و جمع‌های کارت آمار «کلِ»
+ * بازه را نشان می‌دهد (fullStats) — سرعت تضمین‌شده.
+ */
+const PDF_MAX_ROWS = 800;
+
+/** v1.5.12 — «تقویم ۳۰ روزه جدولی که سود و زیان کلی هر روز را نشان بدهد». */
+const CAL_DAYS = 30;
 
 /** v1.5.4 (بازیابی‌شده در v1.5.6) — فیلتر نوع تاریخچه: همه / فقط سودها /
  *  فقط ضررها / استاپ / تیک‌پرافیت / بستن دستی / بستن حجمی. */
@@ -293,9 +311,16 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   // v1.5.11 — وضعیت ساخت PDF (تعداد معامله + مرحله) تا کاربر بداند چه
   // چیزی در حال ساخت است و چقدر طول می‌کشد (قبلاً فقط «در حال ساخت…»).
   const [pdfStatus, setPdfStatus] = useState('');
+  /** v1.5.12 — تقویم ۳۰ روزه: باز/بسته + رفر عکس + نوع پیش‌نمایش (PnL یا تقویم). */
+  const [calOpen, setCalOpen] = useState(false);
+  const [previewKind, setPreviewKind] = useState<'pnl' | 'cal'>('pnl');
+  /** v1.5.12 — رخدادهای درآمد بایننس (فاندینگ + کارمزد) برای پوزیشن‌های واقعی. */
+  const [realFeeRows, setRealFeeRows] = useState<BinanceIncomeRow[]>([]);
   /** v1.5.4 (بازیابی‌شده در v1.5.6) — دقت قیمت بایننس (symbol → pricePrecision). */
   const [pricePrecision, setPricePrecision] = useState<Record<string, number>>({});
   const pnlCardRef = useRef<View>(null);
+  /** v1.5.12 — رفر کارت تقویم ۳۰ روزه برای ساخت عکس اشتراک/ذخیره. */
+  const calCardRef = useRef<View>(null);
 
   /** v1.5.8 — R2: پریست‌های محاسبه‌گر (حالت واقعی) */
   const [feasPresets, setFeasPresets] = useState<FeasibilityPreset[]>([]);
@@ -491,6 +516,102 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     const page = Math.min(realHistPage, realClosedTotalPages);
     return realClosedFiltered.slice((page - 1) * HIST_PAGE_SIZE, page * HIST_PAGE_SIZE);
   }, [realClosedFiltered, realHistPage, realClosedTotalPages]);
+
+  // ── v1.5.12 — «اگه فاندینگ ریت یا کارمزدی کم میشه در اون پوزیشن باز نشون
+  // بده هم در تاریخچه» (ترید واقعی): درآمد حساب (/fapi/v1/income) یک‌جا و
+  // با کش ۶۰ ثانیه‌ای گرفته می‌شود و سهم هر نماد سمت گوشی تفکیک می‌شود.
+  // دمو کارمزد/فاندینگ ندارد → چیزی نمایش داده نمی‌شود (واقعیتِ حساب).
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    if (settings.mode !== 'real' || !realKeys?.apiKey || !realKeys?.apiSecret) {
+      setRealFeeRows([]);
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      const candidates = realPositions.filter(
+        (p) => p.status === 'open' || (p.status === 'closed' && (p.closedAt ?? p.openedAt) && Date.now() - (p.closedAt ?? p.openedAt)! <= 7 * 86_400_000)
+      );
+      if (candidates.length === 0) {
+        if (!cancelled) setRealFeeRows([]);
+        return;
+      }
+      const since = Math.min(...candidates.map((p) => p.openedAt));
+      try {
+        const rows = await fetchIncomeRows(realKeys.apiKey, realKeys.apiSecret, since);
+        if (!cancelled) setRealFeeRows(rows);
+      } catch {
+        // بی‌صدا — ردیف‌ها بدون خط کارمزد می‌مانند.
+      }
+    };
+    void load();
+    const t = setInterval(() => void load(), 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.mode, realKeys?.apiKey, realKeys?.apiSecret, realPositions.map((p) => p.id).join('|')]);
+
+  /** v1.5.12 — کارمزد + فاندینگ یک پوزیشن واقعی (null = چیزی کم نشده). */
+  const realFeesOf = useCallback(
+    (p: { symbol: string; openedAt: number; status: string; closedAt?: number }) => {
+      if (settings.mode !== 'real') return null;
+      const f = summarizeFeesForPosition(
+        realFeeRows,
+        p.symbol,
+        p.openedAt,
+        p.status === 'closed' ? p.closedAt ?? undefined : undefined
+      );
+      if (f.funding === 0 && f.commission === 0) return null;
+      return f;
+    },
+    [settings.mode, realFeeRows]
+  );
+
+  // ── v1.5.12 — «تقویم ۳۰ روزه جدولی که در هر روز سود و زیان کلی اون روز را
+  // نشان بدهد تفکیک شده» — سطر هر روز: تعداد، سود، ضرر، خالص (جدیدترین اول).
+  const calendarRows = useMemo(() => {
+    const rowsSrc = settings.mode === 'demo' ? positions : realPositions;
+    const now = Date.now();
+    const win = CAL_DAYS * 86_400_000;
+    const map = new Map<
+      string,
+      { key: string; label: string; ts: number; trades: number; wins: number; profit: number; loss: number; net: number }
+    >();
+    for (const p of rowsSrc) {
+      if (p.status !== 'closed') continue;
+      const at = p.closedAt ?? p.openedAt;
+      if (!at || now - at > win) continue;
+      const d = new Date(at);
+      const key = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+      let row = map.get(key);
+      if (!row) {
+        row = { key, label: d.toLocaleDateString('fa-IR'), ts: at, trades: 0, wins: 0, profit: 0, loss: 0, net: 0 };
+        map.set(key, row);
+      }
+      const pnl = p.realizedPnl ?? 0;
+      row.trades += 1;
+      if (pnl >= 0) {
+        row.wins += 1;
+        row.profit += pnl;
+      } else {
+        row.loss += pnl;
+      }
+      row.net += pnl;
+    }
+    return Array.from(map.values()).sort((a, b) => b.ts - a.ts);
+  }, [settings.mode, positions, realPositions]);
+
+  /** v1.5.12 — ردیف جمع کل تقویم. */
+  const calTotals = useMemo(
+    () =>
+      calendarRows.reduce(
+        (acc, r) => ({ trades: acc.trades + r.trades, profit: acc.profit + r.profit, loss: acc.loss + r.loss, net: acc.net + r.net }),
+        { trades: 0, profit: 0, loss: 0, net: 0 }
+      ),
+    [calendarRows]
+  );
   // v1.5.7 — R2: جمع سود/زیانِ «تمام» معاملات همان بازه در سرتیتر تاریخچه
   // محاسبه می‌شود (closedFiltered دیگر سقف ۱۰۰تایی ندارد — PDF هم همین است).
 
@@ -616,7 +737,29 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         ThemedAlert.alert('خطا', 'ساخت عکس PnL ممکن نشد.');
         return;
       }
+      setPreviewKind('pnl');
       setPreviewUri(uri);
+    } finally {
+      setCaptureBusy(false);
+    }
+  };
+
+  // ── v1.5.12 — «گزینه اشتراک عکسو ذخیره هم ذخیره باشه» برای تقویم ۳۰ روزه:
+  // اول عکس ساخته و در همان پیش‌نمایش نشان داده می‌شود؛ بعد ذخیره/اشتراک.
+  const handleMakeCalImage = async () => {
+    if (captureBusy) return;
+    setCaptureBusy(true);
+    try {
+      if (Platform.OS === 'web') {
+        ThemedAlert.alert('وب', 'خروجی عکس فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
+        return;
+      }
+      if (!calCardRef.current) return;
+      const uri = await captureRef(calCardRef, { format: 'png', quality: 1, result: 'tmpfile' });
+      setPreviewKind('cal');
+      setPreviewUri(uri);
+    } catch {
+      ThemedAlert.alert('خطا', 'ساخت عکس تقویم ممکن نشد.');
     } finally {
       setCaptureBusy(false);
     }
@@ -650,7 +793,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         return;
       }
       await MediaLibrary.saveToLibraryAsync(previewUri);
-      ThemedAlert.alert('ذخیره شد ✅', 'عکس PnL ربات در گالری گوشی ذخیره شد.');
+      ThemedAlert.alert('ذخیره شد ✅', 'عکس در گالری گوشی ذخیره شد.');
     } catch {
       ThemedAlert.alert('خطا', 'ذخیره عکس انجام نشد.');
     } finally {
@@ -796,29 +939,54 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         ThemedAlert.alert('تاریخچه خالی', 'در این بازه/فیلتر معامله‌ای برای PDF نیست.');
         return;
       }
+      // v1.5.12 — «۷ روزه اصلا ساخته نمیشه»: ریشه، حجم HTML بود. ۸۰۰ ردیف
+      // آخر (جدیدترین‌ها) جدول می‌شود؛ آمارِ کارت از «کلِ» بازه (fullStats).
+      const capped = source.length > PDF_MAX_ROWS;
+      const rowsSource = capped ? source.slice(0, PDF_MAX_ROWS) : source;
+      const fullWins = source.filter((p) => (p.realizedPnl ?? 0) >= 0).length;
+      const fullStats = {
+        trades: source.length,
+        wins: fullWins,
+        losses: source.length - fullWins,
+        realized: source.reduce((s2, p) => s2 + (p.realizedPnl ?? 0), 0),
+      };
       setPdfStatus(`در حال ساخت PDF (${source.length.toLocaleString('fa-IR')} معامله)…`);
-      const rows: BacktestPdfRow[] = source.map((p) => ({
-        symbol: p.symbol,
-        side: p.side,
-        strategyName: p.strategyName,
-        sourceLabel: p.sourceLabel,
-        entryPrice: p.entryPrice,
-        stopPrice: p.stopPrice,
-        takePrice: p.takePrice,
-        marginUsd: marginOfPosition(p),
-        qty: p.qty,
-        leverage: p.leverage,
-        openedAt: p.openedAt,
-        closedAt: p.closedAt,
-        closeReason: p.closeReason,
-        realizedPnl: p.realizedPnl,
-        entryText: fmtPrice(p.symbol, p.entryPrice),
-        stopText: fmtPrice(p.symbol, p.stopPrice),
-        takeText: fmtPrice(p.symbol, p.takePrice),
-        // v1.5.10 — «نقطه خروج» در PDF: قیمت لحظه‌ی بسته شدن
-        exitText: p.lastPrice > 0 ? fmtPrice(p.symbol, p.lastPrice) : '—',
-      }));
-      const html = buildBacktestPdfHtml(rows, {
+      const rows: BacktestPdfRow[] = rowsSource.map((p) => {
+        // v1.5.12 — «کارمزد + فاندینگ» فقط ترید واقعی (دمو کارمزد ندارد).
+        let feesText: string | undefined;
+        if (!isDemo) {
+          const f = realFeesOf(p);
+          if (f) {
+            feesText = `فاندینگ ${f.funding >= 0 ? '−' : '+'}$${Math.abs(f.funding).toFixed(2)} • کارمزد ${f.commission >= 0 ? '−' : '+'}$${Math.abs(f.commission).toFixed(2)}`;
+          }
+        }
+        return {
+          symbol: p.symbol,
+          side: p.side,
+          strategyName: p.strategyName,
+          sourceLabel: p.sourceLabel,
+          entryPrice: p.entryPrice,
+          stopPrice: p.stopPrice,
+          takePrice: p.takePrice,
+          marginUsd: marginOfPosition(p),
+          qty: p.qty,
+          leverage: p.leverage,
+          openedAt: p.openedAt,
+          closedAt: p.closedAt,
+          closeReason: p.closeReason,
+          realizedPnl: p.realizedPnl,
+          entryText: fmtPrice(p.symbol, p.entryPrice),
+          stopText: fmtPrice(p.symbol, p.stopPrice),
+          takeText: fmtPrice(p.symbol, p.takePrice),
+          exitText: p.lastPrice > 0 ? fmtPrice(p.symbol, p.lastPrice) : '—',
+          feesText,
+        };
+      });
+      const windowDays = histWindowMs(histPeriod) / 86400000;
+      const truncatedNote = capped
+        ? `از ${source.length.toLocaleString('fa-IR')} معامله‌ی این بازه، ${PDF_MAX_ROWS.toLocaleString('fa-IR')} معامله‌ی آخر در جدول آمده (برای سرعتِ چاپ) — جمع‌های آمار بالای گزارش شامل «همه‌ی» معاملات است.`
+        : undefined;
+      const metaBase = {
         mode: settings.mode,
         periodLabel: AUTO_PNL_PERIOD_LABEL[histPeriod],
         filterLabel: HIST_TYPE_FILTER_LABEL[histTypeFilter],
@@ -826,34 +994,49 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         engagedMarginUsd,
         openPnlUsd: isDemo ? totalPnl : realTotalPnl,
         generatedAt: Date.now(),
-        // v1.5.8 — R3: امروز/۷ روز → جدول ریز همه‌ی معاملات؛ بیشتر از ۷ روز → فقط خلاصه
-        windowDays: histWindowMs(histPeriod) / 86400000,
-      });
-      // v1.5.11 — قالب چاپ سریع (جدول‌های ۴۰ ردیفی، بدون بک‌گراند) چند
-      // ثانیه‌ای ساخته می‌شود؛ این مهلت فقط بیمه است تا دکمه هیچ‌وقت
-      // «همیشه در حال ساخت» نماند (مشکل ۱ ساعته‌ی نسخه قبل).
-      const PDF_TIMEOUT_MS = 120_000;
-      let timedOut = false;
-      const timeout = new Promise<null>((resolve) => {
-        setTimeout(() => {
-          timedOut = true;
-          resolve(null);
-        }, PDF_TIMEOUT_MS);
-      });
-      const printResult = await Promise.race([
-        Print.printToFileAsync({ html }).catch(() => null),
-        timeout,
-      ]);
-      if (timedOut && !printResult) {
+        fullStats,
+        truncatedNote,
+      };
+      // تلاش اول: قالب چاپ سریع با جدول (۸۰۰ ردیف آخر). تلاش دوم (فول‌بک):
+      // فقط خلاصه‌ی آمار بدون جدول تا کاربر «همیشه» یک PDF تحویل بگیرد.
+      const attempt = async (withTables: boolean): Promise<{ uri: string } | null> => {
+        const html = buildBacktestPdfHtml(rows, {
+          ...metaBase,
+          windowDays: withTables ? windowDays : 30,
+        });
+        let timedOut = false;
+        const timeout = new Promise<null>((resolve) => {
+          setTimeout(() => {
+            timedOut = true;
+            resolve(null);
+          }, 90_000);
+        });
+        const printResult = await Promise.race([
+          Print.printToFileAsync({ html }).catch(() => null),
+          timeout,
+        ]);
+        if (timedOut) return null;
+        return printResult;
+      };
+      let printResult = await attempt(true);
+      let usedFallback = false;
+      if (!printResult) {
+        usedFallback = true;
+        setPdfStatus('جدول طول کشید — ساخت نسخه‌ی خلاصه…');
+        printResult = await attempt(false);
+      }
+      if (!printResult) {
         ThemedAlert.alert(
-          'ساخت PDF طول کشید',
-          `ساخت PDF برای ${source.length.toLocaleString('fa-IR')} معامله بیش از ۲ دقیقه طول کشید و لغو شد.\n\nپیشنهاد: بازه‌ی کوچک‌تر (امروز) یا فیلتر «سودها/ضررها» را انتخاب کنید — یا چند لحظه صبر کنید و دوباره امتحان کنید.`
+          'ساخت PDF انجام نشد',
+          'حتی نسخه‌ی خلاصه هم در ۹۰ ثانیه آماده نشد — اتصال اینترنت/حافظه‌ی دستگاه را بررسی کنید یا فیلتر کوچک‌تری (امروز) را انتخاب کنید.'
         );
         return;
       }
-      if (!printResult) {
-        ThemedAlert.alert('خطا', 'ساخت PDF انجام نشد — دوباره تلاش کنید.');
-        return;
+      if (usedFallback) {
+        ThemedAlert.alert(
+          'PDF خلاصه ساخته شد',
+          'جدول ریز معاملات برای این تعداد بیش از حد طول کشید؛ PDF با کارت آمار کامل (بدون جدول) ساخته شد. برای جدول ریز، بازه‌ی «امروز» را امتحان کنید.'
+        );
       }
       const { uri } = printResult;
       setPdfStatus('آماده شد — باز کردن اشتراک‌گذاری…');
@@ -869,7 +1052,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       setPdfBusy(false);
       setPdfStatus('');
     }
-  };;
+  };
 
   // v1.5.3 — ساعت + تاریخ شمسی باز شدن معامله
   const fmtOpenTime = (ms?: number): string => {
@@ -1473,12 +1656,88 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 </Pressable>
               </View>
 
+              {/* ── v1.5.12 — تقویم ۳۰ روزه سود/زیان (جدولی، تفکیک روزانه،
+                  با فلش باز/بسته + ساخت عکس برای ذخیره/اشتراک) ── */}
+              {hasAnyPosition && (
+                <View style={styles.calBox}>
+                  <Pressable style={styles.calHead} onPress={() => setCalOpen((v) => !v)} testID="cal-toggle">
+                    <CalendarDays size={13} color={colors.dark.accent} />
+                    <Text style={styles.calTitle}>
+                      تقویم ۳۰ روزه سود/زیان — {settings.mode === 'demo' ? 'دمو' : 'واقعی'}
+                    </Text>
+                    <View style={styles.calHeadSpace} />
+                    {calOpen ? (
+                      <ChevronUp size={14} color={colors.dark.textMuted} />
+                    ) : (
+                      <ChevronDown size={14} color={colors.dark.textMuted} />
+                    )}
+                  </Pressable>
+                  {calOpen && (
+                    <View>
+                      <View ref={calCardRef} collapsable={false} style={styles.calCard}>
+                        <Text style={styles.calCardTitle}>
+                          🤖 بک‌تست — تقویم ۳۰ روزه ({settings.mode === 'demo' ? 'دمو' : 'واقعی'})
+                        </Text>
+                        <View style={[styles.calGridRow, styles.calGridHead]}>
+                          <Text style={[styles.calCell, styles.calCellDate, styles.calCellHead]}>تاریخ</Text>
+                          <Text style={[styles.calCell, styles.calCellHead]}>معاملات</Text>
+                          <Text style={[styles.calCell, styles.calCellHead]}>سود</Text>
+                          <Text style={[styles.calCell, styles.calCellHead]}>ضرر</Text>
+                          <Text style={[styles.calCell, styles.calCellHead]}>خالص</Text>
+                        </View>
+                        {calendarRows.map((r) => (
+                          <View key={r.key} style={styles.calGridRow}>
+                            <Text style={[styles.calCell, styles.calCellDate]}>{r.label}</Text>
+                            <Text style={styles.calCell}>{r.trades.toLocaleString('fa-IR')}</Text>
+                            <Text style={[styles.calCell, { color: r.profit > 0 ? colors.dark.green : colors.dark.textMuted }]}>
+                              +${r.profit.toFixed(2)}
+                            </Text>
+                            <Text style={[styles.calCell, { color: r.loss < 0 ? colors.dark.red : colors.dark.textMuted }]}>
+                              −${Math.abs(r.loss).toFixed(2)}
+                            </Text>
+                            <Text style={[styles.calCell, styles.calCellNet, { color: r.net >= 0 ? colors.dark.green : colors.dark.red }]}>
+                              {r.net >= 0 ? '+' : '−'}${Math.abs(r.net).toFixed(2)}
+                            </Text>
+                          </View>
+                        ))}
+                        {calendarRows.length === 0 && (
+                          <Text style={styles.calEmpty}>در ۳۰ روز اخیر معامله‌ی بسته‌شده‌ای نیست.</Text>
+                        )}
+                        {calendarRows.length > 0 && (
+                          <View style={[styles.calGridRow, styles.calGridTotal]}>
+                            <Text style={[styles.calCell, styles.calCellDate, styles.calCellTotalLabel]}>مجموع ۳۰ روز</Text>
+                            <Text style={[styles.calCell, styles.calCellTotalLabel]}>{calTotals.trades.toLocaleString('fa-IR')}</Text>
+                            <Text style={[styles.calCell, { color: calTotals.profit > 0 ? colors.dark.green : colors.dark.textMuted }]}>
+                              +${calTotals.profit.toFixed(2)}
+                            </Text>
+                            <Text style={[styles.calCell, { color: calTotals.loss < 0 ? colors.dark.red : colors.dark.textMuted }]}>
+                              −${Math.abs(calTotals.loss).toFixed(2)}
+                            </Text>
+                            <Text style={[styles.calCell, styles.calCellNet, { color: calTotals.net >= 0 ? colors.dark.green : colors.dark.red }]}>
+                              {calTotals.net >= 0 ? '+' : '−'}${Math.abs(calTotals.net).toFixed(2)}
+                            </Text>
+                          </View>
+                        )}
+                        <Text style={styles.calFooter}>PampDumpCoins • سود/زیان روزانه‌ی معاملات بسته‌شده در ۳۰ روز اخیر</Text>
+                      </View>
+                      <Pressable style={styles.shareBtn} onPress={() => void handleMakeCalImage()} disabled={captureBusy} testID="cal-make-image">
+                        {captureBusy ? (
+                          <ActivityIndicator size="small" color={colors.dark.background} />
+                        ) : (
+                          <Camera size={13} color={colors.dark.background} />
+                        )}
+                        <Text style={styles.shareBtnText}>ساخت عکس تقویم (پیش‌نمایش)</Text>
+                      </Pressable>
+                    </View>
+                  )}
+                </View>
+              )}
               {/* v1.5.1 — پیش‌نمایش عکس PnL: بعد از دیدن عکس، ذخیره یا اشتراک را انتخاب کنید */}
               <Modal visible={!!previewUri} transparent animationType="fade">
                 <Pressable style={styles.previewOverlay} onPress={() => setPreviewUri(null)}>
                   <View style={styles.previewCard} onStartShouldSetResponder={() => true}>
                     <View style={styles.previewHead}>
-                      <Text style={styles.previewTitle}>پیش‌نمایش عکس PnL</Text>
+                      <Text style={styles.previewTitle}>{previewKind === 'cal' ? 'پیش‌نمایش عکس تقویم' : 'پیش‌نمایش عکس PnL'}</Text>
                       <Pressable hitSlop={8} onPress={() => setPreviewUri(null)}>
                         <X size={18} color={colors.dark.textMuted} />
                       </Pressable>
@@ -1698,6 +1957,12 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       </Text>
                       {/* v1.5.3 — ساعت و تاریخ باز شدن معامله */}
                       <Text style={styles.posTime}>باز شد: {fmtOpenTime(p.openedAt)}</Text>
+                      {/* v1.5.12 — سود بخش‌های بسته‌شده روی همان پوزیشن باز */}
+                      {p.partialRealizedPnl != null && p.partialRealizedPnl !== 0 ? (
+                        <Text style={[styles.posPartial, { color: p.partialRealizedPnl >= 0 ? colors.dark.green : colors.dark.red }]}>
+                          سود بخش بسته‌شده: {p.partialRealizedPnl >= 0 ? '+' : '−'}${Math.abs(p.partialRealizedPnl).toFixed(2)} ({(p.partialsDone ?? 0).toLocaleString('fa-IR')} برداشت)
+                        </Text>
+                      ) : null}
                     </View>
                     <View style={styles.posSide}>
                       <Text style={[styles.posPnl, { color: pnl >= 0 ? colors.dark.green : colors.dark.red }]}>
@@ -1933,6 +2198,21 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       </Text>
                       {/* v1.5.3 — ساعت و تاریخ باز شدن معامله */}
                       <Text style={styles.posTime}>باز شد: {fmtOpenTime(p.openedAt)}</Text>
+                      {/* v1.5.12 — سود بخش‌های بسته‌شده روی همان پوزیشن باز */}
+                      {p.partialRealizedPnl != null && p.partialRealizedPnl !== 0 ? (
+                        <Text style={[styles.posPartial, { color: p.partialRealizedPnl >= 0 ? colors.dark.green : colors.dark.red }]}>
+                          سود بخش بسته‌شده: {p.partialRealizedPnl >= 0 ? '+' : '−'}${Math.abs(p.partialRealizedPnl).toFixed(2)} ({(p.partialsDone ?? 0).toLocaleString('fa-IR')} برداشت)
+                        </Text>
+                      ) : null}
+                      {/* v1.5.12 — فاندینگ + کارمزد کم‌شده از پوزیشن واقعی */}
+                      {(() => {
+                        const f = realFeesOf(p);
+                        return f ? (
+                          <Text style={styles.posFees}>
+                            فاندینگ {f.funding >= 0 ? '−' : '+'}${Math.abs(f.funding).toFixed(2)} • کارمزد {f.commission >= 0 ? '−' : '+'}${Math.abs(f.commission).toFixed(2)}
+                          </Text>
+                        ) : null;
+                      })()}
                     </View>
                     <View style={styles.posSide}>
                       <Text style={[styles.posPnl, { color: pnl >= 0 ? colors.dark.green : colors.dark.red }]}>
@@ -2074,6 +2354,14 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       <Text style={[styles.posPnl, { color: (p.realizedPnl ?? 0) >= 0 ? colors.dark.green : colors.dark.red }]}>
                         {(p.realizedPnl ?? 0) >= 0 ? '+' : '−'}${Math.abs(p.realizedPnl ?? 0).toFixed(2)}
                       </Text>
+                      {(() => {
+                        const f = realFeesOf(p);
+                        return f ? (
+                          <Text style={styles.closedFees}>
+                            فاندینگ {f.funding >= 0 ? '−' : '+'}${Math.abs(f.funding).toFixed(2)} • کارمزد {f.commission >= 0 ? '−' : '+'}${Math.abs(f.commission).toFixed(2)}
+                          </Text>
+                        ) : null;
+                      })()}
                     </View>
                   ))}
                   {/* v1.5.6 — صفحه‌بندی ۱۰۰تایی (بازیابی از v1.5.4) */}
@@ -2859,6 +3147,113 @@ const styles = StyleSheet.create({
     fontSize: 9.5,
     color: colors.dark.textSecondary,
     marginBottom: 4,
+  },
+  // ── v1.5.12 — تقویم ۳۰ روزه ──
+  calBox: {
+    marginTop: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    backgroundColor: colors.dark.card,
+    padding: 8,
+  },
+  calHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  calTitle: {
+    flex: 1,
+    fontSize: 11.5,
+    fontWeight: '800',
+    color: colors.dark.text,
+  },
+  calHeadSpace: {
+    flex: 0,
+  },
+  calCard: {
+    marginTop: 8,
+    borderRadius: 10,
+    backgroundColor: colors.dark.surface,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    padding: 10,
+  },
+  calCardTitle: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: colors.dark.text,
+    marginBottom: 8,
+  },
+  calGridRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 4,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.dark.border,
+  },
+  calGridHead: {
+    borderBottomWidth: 1,
+    borderBottomColor: colors.dark.cardBorder,
+  },
+  calGridTotal: {
+    borderBottomWidth: 0,
+    marginTop: 2,
+    borderTopWidth: 1,
+    borderTopColor: colors.dark.cardBorder,
+  },
+  calCell: {
+    flex: 1,
+    fontSize: 10.5,
+    fontWeight: '700',
+    color: colors.dark.text,
+    textAlign: 'center',
+    fontVariant: ['tabular-nums'],
+  },
+  calCellDate: {
+    flex: 1.4,
+    textAlign: 'left',
+  },
+  calCellHead: {
+    fontSize: 9,
+    fontWeight: '800',
+    color: colors.dark.textMuted,
+  },
+  calCellNet: {
+    fontWeight: '800',
+  },
+  calCellTotalLabel: {
+    color: colors.dark.text,
+    fontWeight: '800',
+  },
+  calEmpty: {
+    textAlign: 'center',
+    color: colors.dark.textMuted,
+    fontSize: 10,
+    paddingVertical: 10,
+  },
+  calFooter: {
+    marginTop: 8,
+    fontSize: 8.5,
+    color: colors.dark.textMuted,
+    textAlign: 'center',
+  },
+  // ── v1.5.12 — سود بخش بسته‌شده روی پوزیشن باز + خط کارمزد/فاندینگ ──
+  posPartial: {
+    fontSize: 10,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  posFees: {
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+    marginTop: 2,
+  },
+  closedFees: {
+    fontSize: 8.5,
+    color: colors.dark.textMuted,
+    marginTop: 1,
+    textAlign: 'left',
   },
   closedRow: {
     flexDirection: 'row',

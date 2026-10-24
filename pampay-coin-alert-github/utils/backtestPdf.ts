@@ -47,6 +47,8 @@ export interface BacktestPdfRow {
   takeText: string;
   /** v1.5.10 — قیمت خروج (قیمت لحظه‌ی بسته شدن) ازپیش‌قالب‌بندی‌شده. */
   exitText?: string;
+  /** v1.5.12 — «کارمزد + فاندینگ» پوزیشن واقعی (مثلاً «ف 0.35 + ک 0.12») — دمو خالی. */
+  feesText?: string;
 }
 
 export interface BacktestPdfMeta {
@@ -64,6 +66,13 @@ export interface BacktestPdfMeta {
    * همه=Infinity). <= ۷ → جدول ریز معاملات؛ بیشتر → فقط خلاصه.
    */
   windowDays?: number;
+  /**
+   * v1.5.12 — آمار «کلِ» بازه حتی وقتی جدول به سقف ردیف بریده شده
+   * (جمع‌های کارت آمار همیشه شامل همه‌ی معاملات همان بازه است).
+   */
+  fullStats?: { trades: number; wins: number; losses: number; realized: number };
+  /** v1.5.12 — یادداشت بریده‌شدن جدول (سقف ۸۰۰ ردیف برای سرعتِ چاپ). */
+  truncatedNote?: string;
 }
 
 /** v1.5.11 — اندازه‌ی هر تکه از جدول (ردیف در هر <table>). */
@@ -103,6 +112,8 @@ function fullRowHtml(r: BacktestPdfRow, i: number): string {
   const pnl = r.realizedPnl ?? 0;
   const reason = PERSIAN_CLOSE_REASON[r.closeReason ?? ''] ?? (r.closeReason ? r.closeReason : '—');
   const exit = r.exitText && r.exitText.length > 0 ? r.exitText : '—';
+  // v1.5.12 — «کارمزد + فاندینگ» زیر سود/زیان (فقط ترید واقعی که کارمزد کم شده)
+  const fees = r.feesText && r.feesText.length > 0 ? `<br/><span class="fee">${r.feesText}</span>` : '';
   return (
     `<tr><td>${(i + 1).toLocaleString('fa-IR')}</td>` +
     `<td class="b">${r.symbol}</td>` +
@@ -117,7 +128,7 @@ function fullRowHtml(r: BacktestPdfRow, i: number): string {
     `<td>${faDateTime(r.openedAt)}</td>` +
     `<td>${faDateTime(r.closedAt)}</td>` +
     `<td>${reason}</td>` +
-    `<td class="mono b ${pnl >= 0 ? 'g' : 'r'}">${pnl >= 0 ? '+' : '−'}$${usd(pnl)}</td></tr>`
+    `<td class="mono b ${pnl >= 0 ? 'g' : 'r'}">${pnl >= 0 ? '+' : '−'}$${usd(pnl)}${fees}</td></tr>`
   );
 }
 
@@ -128,10 +139,13 @@ const FULL_TABLE_HEAD =
 
 /** ساخت HTML گزارش PDF تاریخچه بک‌تست — قالب چاپ سریع v1.5.11 (RTL فارسی). */
 export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMeta): string {
-  const totalTrades = rows.length;
-  const wins = rows.filter((r) => (r.realizedPnl ?? 0) >= 0).length;
-  const losses = totalTrades - wins;
-  const realized = rows.reduce((s, r) => s + (r.realizedPnl ?? 0), 0);
+  // v1.5.12 — آمار از «کلِ» بازه (fullStats) وقتی جدول بریده شده است؛
+  // وگرنه از همان ردیف‌های جدول.
+  const st = meta.fullStats;
+  const totalTrades = st ? st.trades : rows.length;
+  const wins = st ? st.wins : rows.filter((r) => (r.realizedPnl ?? 0) >= 0).length;
+  const losses = st ? st.losses : totalTrades - wins;
+  const realized = st ? st.realized : rows.reduce((s, r) => s + (r.realizedPnl ?? 0), 0);
   const winRate = totalTrades > 0 ? Math.round((wins / totalTrades) * 100) : 0;
   const balance = meta.initialCapitalUsd + realized;
   const freeMargin = Math.max(0, balance - meta.engagedMarginUsd);
@@ -142,11 +156,13 @@ export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMe
   const includeTrades = Number.isFinite(windowDays) ? windowDays <= 7 : false;
 
   // v1.5.11 — جدول‌های تکه‌تکه‌ی ۴۰ ردیفی (چاپ سریع اندروید)
+  // v1.5.12 — جدول از «rows» ساخته می‌شود (سقف ۸۰۰ ردیف آخر)؛ totalTrades فقط
+  // آمار کارت است — پیمایش روی totalTrades به undefined می‌رسید (تست گرفتش).
   let tablesHtml = '';
-  if (includeTrades && totalTrades > 0) {
+  if (includeTrades && rows.length > 0) {
     const parts: string[] = [];
-    for (let start = 0; start < totalTrades; start += PDF_TABLE_CHUNK) {
-      const end = Math.min(start + PDF_TABLE_CHUNK, totalTrades);
+    for (let start = 0; start < rows.length; start += PDF_TABLE_CHUNK) {
+      const end = Math.min(start + PDF_TABLE_CHUNK, rows.length);
       const chunk: string[] = [];
       for (let i = start; i < end; i++) chunk.push(fullRowHtml(rows[i], i));
       parts.push(`<table class="t"><thead>${FULL_TABLE_HEAD}</thead><tbody>${chunk.join('')}</tbody></table>`);
@@ -178,6 +194,8 @@ export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMe
   .footer { font-size: 7.5px; color: #555; text-align: center; margin-top: 6px; }
   .guide p { font-size: 8px; color: #222; line-height: 1.6; margin: 0 0 5px; text-align: justify; }
   .guide b { font-weight: 700; }
+  .fee { font-size: 6.5px; color: #555; font-weight: 400; }
+  .trunc { font-size: 8px; color: #333; border: 1px dashed #777; padding: 4px 7px; margin: 4px 0 8px; }
 </style>
 </head>
 <body>
@@ -207,9 +225,9 @@ export function buildBacktestPdfHtml(rows: BacktestPdfRow[], meta: BacktestPdfMe
     !includeTrades
       ? `<div class="empty">این بازه (${meta.periodLabel}) فقط خلاصه‌ی آمار دارد.</div>
     <div class="note">برای سرعتِ ساخت PDF، در بازه‌های بیشتر از ۷ روز جدول ریز معاملات درج نمی‌شود — بازه‌ی «۷ روز» یا «امروز» را انتخاب کنید تا همه‌ی ریز معاملات همان بازه با تمام مشخصات (ورود، استاپ، تیک‌پرافیت، قیمت خروج، حجم مارجین، نوع بسته شدن) در PDF بیاید.</div>`
-      : totalTrades === 0
+      : rows.length === 0
         ? '<div class="empty">در این بازه/فیلتر معامله‌ای نیست.</div>'
-        : tablesHtml
+        : `${meta.truncatedNote ? `<div class="trunc">${meta.truncatedNote}</div>` : ''}${tablesHtml}`
   }
   <div class="footer">PampDumpCoins — گزارش تاریخچه بک‌تست • ${faDateTime(meta.generatedAt)}</div>
   <div class="guide">

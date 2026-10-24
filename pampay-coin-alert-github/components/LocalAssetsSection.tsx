@@ -242,8 +242,9 @@ export default function LocalAssetsSection({
 
       {/* ── live price list ── */}
       <View style={styles.priceBlock}>
-        <Text style={styles.blockLabel}>قیمت‌های لحظه‌ای (تومان)</Text>
+        <Text style={styles.blockLabel}>قیمت‌های لحظه‌ای</Text>
         <View style={styles.priceGrid}>
+          <PriceChip label="انس جهانی طلا ($)" value={p?.goldOunceUsd} usd />
           <PriceChip label="طلای ۱۸ عیار (گرم)" value={p?.gold18} />
           <PriceChip label="طلای ۲۴ عیار (گرم)" value={p?.gold24} />
           <PriceChip label="نقره ۹۹۹ (گرم)" value={p?.silver999} />
@@ -781,13 +782,18 @@ function LocalAssetsPnl({
 
 // ── sub-components ──
 
-function PriceChip({ label, value }: { label: string; value?: number }) {
+function PriceChip({ label, value, usd }: { label: string; value?: number; usd?: boolean }) {
+  // v1.5.12 — «قیمت انس جهانی طلا» دلاری است؛ بقیه تومانی.
+  const text =
+    value && value > 0
+      ? usd
+        ? `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+        : formatFullToman(value)
+      : '…';
   return (
     <View style={styles.priceChip}>
       <Text style={styles.priceChipLabel}>{label}</Text>
-      <Text style={[styles.priceChipValue, !value && styles.priceChipEmpty]}>
-        {value && value > 0 ? formatFullToman(value) : '…'}
-      </Text>
+      <Text style={[styles.priceChipValue, !value && styles.priceChipEmpty]}>{text}</Text>
     </View>
   );
 }
@@ -948,20 +954,22 @@ const styles = createThemedStyles(() =>
       flexGrow: 1,
       backgroundColor: colors.dark.surface,
       borderRadius: 8,
-      paddingVertical: 6,
+      paddingVertical: 8,
       paddingHorizontal: 6,
       alignItems: 'center',
       borderWidth: 1,
       borderColor: colors.dark.border,
     },
     priceChipLabel: {
-      fontSize: 9,
+      fontSize: 10,
       color: colors.dark.textSecondary,
       textAlign: 'center',
     },
+    // v1.5.12 — «فونت متن و اعداد قیمت‌های لحظه‌ای را برای خوانایی بیشتر
+    // بزرگتر کن» — ۱۱ → ۱۴.۵ (ضخیم‌تر) + لیبل ۹ → ۱۰.
     priceChipValue: {
-      fontSize: 11,
-      fontWeight: '700' as const,
+      fontSize: 14.5,
+      fontWeight: '800' as const,
       color: colors.dark.text,
       marginTop: 2,
     },

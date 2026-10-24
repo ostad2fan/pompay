@@ -181,6 +181,12 @@ export interface DemoAutoPosition {
   strategyName?: string;
   /** v1.5.3 — چند بار ربات خودش نصف حجم بسته (۰/۱/۲ — آستانه ۲۵٪ و ۵۰٪). */
   partialsDone?: number;
+  /**
+   * v1.5.12 — جمع سود/زیان تحقق‌یافته‌ی بخش‌های بسته‌شده‌ی همین پوزیشن باز
+   * («هر پوزیشنی نصف حجمش بسته شد سود/ضررش روی همان پوزیشن باز نشان داده شود»)
+   * — روی خود رکوردهای بسته‌ی جزئی undefined است (فقط روی پوزیشن باز).
+   */
+  partialRealizedPnl?: number;
 }
 
 /** v1.5.0 — a REAL position the engine opened (tracked for trailing/PnL). */
@@ -209,6 +215,8 @@ export interface RealAutoPosition {
   strategyName?: string;
   /** v1.5.3 — چند بار ربات خودش نصف حجم بسته (۰/۱/۲ — آستانه ۲۵٪ و ۵۰٪). */
   partialsDone?: number;
+  /** v1.5.12 — جمع سود/زیان تحقق‌یافته‌ی بخش‌های بسته‌شده‌ی همین پوزیشن باز. */
+  partialRealizedPnl?: number;
 }
 
 export interface AutoEngineLog {
@@ -898,11 +906,13 @@ async function partialCloseDemo(
     return closeDemo(id, price, reason === 'partial' ? 'take' : 'manual');
   }
   const pnl = (price - p.entryPrice) * dir * closedQty;
+  // v1.5.12 — سود بخش بسته‌شده روی «پوزیشن باز» انباشته می‌شود تا روی همان ردیف دیده شود.
   positions[idx] = {
     ...p,
     qty: remainingQty,
     partialsDone: (p.partialsDone ?? 0) + 1,
     lastPrice: price,
+    partialRealizedPnl: (p.partialRealizedPnl ?? 0) + pnl,
   };
   const partialRecord: DemoAutoPosition = {
     ...p,
@@ -914,6 +924,7 @@ async function partialCloseDemo(
     realizedPnl: pnl,
     lastPrice: price,
     partialsDone: undefined,
+    partialRealizedPnl: undefined,
   };
   positions.splice(idx + 1, 0, partialRecord);
   await saveDemoPositions(positions);
@@ -958,7 +969,14 @@ async function partialCloseReal(
   const tracked = await loadRealPositions();
   const idx = tracked.findIndex((p) => p.id === pos.id && p.status === 'open');
   if (idx < 0) return false;
-  tracked[idx] = { ...tracked[idx], qty: remainingQty, partialsDone: (tracked[idx].partialsDone ?? 0) + 1, lastPrice: price };
+  // v1.5.12 — سود بخش بسته‌شده روی «پوزیشن باز» انباشته می‌شود (نمایش روی ردیف).
+  tracked[idx] = {
+    ...tracked[idx],
+    qty: remainingQty,
+    partialsDone: (tracked[idx].partialsDone ?? 0) + 1,
+    lastPrice: price,
+    partialRealizedPnl: (tracked[idx].partialRealizedPnl ?? 0) + pnl,
+  };
   const partialRecord: RealAutoPosition = {
     ...tracked[idx],
     id: `${pos.id}-p${(pos.partialsDone ?? 0) + 1}`,
@@ -969,6 +987,7 @@ async function partialCloseReal(
     realizedPnl: pnl,
     lastPrice: price,
     partialsDone: undefined,
+    partialRealizedPnl: undefined,
   };
   tracked.splice(idx + 1, 0, partialRecord);
   await saveRealPositions(tracked);

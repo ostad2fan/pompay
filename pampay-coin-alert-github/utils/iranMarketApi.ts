@@ -39,7 +39,7 @@ const TGJU_PROXY_MIRRORS = [
   'https://api.allorigins.win/raw?url=' + encodeURIComponent('https://call2.tgju.org/ajax.json'),
 ];
 
-const CACHE_KEY = '@iran_market_prices_v1';
+const CACHE_KEY = '@iran_market_prices_v2'; // v1.5.12 — v2: + goldOunceUsd (انس جهانی)
 const CACHE_TTL = 10 * 60 * 1000; // 10 min AsyncStorage
 const MEMORY_TTL = 60 * 1000; // 60s in-flight result
 
@@ -48,6 +48,11 @@ export interface IranMarketPrices {
   gold18: number;
   /** هر گرم طلای ۲۴ عیار — تومان */
   gold24: number;
+  /**
+   * v1.5.12 — «قیمت انس جهانی طلا» (XAU/USD) — دلار، نه تومان؛ از همان
+   * فید TGJU با نماد «ons» می‌آید (مثل بقیه بدون احراز هویت).
+   */
+  goldOunceUsd: number;
   /** هر گرم نقره ۹۹۹ — تومان */
   silver999: number;
   /** هر گرم نقره ۹۲۵ — تومان */
@@ -127,12 +132,21 @@ function extractPrices(data: {
   const mesghal = pick('mesghal');
   const dollar = pick('price_dollar_rl');
 
+  // v1.5.12 — انس جهانی طلا (XAU) — TGJU آن را «دلاری» منتشر می‌کند (ریال
+  // نیست!) پس ÷10 نمی‌شود؛ فقط کاما حذف و عدد اعتبار‌سنجی می‌شود (رنج امن).
+  const onsRaw = cur['ons']?.p;
+  const goldOunceUsd = (() => {
+    const n = parseFloat(String(onsRaw ?? '').replace(/,/g, ''));
+    return Number.isFinite(n) && n > 100 && n < 100_000 ? n : 0;
+  })();
+
   // Sanity: گرم ۱۸ عیار باید بین ۵ تا ۱۰۰ میلیون تومان باشد (رنج امن ۱۰ ساله).
   if (gold18 < 5_000_000 || gold18 > 100_000_000) return {};
 
   return {
     gold18,
     gold24: gold24 > 5_000_000 ? gold24 : Math.round((gold18 / 0.75) * 1000) / 1000,
+    goldOunceUsd,
     silver999: silver999 > 10_000 ? silver999 : 0,
     silver925: silver925 > 10_000 ? silver925 : silver999 > 10_000 ? Math.round(silver999 * 0.925) : 0,
     coinEmami: coinEmami > 10_000_000 ? coinEmami : 0,
@@ -220,6 +234,7 @@ export async function fetchIranMarketPrices(): Promise<IranMarketPrices | null> 
   const buildPrices = (partial: Partial<IranMarketPrices>, source: string): IranMarketPrices => ({
     gold18: partial.gold18!,
     gold24: partial.gold24!,
+    goldOunceUsd: partial.goldOunceUsd ?? 0,
     silver999: partial.silver999 ?? 0,
     silver925: partial.silver925 ?? 0,
     coinEmami: partial.coinEmami ?? 0,
