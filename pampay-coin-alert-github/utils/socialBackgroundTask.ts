@@ -1,5 +1,5 @@
 /**
- * socialBackgroundTask.ts — v1.5.13
+ * socialBackgroundTask.ts — v1.5.14
  *
  * اعلان سیگنال سوشال‌مدیا «بدون سرور» حتی وقتی برنامه در پس‌زمینه است:
  * expo-background-fetch هر ≥۱۵ دقیقه گوشی را بیدار می‌کند، یک چرخه کامل

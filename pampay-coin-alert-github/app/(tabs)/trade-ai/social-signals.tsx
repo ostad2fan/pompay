@@ -1,5 +1,5 @@
 /**
- * app/(tabs)/trade-ai/social-signals.tsx — v1.5.13
+ * app/(tabs)/trade-ai/social-signals.tsx — v1.5.14
  *
  * تب «سوشال‌مدیا» — سیگنال‌های سوشال‌مدیا بدون هیچ سروری (فقط اینترنت گوشی).
  *
@@ -39,12 +39,14 @@ import {
   User,
   Link2,
   HelpCircle,
+  Send,
 } from 'lucide-react-native';
 import colors from '@/constants/colors';
 import { createThemedStyles } from '@/utils/themeStyles';
 import { useApp } from '@/contexts/AppContext';
 import TradeAiSegmentHeader from '@/components/TradeAiSegmentHeader';
 import { ThemedAlert } from '@/components/ThemedAlert';
+import SocialImageViewer from '@/components/SocialImageViewer';
 import {
   SocialSignal,
   SocialSource,
@@ -53,6 +55,7 @@ import {
   listSocialSources,
   addSocialSource,
   removeSocialSource,
+  sendSocialTelegramTest,
 } from '@/utils/socialSignalsService';
 
 function timeAgoFa(ms: number): string {
@@ -71,9 +74,13 @@ export default function SocialSignalsScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [lastFetchAt, setLastFetchAt] = useState<number | null>(null);
-  const [guideOpen, setGuideOpen] = useState(true);
+  // v1.5.14 — راهنما و تنظیمات نمایش: به‌صورت پیش‌فرض جمع‌شده است و با
+  // زدن فلش باز می‌شود (خواندنش با کاربر است).
+  const [guideOpen, setGuideOpen] = useState(false);
   const [newSource, setNewSource] = useState('');
   const [adding, setAdding] = useState(false);
+  const [viewerImage, setViewerImage] = useState<string | null>(null);
+  const [testingTg, setTestingTg] = useState(false);
 
   const showSourceName = settings.socialShowSourceName === true;
   const showLink = settings.socialShowSourceLink === true;
@@ -150,6 +157,38 @@ export default function SocialSignalsScreen() {
     Linking.openURL(url).catch(() => {});
   }, []);
 
+  /** v1.5.14 — تست ارسال ۲ سیگنال آخر (همراه عکس چارت) به تلگرام. */
+  const handleTelegramTest = useCallback(async () => {
+    if (testingTg) return;
+    setTestingTg(true);
+    try {
+      const res = await sendSocialTelegramTest();
+      if (res.error === 'telegram_disabled') {
+        ThemedAlert.alert(
+          'تلگرام فعال نیست',
+          'اول در «تنظیمات برنامه» بخش تلگرام، ربات و چت‌آیدی را ثبت و تلگرام را روشن کنید؛ بعد دوباره این تست را بزنید.'
+        );
+      } else if (res.error === 'no_signals') {
+        ThemedAlert.alert(
+          'سیگنالی برای تست نیست',
+          'هنوز هیچ سیگنالی ذخیره نشده. صفحه را به پایین بکشید تا بروزرسانی شود و بعد دوباره تست را بزنید.'
+        );
+      } else if (res.ok) {
+        ThemedAlert.alert(
+          'تست تلگرام موفق ✓',
+          `${res.sent.toLocaleString('fa-IR')} سیگنال (با عکس چارت) به تلگرام ارسال شد — ربات شما را چک کنید.`
+        );
+      } else {
+        ThemedAlert.alert(
+          'ارسال به تلگرام نشد',
+          'اتصال اینترنت یا توکن ربات را چک کنید. اگر عکس از سمت تلگرام باز نشود، متن سیگنال فرستاده می‌شود (خطای جزئیات در لاگ).'
+        );
+      }
+    } finally {
+      setTestingTg(false);
+    }
+  }, [testingTg]);
+
   return (
     <View style={styles.container}>
       <View style={styles.segmentWrap}>
@@ -189,9 +228,10 @@ export default function SocialSignalsScreen() {
               </Text>
               <Text style={styles.guideText}>
                 • منبع پیش‌فرض، آیدی توییتری است که در «افزودن منبع» می‌بینید؛ هر کاربر توییتر دیگری را هم می‌توانید اضافه یا حذف کنید (لینک پروفایل مثل x.com/username یا فقط آیدی).
-                {'\n'}• بروزرسانی خودکار طبق «بازه بروزرسانی» در تنظیمات برنامه انجام می‌شود و هر بار که این تب را باز کنید هم یک چرخه تازه زده می‌شود.
+                {'\n'}• بروزرسانی خودکار طبق «بازه بروزرسانی» در تنظیمات برنامه انجام می‌شود؛ هر بار که این تب را باز کنید یا به برنامه برگردید هم یک چرخه تازه زده می‌شود — پس توییت تازه منبع پیش‌فرض سریع در برنامه و تلگرام می‌افتد.
                 {'\n'}• فقط توییت‌هایی سیگنال محسوب می‌شوند که هم تیکر دلار ($) داشته باشند و هم عکس چارت؛ توییت‌های بدون عکس چارت اصلاً نمایش داده نمی‌شوند و پیامی هم برایشان نمی‌آید.
-                {'\n'}• ارسال به تلگرام هم بدون سرور و مستقیم از گوشی انجام می‌شود؛ کافی است تلگرام در تنظیمات برنامه فعال باشد.
+                {'\n'}• روی عکس هر سیگنال بزنید تا تمام‌صفحه باز شود؛ با دو انگشت زوم کنید (تا ۸ برابر) و جزئیات چارت را ببینید؛ دکمه دانلود بالای صفحه، عکس را در گالری گوشی ذخیره می‌کند.
+                {'\n'}• ارسال به تلگرام هم بدون سرور و مستقیم از گوشی انجام می‌شود؛ کافی است تلگرام در تنظیمات برنامه فعال باشد. دکمه «تست ارسال به تلگرام» پایین همین بخش، ۲ سیگنال آخر را با عکس می‌فرستد تا مطمئن شوید اتصال درست است.
               </Text>
 
               <View style={styles.privacyBox}>
@@ -227,6 +267,21 @@ export default function SocialSignalsScreen() {
                   testID="social-show-source-link"
                 />
               </View>
+
+              {/* v1.5.14 — تست ارسال ۲ سیگنال آخر (همراه عکس چارت) به تلگرام */}
+              <Pressable
+                style={({ pressed }) => [styles.testTgBtn, pressed && { opacity: 0.85 }]}
+                onPress={handleTelegramTest}
+                disabled={testingTg}
+                testID="social-telegram-test"
+              >
+                {testingTg ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Send size={14} color="#fff" />
+                )}
+                <Text style={styles.testTgText}>تست ارسال به تلگرام (۲ سیگنال آخر با عکس)</Text>
+              </Pressable>
             </View>
           )}
         </View>
@@ -333,12 +388,15 @@ export default function SocialSignalsScreen() {
                 </View>
               )}
 
-              <Image
-                source={{ uri: sig.imageUrl }}
-                style={styles.chartImage}
-                resizeMode="cover"
-                accessibilityLabel="چارت سیگنال"
-              />
+              {/* v1.5.14 — لمس عکس = نمایشگر تمام‌صفحه با زوم دو انگشتی + ذخیره در گالری */}
+              <Pressable onPress={() => setViewerImage(sig.imageUrl)} testID={`social-img-${sig.id}`}>
+                <Image
+                  source={{ uri: sig.imageUrl }}
+                  style={styles.chartImage}
+                  resizeMode="cover"
+                  accessibilityLabel="چارت سیگنال — برای تمام‌صفحه بزنید"
+                />
+              </Pressable>
               <Text style={styles.signalText} numberOfLines={8}>
                 {sig.text}
               </Text>
@@ -354,6 +412,13 @@ export default function SocialSignalsScreen() {
           ))
         )}
       </ScrollView>
+
+      {/* v1.5.14 — نمایشگر تمام‌صفحه عکس چارت (زوم + ذخیره در گالری) */}
+      <SocialImageViewer
+        visible={viewerImage != null}
+        imageUrl={viewerImage}
+        onClose={() => setViewerImage(null)}
+      />
     </View>
   );
 }
@@ -650,6 +715,21 @@ const styles = createThemedStyles(() =>
       fontSize: 11,
       fontWeight: '700' as const,
       color: colors.dark.blue,
+    },
+    testTgBtn: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+      backgroundColor: colors.dark.accent,
+      borderRadius: 10,
+      paddingVertical: 11,
+      marginTop: 4,
+    },
+    testTgText: {
+      fontSize: 12,
+      fontWeight: '800' as const,
+      color: '#fff',
     },
   })
 );

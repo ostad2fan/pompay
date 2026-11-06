@@ -1,5 +1,5 @@
 /**
- * socialSignalsService.ts — v1.5.13
+ * socialSignalsService.ts — v1.5.14
  *
  * «سیگنال‌های سوشال‌مدیا» — دریافت خودکار توییت‌های معتبر بدون هیچ سروری:
  * فقط اینترنت گوشی. منبع پیش‌فرض @CryptoNewton است و کاربر می‌تواند هر
@@ -27,7 +27,7 @@
  */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Platform } from 'react-native';
+import { AppState, Platform } from 'react-native';
 import * as Notifications from 'expo-notifications';
 
 export interface SocialSignal {
@@ -482,12 +482,64 @@ export async function runSocialSignalsCycle(): Promise<SocialCycleResult> {
   }
 }
 
+/** Human result of the in-app Telegram test button (v1.5.14). */
+export interface SocialTelegramTestResult {
+  ok: boolean;
+  /** how many of the picked signals really reached Telegram */
+  sent: number;
+  total: number;
+  error?: 'telegram_disabled' | 'no_signals' | 'send_failed';
+}
+
+/**
+ * v1.5.14 — دکمه «تست ارسال به تلگرام» در راهنمای تب سوشال‌مدیا: ۲ سیگنال
+ * آخر (همراه عکس چارت) را از همان مسیرِ ارسال خودکارِ واقعی می‌فرستد تا
+ * کاربر مطمئن شود اتصال تلگرام درست کار می‌کند. اگر تلگرام فعال نباشد
+ * به‌جای ارسال، دلیل برگردانده می‌شود (UI پیام راهنما نشان می‌دهد).
+ */
+export async function sendSocialTelegramTest(): Promise<SocialTelegramTestResult> {
+  let cfg: { telegramEnabled?: boolean; telegramBotToken?: string; telegramChatId?: string };
+  try {
+    const raw = await AsyncStorage.getItem(TELEGRAM_SETTINGS_KEY);
+    cfg = raw ? (JSON.parse(raw) as typeof cfg) : {};
+  } catch {
+    cfg = {};
+  }
+  if (!cfg.telegramEnabled || !cfg.telegramBotToken || !cfg.telegramChatId) {
+    return { ok: false, sent: 0, total: 0, error: 'telegram_disabled' };
+  }
+  const list = await loadSocialSignals();
+  const picks = list.slice(0, 2); // تازه‌ترین‌ها (لیست ذخیره‌شده جدید→قدیم است)
+  if (picks.length === 0) {
+    return { ok: false, sent: 0, total: 0, error: 'no_signals' };
+  }
+  const flags = await loadSocialDisplayFlags();
+  const { sendTelegramSocialSignal } = await import('./telegramService');
+  let sent = 0;
+  for (const sig of picks) {
+    try {
+      const done = await sendTelegramSocialSignal(sig, {
+        botToken: cfg.telegramBotToken,
+        chatId: cfg.telegramChatId,
+        showUsername: flags.showSourceName,
+        showLink: flags.showLink,
+      });
+      if (done) sent++;
+    } catch (e) {
+      console.log('[SocialSignals] تست تلگرام یک سیگنال نشد:', (e as Error).message);
+    }
+  }
+  return { ok: sent > 0, sent, total: picks.length, error: sent === 0 ? 'send_failed' : undefined };
+}
+
 // ---------------------------------------------------------------------------
 // اسکجولر — بازه بروزرسانی طبق تنظیمات برنامه (refreshInterval دقیقه)
 // ---------------------------------------------------------------------------
 
 let schedulerInterval: ReturnType<typeof setInterval> | null = null;
 let schedulerMinutes = 0;
+/** آخرین چرخه‌ای که خودکار (نه دستی) اجرا شده — برای ریفرشِ «برگشت به اپ». */
+let lastAutoCycleAt = 0;
 
 export function startSocialSignalsScheduler(intervalMinutes: number): void {
   if (Platform.OS === 'web') return;
@@ -498,11 +550,23 @@ export function startSocialSignalsScheduler(intervalMinutes: number): void {
   console.log(`[SocialSignals] اسکجولر هر ${mins} دقیقه شروع شد`);
   // اولین چرخه کمی بعد از استارت برنامه (تا بلوکه شدن UI اولیه نشود)
   setTimeout(() => {
+    lastAutoCycleAt = Date.now();
     runSocialSignalsCycle().catch((e) => console.log('[SocialSignals] چرخه اول:', (e as Error).message));
   }, 4000);
   schedulerInterval = setInterval(() => {
+    lastAutoCycleAt = Date.now();
     runSocialSignalsCycle().catch((e) => console.log('[SocialSignals] چرخه:', (e as Error).message));
   }, mins * 60_000);
+  // v1.5.14 — «پست سریع»: با هر بار برگشتن کاربر به برنامه (app → foreground)
+  // یک چرخه تازه زده می‌شود (حداکثر هر ۶۰ ثانیه یک بار) تا توییت تازه منبع
+  // پیش‌فرض بدون منتظرِ تایمر بعدی، همان لحظه در برنامه و تلگرام بیفتد.
+  AppState.addEventListener?.('change', (st: string) => {
+    if (st !== 'active') return;
+    if (Date.now() - lastAutoCycleAt < 60_000) return;
+    lastAutoCycleAt = Date.now();
+    console.log('[SocialSignals] چرخه فوری: برگشت به برنامه');
+    runSocialSignalsCycle().catch(() => {});
+  });
 }
 
 export function stopSocialSignalsScheduler(): void {
