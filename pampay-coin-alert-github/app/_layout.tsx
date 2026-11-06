@@ -25,6 +25,7 @@ import { AppProvider, useApp } from "@/contexts/AppContext";
 import { VpnGateProvider } from "@/contexts/VpnGateContext";
 import colors from "@/constants/colors";
 import UpdateBanner from "@/components/UpdateBanner";
+import WhatsNewModal from "@/components/WhatsNewModal";
 import StartupIpGate from "@/components/StartupIpGate";
 import { ThemedAlertHost } from "@/components/ThemedAlert";
 import { startGlobalAutoEngine } from "@/utils/autoTradingEngine";
@@ -58,6 +59,8 @@ function ThemedAppRoot() {
       <StatusBar style={isLight ? "dark" : "light"} />
       {/* New-version banner slides over everything, top of the screen */}
       <UpdateBanner />
+      {/* v1.5.15 — مودال «تغییرات این نسخه»: فقط بار اول بعد از نصب هر نسخه */}
+      <WhatsNewModal />
       <RootLayoutNav />
       {/* v1.4.7 — full-screen Iran-IP gate: runs on every app open / resume.
           Covers EVERYTHING (highest z-index) until the exit IP is non-Iran. */}

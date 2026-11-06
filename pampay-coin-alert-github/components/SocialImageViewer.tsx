@@ -1,36 +1,47 @@
 /**
- * components/SocialImageViewer.tsx — v1.5.14
+ * components/SocialImageViewer.tsx — v1.5.15
  *
- * نمایشگر تمام‌صفحه عکس چارت سیگنال‌های سوشال‌مدیا، طبق درخواست کاربر:
- *   • روی عکس هر سیگنال که بزنی، عکس «تمام‌صفحه» باز می‌شود؛
- *   • زوم دو انگشتی (پینچ) تا ۸ برابر + جابه‌جایی با کشیدن — جزئیات چارت
- *     دقیقاً مثل گالری گوشی قابل بررسی است (ScrollView بومی با
- *     maximumZoomScale = زوم نرم و بدون لگ، بدون کتابخانه اضافه)؛
- *   • دکمه «ذخیره در گالری» عکس را دانلود و در گالری گوشی ذخیره می‌کند تا
- *     بعد از دانلود هم جزئیات با زوم گالری دیده شود؛
- *   • ضربدر بالا = بستن. لمس پس‌زمینه هم می‌بندد.
+ * نمایشگر تمام‌صفحه عکس چارت سیگنال‌های سوشال‌مدیا.
+ *
+ * v1.5.15 — رفع باگ «زوم کار نمی‌کند»: maximumZoomScale روی ScrollView فقط
+ * در iOS رفتار پینچ دارد و در اندروید نادیده گرفته می‌شود. حالا زوم واقعی با
+ * react-native-gesture-handler (بدون کتابخانه جدید — از قبل در پروژه هست):
+ *   • پینچ دو انگشتی تا ۸ برابر (PinchGestureHandler + Animated)؛
+ *   • دابل‌تپ = رفت‌وبرگشت بین ۱× و ۲.۵×؛
+ *   • بعد از زوم، با یک انگشت جابه‌جا (PanGestureHandler)؛
+ *   • اگر زوم زیر ۱ برود، با فنر به اندازه اصلی برمی‌گردد.
+ * کیفیت نمایش هم بالا رفت: عکس با پارامتر name=large توییتر لود می‌شود و
+ * دکمه ذخیره، فایل اصلی (name=orig) را در گالری می‌گذارد تا اعداد و قیمت‌ها
+ * دقیق خوانده شوند.
  */
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Modal,
   View,
   Text,
   StyleSheet,
-  ScrollView,
   Pressable,
   Image,
   ActivityIndicator,
   Dimensions,
   StatusBar,
+  Animated,
 } from 'react-native';
+import {
+  PinchGestureHandler,
+  PanGestureHandler,
+  TapGestureHandler,
+  State,
+} from 'react-native-gesture-handler';
 import { X, Download, Check } from 'lucide-react-native';
-// SDK 54: cacheDirectory/downloadAsync live in the legacy entry (theme compat)
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import colors from '@/constants/colors';
+import { upgradeTwitterImageUrl } from '@/utils/socialSignalsService';
 
 const WIN = Dimensions.get('window');
+const DOUBLE_TAP_ZOOM = 2.5;
 
 interface Props {
   visible: boolean;
@@ -43,13 +54,47 @@ export default function SocialImageViewer({ visible, imageUrl, onClose }: Props)
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  const zoom = useRef(new Animated.Value(1)).current;
+  const tx = useRef(new Animated.Value(0)).current;
+  const ty = useRef(new Animated.Value(0)).current;
+  const zoomRef = useRef(1);
+  const doubleTapRef = useRef<TapGestureHandler | null>(null);
+  const pinchRef = useRef<PinchGestureHandler | null>(null);
+
+  useEffect(() => {
+    const id = zoom.addListener((s) => {
+      zoomRef.current = s.value;
+    });
+    return () => zoom.removeAllListeners();
+  }, [zoom]);
+
+  const resetView = useCallback(() => {
+    Animated.parallel([
+      Animated.spring(zoom, { toValue: 1, useNativeDriver: true, friction: 8 }),
+      Animated.spring(tx, { toValue: 0, useNativeDriver: true, friction: 8 }),
+      Animated.spring(ty, { toValue: 0, useNativeDriver: true, friction: 8 }),
+    ]).start();
+  }, [zoom, tx, ty]);
+
+  const toggleDoubleTapZoom = useCallback(() => {
+    const target = zoomRef.current > 1.05 ? 1 : DOUBLE_TAP_ZOOM;
+    Animated.parallel([
+      Animated.spring(zoom, { toValue: target, useNativeDriver: true, friction: 8 }),
+      Animated.spring(tx, { toValue: 0, useNativeDriver: true, friction: 8 }),
+      Animated.spring(ty, { toValue: 0, useNativeDriver: true, friction: 8 }),
+    ]).start();
+  }, [zoom, tx, ty]);
+
   useEffect(() => {
     if (visible) {
       setSaved(false);
       setSaveError(null);
       setSaving(false);
+      zoom.setValue(1);
+      tx.setValue(0);
+      ty.setValue(0);
     }
-  }, [visible, imageUrl]);
+  }, [visible, imageUrl, zoom, tx, ty]);
 
   const handleSave = useCallback(async () => {
     if (!imageUrl || saving) return;
@@ -63,9 +108,11 @@ export default function SocialImageViewer({ visible, imageUrl, onClose }: Props)
         setSaveError('اجازه دسترسی به گالری داده نشد — از تنظیمات گوشی فعالش کنید');
         return;
       }
+      // v1.5.15 — فایل اصلی (name=orig) ذخیره می‌شود، نه پیش‌نمایش کوچک RSS
+      const orig = upgradeTwitterImageUrl(imageUrl, 'orig');
       const name = `pampi-signal-${Date.now()}.jpg`;
       const local = `${FileSystem.cacheDirectory}${name}`;
-      const res = await FileSystem.downloadAsync(imageUrl, local);
+      const res = await FileSystem.downloadAsync(orig, local);
       if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
       await MediaLibrary.saveToLibraryAsync(res.uri);
       setSaved(true);
@@ -80,32 +127,68 @@ export default function SocialImageViewer({ visible, imageUrl, onClose }: Props)
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <StatusBar hidden />
       <View style={styles.backdrop}>
-        {/* زوم: پینچ دو انگشتی تا ۸ برابر + پن با کشیدن (ScrollView بومی) */}
-        <ScrollView
-          style={styles.zoomArea}
-          contentContainerStyle={styles.zoomContent}
-          maximumZoomScale={8}
-          minimumZoomScale={1}
-          bouncesZoom
-          showsVerticalScrollIndicator={false}
-          showsHorizontalScrollIndicator={false}
+        <TapGestureHandler
+          ref={doubleTapRef}
+          numberOfTaps={2}
+          onActivated={toggleDoubleTapZoom}
         >
-          {imageUrl ? (
-            <Image
-              source={{ uri: imageUrl }}
-              style={styles.image}
-              resizeMode="contain"
-              accessibilityLabel="چارت سیگنال — تمام‌صفحه"
-            />
-          ) : null}
-        </ScrollView>
+          <PinchGestureHandler
+            ref={pinchRef}
+            simultaneousHandlers={doubleTapRef}
+            onGestureEvent={Animated.event([{ nativeEvent: { scale: zoom } }], {
+              useNativeDriver: true,
+            })}
+            onHandlerStateChange={(e) => {
+              const { state } = e.nativeEvent;
+              if (state === State.END && zoomRef.current < 1.02) {
+                resetView();
+              }
+            }}
+          >
+            <PanGestureHandler
+              simultaneousHandlers={[doubleTapRef, pinchRef]}
+              onGestureEvent={Animated.event(
+                [{ nativeEvent: { translationX: tx, translationY: ty } }],
+                { useNativeDriver: true }
+              )}
+              onHandlerStateChange={(e) => {
+                if (e.nativeEvent.state === State.END && zoomRef.current <= 1.02) {
+                  Animated.parallel([
+                    Animated.spring(tx, { toValue: 0, useNativeDriver: true, friction: 8 }),
+                    Animated.spring(ty, { toValue: 0, useNativeDriver: true, friction: 8 }),
+                  ]).start();
+                }
+              }}
+            >
+              <Animated.View style={styles.zoomArea}>
+                <Animated.View
+                  style={[
+                    styles.imageWrap,
+                    {
+                      transform: [{ translateX: tx }, { translateY: ty }, { scale: zoom }],
+                    },
+                  ]}
+                >
+                  {imageUrl ? (
+                    <Image
+                      source={{ uri: upgradeTwitterImageUrl(imageUrl, 'large') }}
+                      style={styles.image}
+                      resizeMode="contain"
+                      accessibilityLabel="چارت سیگنال — تمام‌صفحه"
+                    />
+                  ) : null}
+                </Animated.View>
+              </Animated.View>
+            </PanGestureHandler>
+          </PinchGestureHandler>
+        </TapGestureHandler>
 
         <View style={styles.topBar} pointerEvents="box-none">
           <Pressable style={styles.iconBtn} onPress={onClose} hitSlop={8} testID="social-image-close">
             <X size={20} color="#fff" />
           </Pressable>
           <Text style={styles.hint} numberOfLines={1}>
-            زوم با دو انگشت
+            زوم: دو انگشت یا دابل‌تپ
           </Text>
           <Pressable
             style={[styles.iconBtn, saved && styles.iconBtnDone]}
@@ -127,7 +210,7 @@ export default function SocialImageViewer({ visible, imageUrl, onClose }: Props)
         {(saveError || saved) && (
           <View style={[styles.toast, saved ? styles.toastOk : styles.toastErr]} pointerEvents="none">
             <Text style={styles.toastText}>
-              {saved ? 'عکس در گالری گوشی ذخیره شد ✓' : saveError}
+              {saved ? 'عکس با کیفیت اصلی در گالری ذخیره شد ✓' : saveError}
             </Text>
           </View>
         )}
@@ -143,15 +226,19 @@ const styles = StyleSheet.create({
   },
   zoomArea: {
     flex: 1,
-  },
-  zoomContent: {
-    flexGrow: 1,
-    justifyContent: 'center',
     alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
   },
-  image: {
+  imageWrap: {
     width: WIN.width,
     height: WIN.height * 0.92,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  image: {
+    width: '100%',
+    height: '100%',
   },
   topBar: {
     position: 'absolute',

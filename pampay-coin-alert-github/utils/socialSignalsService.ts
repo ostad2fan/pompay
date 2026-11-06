@@ -1,5 +1,5 @@
 /**
- * socialSignalsService.ts — v1.5.14
+ * socialSignalsService.ts — v1.5.15
  *
  * «سیگنال‌های سوشال‌مدیا» — دریافت خودکار توییت‌های معتبر بدون هیچ سروری:
  * فقط اینترنت گوشی. منبع پیش‌فرض @CryptoNewton است و کاربر می‌تواند هر
@@ -81,6 +81,25 @@ const FETCH_TIMEOUT_MS = 12_000;
 
 /** منبع پیش‌فرض — طبق دموی تاییدشده. */
 export const DEFAULT_SOCIAL_SOURCE: SocialSource = { user: 'CryptoNewton', builtin: true };
+
+/**
+ * v1.5.15 — گیت‌وی‌های RSS معمولاً پیش‌نمایش کوچک عکس را می‌دهند
+ * (…?format=jpg&name=small یا name=360x360) — برای همین «اعداد و قیمت‌ها»
+ * در عکسِ ذخیره‌شده خوانا نبود. این تابع پارامتر توییتر-CDN را به نسخه
+ * بزرگ‌تر ارتقا می‌دهد:
+ *   • 'large' → برای نمایش در برنامه و عکس تلگرام (سریع و باکیفیت)؛
+ *   • 'orig'  → فایل اصلی کامل — برای «ذخیره در گالری».
+ * پسوند اصلی (jpg/png/webp) حفظ می‌شود.
+ */
+export function upgradeTwitterImageUrl(url: string, size: 'large' | 'orig'): string {
+  if (!url) return url;
+  if (!/pbs\.twimg\.com\/media\//.test(url)) return url;
+  const qm = url.indexOf('?');
+  const base = qm >= 0 ? url.slice(0, qm) : url;
+  const extM = base.match(/\.(jpg|jpeg|png|webp|gif)$/i);
+  const format = extM ? extM[1].toLowerCase().replace('jpeg', 'jpg') : 'jpg';
+  return `${base}?format=${format}&name=${size}`;
+}
 
 // ---------------------------------------------------------------------------
 // منابع (پیش‌فرض + اضافه‌شده‌های کاربر)
@@ -405,7 +424,10 @@ async function maybeAnnounceToTelegram(sig: SocialSignal): Promise<void> {
     };
     if (!s.telegramEnabled || !s.telegramBotToken || !s.telegramChatId) return;
     const { sendTelegramSocialSignal } = await import('./telegramService');
-    await sendTelegramSocialSignal(sig, {
+    // v1.5.15 — عکس تلگرام با کیفیت large (نه پیش‌نمایش small گیت‌وی)
+    await sendTelegramSocialSignal(
+      { ...sig, imageUrl: upgradeTwitterImageUrl(sig.imageUrl, 'large') },
+      {
       botToken: s.telegramBotToken,
       chatId: s.telegramChatId,
       showUsername: (await loadSocialDisplayFlags()).showSourceName,
@@ -518,12 +540,16 @@ export async function sendSocialTelegramTest(): Promise<SocialTelegramTestResult
   let sent = 0;
   for (const sig of picks) {
     try {
-      const done = await sendTelegramSocialSignal(sig, {
-        botToken: cfg.telegramBotToken,
-        chatId: cfg.telegramChatId,
-        showUsername: flags.showSourceName,
-        showLink: flags.showLink,
-      });
+      // v1.5.15 — عکس تلگرام با کیفیت large (نه پیش‌نمایش small گیت‌وی)
+      const done = await sendTelegramSocialSignal(
+        { ...sig, imageUrl: upgradeTwitterImageUrl(sig.imageUrl, 'large') },
+        {
+          botToken: cfg.telegramBotToken,
+          chatId: cfg.telegramChatId,
+          showUsername: flags.showSourceName,
+          showLink: flags.showLink,
+        }
+      );
       if (done) sent++;
     } catch (e) {
       console.log('[SocialSignals] تست تلگرام یک سیگنال نشد:', (e as Error).message);

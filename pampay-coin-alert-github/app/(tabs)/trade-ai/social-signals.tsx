@@ -1,5 +1,5 @@
 /**
- * app/(tabs)/trade-ai/social-signals.tsx — v1.5.14
+ * app/(tabs)/trade-ai/social-signals.tsx — v1.5.15
  *
  * تب «سوشال‌مدیا» — سیگنال‌های سوشال‌مدیا بدون هیچ سروری (فقط اینترنت گوشی).
  *
@@ -56,6 +56,7 @@ import {
   addSocialSource,
   removeSocialSource,
   sendSocialTelegramTest,
+  upgradeTwitterImageUrl,
 } from '@/utils/socialSignalsService';
 
 function timeAgoFa(ms: number): string {
@@ -391,7 +392,7 @@ export default function SocialSignalsScreen() {
               {/* v1.5.14 — لمس عکس = نمایشگر تمام‌صفحه با زوم دو انگشتی + ذخیره در گالری */}
               <Pressable onPress={() => setViewerImage(sig.imageUrl)} testID={`social-img-${sig.id}`}>
                 <Image
-                  source={{ uri: sig.imageUrl }}
+                  source={{ uri: upgradeTwitterImageUrl(sig.imageUrl, 'large') }}
                   style={styles.chartImage}
                   resizeMode="cover"
                   accessibilityLabel="چارت سیگنال — برای تمام‌صفحه بزنید"

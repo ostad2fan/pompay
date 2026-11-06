@@ -21,33 +21,32 @@ import { Linking, Platform } from 'react-native';
 import { getServerUrl } from './scanServerApi';
 
 /** Must match app.json «version» at release time. */
-export const APP_VERSION = '1.5.14';
-export const APP_VERSION_CODE = 39;
+export const APP_VERSION = '1.5.15';
+export const APP_VERSION_CODE = 40;
 
 const REPO_OWNER = 'ostad2fan';
 const REPO_NAME = 'pompay';
 const REPO_BRANCH = 'main';
 const REPO_DIR = 'pampay-coin-alert-github';
 const APK_NAME = 'PampDumpCoins-latest.apk';
-/**
- * v1.4.10 — the APK now ALSO ships under a VERSIONED name
- * (PampDumpCoins-v1.4.10.apk). The versioned URL is the primary download
- * because it can NEVER collide with a cached older file: every release is a
- * brand-new URL, so the browser/DownloadManager cannot serve the previous
- * version «by mistake» (the #1 cause of «دکمه دانلود نسخه قدیمی می‌آورد» —
- * jsDelivr sends cache-control max-age=604800 = 7 days on the fixed name).
- * The fixed-name copy stays in the repo as a fallback for older app builds.
- */
-const VERSIONED_APK_NAME = `PampDumpCoins-v${APP_VERSION}.apk`;
 
 /**
- * v1.5.13 — the APK now ALSO ships as a GitHub RELEASE asset
- * (repo → Releases → v1.5.13 → PampDumpCoins-v1.5.13.apk). The release URL is
- * the first download candidate: the file is attached to the release itself, so
- * it exists even if the repo files are removed, and GitHub's asset CDN
- * (objects.githubusercontent.com) is reachable from Iran without a VPN.
+ * v1.5.15 — CRITICAL FIX for «دکمه دانلود نسخه قدیمی می‌آورد»:
+ * these URL builders MUST be derived from the LATEST version (from
+ * version.json / the apkUrl itself), NEVER from the installed APP_VERSION.
+ * Before this fix `RELEASE_APK_URL` was built with APP_VERSION (the version
+ * running on the phone) and `apkDownloadCandidates` put it IN FRONT of the
+ * manifest apkUrl — so a user on 1.5.13 pressing «بروزرسانی» got the 1.5.13
+ * release asset (which exists!) instead of 1.5.14. Now every candidate is
+ * computed from the version embedded in the manifest apkUrl.
  */
-const RELEASE_APK_URL = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${APP_VERSION}/${VERSIONED_APK_NAME}`;
+function versionedApkName(v: string): string {
+  return `PampDumpCoins-v${v}.apk`;
+}
+
+function releaseApkUrlFor(v: string): string {
+  return `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${v}/${versionedApkName(v)}`;
+}
 
 /** Direct GitHub raw URL for version.json (blocked in Iran without VPN). */
 export const DEFAULT_UPDATE_URL =
@@ -245,21 +244,28 @@ export async function dismissUpdate(version: string): Promise<void> {
 
 /** The versioned (primary) and fixed-name (fallback) raw/CDN APK URLs. */
 function apkDownloadCandidates(apkUrl: string): string[] {
-  // Always start from the URL version.json gave us (the GitHub release asset
-  // since v1.5.13) + cache-buster so no layer can serve a stale copy.
+  // v1.5.15 — every candidate is built from the LATEST version, derived from
+  // the manifest apkUrl itself (…/releases/download/v1.5.14/… or
+  // PampDumpCoins-v1.5.14.apk). The installed APP_VERSION is only a last
+  // fallback and can never come before the manifest URL.
+  const fromUrl =
+    apkUrl.match(/releases\/download\/v([^/?#]+)\//i)?.[1] ??
+    apkUrl.match(/PampDumpCoins-v([0-9][0-9.]*)\.apk/i)?.[1] ??
+    APP_VERSION;
+  const latestV = fromUrl.trim() || APP_VERSION;
+
+  // Cache-buster so no layer can serve a stale copy.
   const bust = (u: string) => `${u}${u.includes('?') ? '&' : '?'}v=${APP_VERSION_CODE}-${Date.now()}`;
-  const urls = [bust(apkUrl)];
-  if (!urls[0].startsWith(RELEASE_APK_URL)) urls.unshift(bust(RELEASE_APK_URL));
-  const rawVersioned = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}/${REPO_DIR}/apk/${VERSIONED_APK_NAME}`;
-  const cdnVersioned = `https://cdn.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${VERSIONED_APK_NAME}`;
-  const fastlyVersioned = `https://fastly.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${VERSIONED_APK_NAME}`;
-  if (!/raw\.githubusercontent\.com/.test(apkUrl)) {
-    // CDN first (Iran-friendly), then raw, then fastly — all versioned.
-    urls.push(bust(cdnVersioned), bust(rawVersioned), bust(fastlyVersioned));
-  } else {
-    urls.push(bust(cdnVersioned), bust(fastlyVersioned));
-  }
-  // Last resorts: the fixed-name mirrors (kept in sync in the repo) + relay.
+
+  const urls: string[] = [bust(apkUrl)];
+  const releaseUrl = releaseApkUrlFor(latestV);
+  if (!urls[0].startsWith(releaseUrl)) urls.push(bust(releaseUrl));
+  const rawVersioned = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}/${REPO_DIR}/apk/${versionedApkName(latestV)}`;
+  const cdnVersioned = `https://cdn.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${versionedApkName(latestV)}`;
+  const fastlyVersioned = `https://fastly.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${versionedApkName(latestV)}`;
+  // CDN first (Iran-friendly), then raw, then fastly — all latest-versioned.
+  urls.push(bust(cdnVersioned), bust(rawVersioned), bust(fastlyVersioned));
+  // Last resorts: the fixed-name mirrors (kept in sync in the repo).
   const raw = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}/${REPO_DIR}/apk/${APK_NAME}`;
   const cdn = `https://cdn.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${APK_NAME}`;
   const fastly = `https://fastly.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${APK_NAME}`;
@@ -354,4 +360,17 @@ export async function openApkDownload(apkUrl: string): Promise<void> {
 /** Human-readable last-check error (settings page). */
 export function getLastUpdateError(): string | null {
   return lastUpdateError;
+}
+
+/**
+ * v1.5.15 — settings «بررسی بروزرسانی و دانلود» button: ALWAYS re-fetches
+ * version.json fresh (no stored/stale info) and downloads the LATEST release
+ * asset. The candidate list itself is derived from the manifest apkUrl, so a
+ * user on an old build can never be handed his own (old) release again.
+ */
+export async function checkAndDownloadLatest(): Promise<AppUpdateInfo | null> {
+  const fresh = await fetchUpdateInfo();
+  if (!fresh) throw new Error(getLastUpdateError() ?? 'بررسی نسخه جدید ناموفق بود');
+  await openApkDownload(fresh.apkUrl);
+  return fresh;
 }
