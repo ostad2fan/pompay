@@ -38,6 +38,14 @@ import { fetchServerSignals, fetchServerPumpDumpSignals, syncScanConfig } from '
 import { registerPushOnServer, ensureNotificationPermission } from '@/utils/pushService';
 import { checkVpnStatus } from '@/utils/vpnGuard';
 import { setThemeMode as applyPalette, getThemeMode, type ThemeMode } from '@/constants/colors';
+import {
+  SocialSignal,
+  setSocialSignalsUpdateListener,
+  startSocialSignalsScheduler,
+  stopSocialSignalsScheduler,
+  notifySocialSignalsLocal,
+} from '@/utils/socialSignalsService';
+import { registerSocialBackgroundTask } from '@/utils/socialBackgroundTask';
 
 import { ThemedAlert } from '@/components/ThemedAlert';
 const TRACKED_WALLETS_KEY = '@tracked_whale_wallets';
@@ -75,6 +83,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   telegramEnabled: false,
   themeMode: 'dark' as ThemeMode,
   autoScanEnabled: false,
+  // v1.5.13 — سوشال‌مدیا: نمایش نام کاربری/لینک منبع پیش‌فرض خاموش است؛
+  // کلیدهای روشن/خاموش داخل راهنمای تب «سیگنال‌های سوشال‌مدیا» قرار دارند.
+  socialShowSourceName: false,
+  socialShowSourceLink: false,
 };
 
 const SETTINGS_KEY = '@crypto_scanner_settings';
@@ -396,6 +408,26 @@ export const [AppProvider, useApp] = createContextHook(() => {
   useEffect(() => {
     updateHookReversalTimeframes(settings.hookTimeframes ?? ['1d']);
   }, [settings.hookTimeframes]);
+
+  // v1.5.13 — سیگنال‌های سوشال‌مدیا: بدون هیچ سروری، فقط اینترنت گوشی.
+  // اسکجولر همیشه روشن است (مستقل از تلگرام) و بازه‌اش همان «بازه بروزرسانی»
+  // تنظیمات برنامه است. سیگنال جدید → نوتیفیکیشن محلی + (اگر تلگرام فعال
+  // باشد در تنظیمات) ارسال به تلگرام داخل خود سرویس انجام می‌شود.
+  const refreshIntervalRef = useRef(settings.refreshInterval);
+  refreshIntervalRef.current = settings.refreshInterval;
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    setSocialSignalsUpdateListener((newSignals: SocialSignal[]) => {
+      notifySocialSignalsLocal(newSignals).catch(() => {});
+    });
+    startSocialSignalsScheduler(refreshIntervalRef.current);
+    // بک‌فچ پس‌زمینه — اعلان حتی وقتی برنامه در پس‌زمینه است (بدون سرور).
+    registerSocialBackgroundTask().catch(() => {});
+    return () => {
+      stopSocialSignalsScheduler();
+      setSocialSignalsUpdateListener(null);
+    };
+  }, []);
 
   const refreshGainzScan = useCallback(async (): Promise<GainzAlgoSignal[]> => {
     const results = await runGainzAlgoScanCycle();

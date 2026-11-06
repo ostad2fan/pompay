@@ -56,6 +56,48 @@ export async function saveEnabledStrategies(map: EnabledStrategies): Promise<voi
   } catch {}
 }
 
+/* ── v1.5.13 — نوع استراتژی «به‌تفکیک مود» (دمو مستقل از واقعی) ──
+ * طبق درخواست کاربر: استراتژی که برای ربات واقعی انتخاب می‌شود نباید روی
+ * بک‌تست دمو اثر بگذارد و برعکس. ذخیره‌ی جدید {demo, real}؛ اگر نبود از
+ * ذخیره‌ی قدیمی مشترک (v1) برای هر دو مهاجرت می‌شود تا چیزی عوض نشود. */
+
+const ENABLED_STRATEGIES_V2_KEY = '@trading_strategies_v2';
+export type StrategyOwner = 'demo' | 'real';
+
+async function loadStrategiesV2(): Promise<{ demo: EnabledStrategies; real: EnabledStrategies }> {
+  try {
+    const raw = await AsyncStorage.getItem(ENABLED_STRATEGIES_V2_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<{ demo: EnabledStrategies; real: EnabledStrategies }>;
+      return {
+        demo: { ...DEFAULT_ENABLED_STRATEGIES, ...(parsed.demo ?? {}) },
+        real: { ...DEFAULT_ENABLED_STRATEGIES, ...(parsed.real ?? {}) },
+      };
+    }
+  } catch {}
+  // مهاجرت از v1 — هر دو مود با لیست فعلی شروع می‌کنند
+  const legacy = await loadEnabledStrategies();
+  return { demo: { ...legacy }, real: { ...legacy } };
+}
+
+async function saveStrategiesV2(v2: { demo: EnabledStrategies; real: EnabledStrategies }): Promise<void> {
+  try {
+    await AsyncStorage.setItem(ENABLED_STRATEGIES_V2_KEY, JSON.stringify(v2));
+    // v1 هم به‌روز می‌ماند تا نسخه‌های قدیمی/مسیرهای قدیمی نریزند
+    await AsyncStorage.setItem(ENABLED_STRATEGIES_KEY, JSON.stringify(v2.demo));
+  } catch {}
+}
+
+export async function loadEnabledStrategiesFor(owner: StrategyOwner): Promise<EnabledStrategies> {
+  const v2 = await loadStrategiesV2();
+  return owner === 'real' ? { ...v2.real } : { ...v2.demo };
+}
+
+export async function saveEnabledStrategiesFor(owner: StrategyOwner, map: EnabledStrategies): Promise<void> {
+  const v2 = await loadStrategiesV2();
+  await saveStrategiesV2(owner === 'real' ? { ...v2, real: map } : { ...v2, demo: map });
+}
+
 /** استراتژی اصلی = اولین استراتژی روشن (اگر همه خاموش → متعادل). */
 export function primaryStrategy(map: EnabledStrategies): TradingStrategy {
   const first = STRATEGY_ORDER.find((s) => map[s]);

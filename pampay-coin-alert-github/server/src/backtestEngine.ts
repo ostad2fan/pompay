@@ -45,6 +45,24 @@ import { sendTelegram } from "./telegram";
 
 export type AutoMode = "demo" | "real";
 
+/**
+ * v1.5.13 — پارامترهای معاملاتی «هر حالت» (ماشین‌حساب + نوع استراتژی).
+ * تنظیمات دمو و واقعی دیگر مشترک نیستند؛ سرور برای موتورِ هر مود پارامترهای
+ * همان مود را استفاده می‌کند. اگر اپ قدیمی demo/real نفرستد، مقادیر فلت
+ * (مشترک قدیمی) برای هر دو به کار می‌رود — سازگار با عقب.
+ */
+export interface AutoModeParams {
+  leverage: number;
+  positionSizeUsd: number;
+  maxLossPercent: number;
+  rewardRatio: number;
+  maxOpenPositions: number;
+  trailing: { enabled: boolean; activationRatio: number; trailRatio: number };
+  aiCapital: { enabled: boolean; dailyLossLimitPercent: number };
+  initialCapitalUsd: number;
+  strategyLabel?: string;
+}
+
 export interface AutoCfg {
   enabled: boolean;
   mode: AutoMode;
@@ -58,6 +76,9 @@ export interface AutoCfg {
   trailing: { enabled: boolean; activationRatio: number; trailRatio: number };
   aiCapital: { enabled: boolean; dailyLossLimitPercent: number };
   initialCapitalUsd: number;
+  /** v1.5.13 — پارامترهای مستقل دمو/واقعی (اگر نبود = فلت برای هر دو). */
+  demo?: AutoModeParams;
+  real?: AutoModeParams;
   /** v1.5.3 — نام استراتژی فعال (از تب بک‌تست اپ). */
   strategyLabel?: string;
   /** v1.5.4 — توکن تلگرام که اپ همراه کانفیگ فرستاده (اعلان‌های ۲۴/۷ بدون
@@ -1062,7 +1083,12 @@ export async function runBacktestCycle(): Promise<void> {
   try {
     const st = await getConfig();
     if (!st || !st.cfg.enabled) return;
-    const cfg = st.cfg;
+    // v1.5.13 — هر مود با پارامترهای خودش: MTM دمو همیشه با پارامترهای «دمو»
+    // و مدیریت واقعی با پارامترهای «واقعی»؛ بقیه‌ی چرخه با کانفیگ مؤثرِ مود فعلی.
+    const stCfg = st.cfg;
+    const demoCfg: AutoCfg = stCfg.demo ? { ...stCfg, ...stCfg.demo } : stCfg;
+    const realCfg: AutoCfg = stCfg.real ? { ...stCfg, ...stCfg.real } : stCfg;
+    const cfg: AutoCfg = stCfg.mode === "real" ? realCfg : demoCfg;
     // v1.5.9 — برنامه باز است؟ (heartbeat تازه) → سرور مکث می‌کند تا نه
     // معامله دوبله شود و نه اعلان (برنامه خودش هر دو کار را می‌کند).
     // برنامه که بسته شد، lease در حداکثر ۳ دقیقه منقضی و سرور ۲۴/۷ ادامه می‌دهد.
@@ -1074,9 +1100,9 @@ export async function runBacktestCycle(): Promise<void> {
     }
     const prices = await getPrices();
 
-    // 1) demo MTM + trailing + SL/TP
+    // 1) demo MTM + trailing + SL/TP (همیشه با پارامترهای دمو)
     try {
-      await markDemo(cfg, st, prices);
+      await markDemo(demoCfg, st, prices);
     } catch (e) {
       console.log("[Backtest] demo MTM failed:", e);
     }
@@ -1084,7 +1110,8 @@ export async function runBacktestCycle(): Promise<void> {
     // 2) real positions management
     if (cfg.mode === "real" && cfg.binanceKeys) {
       try {
-        await manageReal(cfg, st);
+        // v1.5.13 — مدیریت پوزیشن واقعی با پارامترهای «واقعی»
+        await manageReal(realCfg, st);
       } catch (e) {
         console.log("[Backtest] real manage failed:", e);
       }
@@ -1245,6 +1272,45 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
     (c as { reset?: unknown }).reset === true;
   // v1.5.9 — کل «خواندن قبلی → ساختن کانفیگ → نوشتن» داخل config lock:
   // pushهای همزمان (اپ + پایان چرخه) دیگر روی هم نمی‌نویسند.
+  // v1.5.13 — پیش‌فرض پارامترهای هر مود = مقادیر فلت (سازگاری با اپ قدیمی)
+  const flatDefaults = {
+    leverage: Math.max(1, Math.min(125, Number(c.leverage ?? 5) || 5)),
+    positionSizeUsd: Math.max(5, Number(c.positionSizeUsd ?? 50) || 50),
+    maxLossPercent: Math.max(0.5, Math.min(90, Number(c.maxLossPercent ?? 5) || 5)),
+    rewardRatio: Math.max(0.5, Math.min(20, Number(c.rewardRatio ?? 2) || 2)),
+    maxOpenPositions: Math.max(1, Math.min(100, Number(c.maxOpenPositions ?? 3) || 3)),
+    trailing: {
+      enabled: c.trailing?.enabled !== false,
+      activationRatio: Number(c.trailing?.activationRatio ?? 0.5) || 0.5,
+      trailRatio: Number(c.trailing?.trailRatio ?? 0.5) || 0.5,
+    },
+    aiCapital: {
+      enabled: c.aiCapital?.enabled !== false,
+      dailyLossLimitPercent: Math.max(0.5, Math.min(50, Number(c.aiCapital?.dailyLossLimitPercent ?? 3) || 3)),
+    },
+    initialCapitalUsd: Math.max(1, Number(c.initialCapitalUsd ?? 1000) || 1000),
+  };
+  const sanitizeModeParams = (raw: unknown): AutoModeParams => {
+    const p = (raw ?? {}) as Partial<AutoModeParams>;
+    return {
+      leverage: Math.max(1, Math.min(125, Number(p.leverage ?? flatDefaults.leverage) || flatDefaults.leverage)),
+      positionSizeUsd: Math.max(5, Number(p.positionSizeUsd ?? flatDefaults.positionSizeUsd) || flatDefaults.positionSizeUsd),
+      maxLossPercent: Math.max(0.5, Math.min(90, Number(p.maxLossPercent ?? flatDefaults.maxLossPercent) || flatDefaults.maxLossPercent)),
+      rewardRatio: Math.max(0.5, Math.min(20, Number(p.rewardRatio ?? flatDefaults.rewardRatio) || flatDefaults.rewardRatio)),
+      maxOpenPositions: Math.max(1, Math.min(100, Number(p.maxOpenPositions ?? flatDefaults.maxOpenPositions) || flatDefaults.maxOpenPositions)),
+      trailing: {
+        enabled: p.trailing ? p.trailing.enabled !== false : flatDefaults.trailing.enabled,
+        activationRatio: Number(p.trailing?.activationRatio ?? flatDefaults.trailing.activationRatio) || flatDefaults.trailing.activationRatio,
+        trailRatio: Number(p.trailing?.trailRatio ?? flatDefaults.trailing.trailRatio) || flatDefaults.trailing.trailRatio,
+      },
+      aiCapital: {
+        enabled: p.aiCapital ? p.aiCapital.enabled !== false : flatDefaults.aiCapital.enabled,
+        dailyLossLimitPercent: Math.max(0.5, Math.min(50, Number(p.aiCapital?.dailyLossLimitPercent ?? flatDefaults.aiCapital.dailyLossLimitPercent) || flatDefaults.aiCapital.dailyLossLimitPercent)),
+      },
+      initialCapitalUsd: Math.max(1, Number(p.initialCapitalUsd ?? flatDefaults.initialCapitalUsd) || flatDefaults.initialCapitalUsd),
+      strategyLabel: p.strategyLabel ? String(p.strategyLabel) : undefined,
+    };
+  };
   const { prev, st, cfg, wasOff } = await withConfigLock(async () => {
   const prev = await getConfig();
   const cfg: AutoCfg = {
@@ -1294,6 +1360,9 @@ export async function handleAutoTradeConfig(body: unknown): Promise<{ status: nu
         ? { apiKey: String(c.binanceKeys.apiKey), apiSecret: String(c.binanceKeys.apiSecret ?? "") }
         : undefined,
   };
+  // v1.5.13 — پارامترهای مستقل هر مود (اپ جدید می‌فرستد؛ اپ قدیمی = فلت هر دو)
+  cfg.demo = sanitizeModeParams(c.demo);
+  cfg.real = sanitizeModeParams(c.real);
   const st: StoredAutoConfig = {
     cfg,
     whaleSnapshot: cfg.mode === (prev?.cfg.mode ?? "demo") ? (prev?.whaleSnapshot ?? []) : [],

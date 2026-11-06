@@ -1381,6 +1381,72 @@ export async function setupTelegramBotCommands(): Promise<void> {
   }
 }
 
+/**
+ * v1.5.13 — سیگنال سوشال‌مدیا: عکس چارت + کپشن، بدون هیچ سروری (فراخوانی
+ * مستقیم از برنامه). طبق درخواست کاربر:
+ *   • نام کاربری منبع و لینک توییت به‌صورت پیش‌فرض در پیام «نمی‌آید»؛
+ *   • فقط اگر کاربر در راهنمای تب سوشال‌مدیا کلید مربوطه را روشن کرده باشد
+ *     showUsername/showLink در کپشن قرار می‌گیرد.
+ * اگر sendPhoto ناموفق بود (CDN توییتر از سمت تلگرام بسته باشد)، متن
+ * سیگنال بدون عکس فرستاده می‌شود تا سیگنال گم نشود.
+ */
+export async function sendTelegramSocialSignal(
+  signal: {
+    text: string;
+    tickers: string[];
+    imageUrl: string;
+    link: string;
+    sourceUser: string;
+    publishedAt: number;
+  },
+  opts: { botToken: string; chatId: string; showUsername: boolean; showLink: boolean }
+): Promise<boolean> {
+  try {
+    const escapeHtml = (s: string): string =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const tag = signal.tickers.map((t) => `$${t}`).join(' ');
+    const time = new Date(signal.publishedAt).toLocaleString('fa-IR', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    const capLines = [`🔵 <b>سیگنال سوشال‌مدیا — ${tag}</b>`];
+    if (opts.showUsername) capLines.push(`👤 منبع: @${signal.sourceUser}`);
+    const body = signal.text.length > 700 ? `${signal.text.slice(0, 697)}…` : signal.text;
+    capLines.push('', escapeHtml(body));
+    capLines.push(`🕐 ${time}`);
+    if (opts.showLink) capLines.push(`🔗 ${signal.link}`);
+    const caption = capLines.join('\n');
+
+    const photoRes = await fetch(`https://api.telegram.org/bot${opts.botToken}/sendPhoto`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: opts.chatId,
+        photo: signal.imageUrl,
+        caption: caption.slice(0, 3900),
+        parse_mode: 'HTML',
+      }),
+    });
+    const photoData = await photoRes.json();
+    if (photoData.ok) {
+      console.log('[Telegram] Social signal sent (with chart)');
+      return true;
+    }
+    console.log('[Telegram] sendPhoto failed:', photoData.description, '→ fallback به متن');
+    return await sendMessageDirect(
+      opts.botToken,
+      opts.chatId,
+      `${caption}\n(عکس چارت ارسال نشد)`,
+      'HTML'
+    );
+  } catch (e) {
+    console.log('[Telegram] Social signal error', e);
+    return false;
+  }
+}
+
 export async function sendTelegramWelcome(): Promise<void> {
   await setupTelegramBotCommands();
   const tg = await getTelegramSettings();

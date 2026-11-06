@@ -154,6 +154,7 @@ import {
   subscribeAutoSettings,
   syncAutoTradeStateFromServer,
   updatePositionTpsl,
+  withModeParams,
 } from '@/utils/autoTradingEngine';
 
 /** v1.5.3 — لوگوی مشکی‌پس‌زمینه (بدون قاب سفید) برای بک‌گراند عکس PnL. */
@@ -1428,7 +1429,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 <TextInput
                   style={styles.settingInput}
                   value={String(settings.leverage)}
-                  onChangeText={(t) => setSettings((s) => ({ ...s, leverage: Math.max(1, Math.min(125, parseInt(t.replace(/\D/g, '') || '1', 10) || 1)) }))}
+                  onChangeText={(t) => setSettings((s) => withModeParams(s, { leverage: Math.max(1, Math.min(125, parseInt(t.replace(/\D/g, '') || '1', 10) || 1)) }))}
                   onEndEditing={() => void persist(settings)}
                   keyboardType="number-pad"
                 />
@@ -1438,7 +1439,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 <TextInput
                   style={styles.settingInput}
                   value={String(settings.positionSizeUsd)}
-                  onChangeText={(t) => setSettings((s) => ({ ...s, positionSizeUsd: Math.max(5, parseInt(t.replace(/\D/g, '') || '5', 10) || 5) }))}
+                  onChangeText={(t) => setSettings((s) => withModeParams(s, { positionSizeUsd: Math.max(5, parseInt(t.replace(/\D/g, '') || '5', 10) || 5) }))}
                   onEndEditing={() => void persist(settings)}
                   keyboardType="number-pad"
                 />
@@ -1448,7 +1449,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 <TextInput
                   style={styles.settingInput}
                   value={String(settings.maxLossPercent)}
-                  onChangeText={(t) => setSettings((s) => ({ ...s, maxLossPercent: Math.max(0.5, Math.min(90, parseFloat(t.replace(/[^\d.]/g, '') || '5') || 5)) }))}
+                  onChangeText={(t) => setSettings((s) => withModeParams(s, { maxLossPercent: Math.max(0.5, Math.min(90, parseFloat(t.replace(/[^\d.]/g, '') || '5') || 5)) }))}
                   onEndEditing={() => void persist(settings)}
                   keyboardType="decimal-pad"
                 />
@@ -1458,7 +1459,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 <TextInput
                   style={styles.settingInput}
                   value={String(settings.rewardRatio)}
-                  onChangeText={(t) => setSettings((s) => ({ ...s, rewardRatio: Math.max(0.5, Math.min(20, parseFloat(t.replace(/[^\d.]/g, '') || '2') || 2)) }))}
+                  onChangeText={(t) => setSettings((s) => withModeParams(s, { rewardRatio: Math.max(0.5, Math.min(20, parseFloat(t.replace(/[^\d.]/g, '') || '2') || 2)) }))}
                   onEndEditing={() => void persist(settings)}
                   keyboardType="decimal-pad"
                 />
@@ -1468,7 +1469,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 <TextInput
                   style={styles.settingInput}
                   value={String(settings.maxOpenPositions)}
-                  onChangeText={(t) => setSettings((s) => ({ ...s, maxOpenPositions: Math.max(1, Math.min(100, parseInt(t.replace(/\D/g, '') || '3', 10) || 3)) }))}
+                  onChangeText={(t) => setSettings((s) => withModeParams(s, { maxOpenPositions: Math.max(1, Math.min(100, parseInt(t.replace(/\D/g, '') || '3', 10) || 3)) }))}
                   onEndEditing={() => void persist(settings)}
                   keyboardType="number-pad"
                 />
@@ -1481,10 +1482,11 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   style={styles.settingInput}
                   value={String(settings.initialCapitalUsd)}
                   onChangeText={(t) =>
-                    setSettings((s) => ({
-                      ...s,
-                      initialCapitalUsd: Math.max(1, Math.min(10_000_000, parseFloat(t.replace(/[^\d.]/g, '') || '1000') || 1000)),
-                    }))
+                    setSettings((s) =>
+                      withModeParams(s, {
+                        initialCapitalUsd: Math.max(1, Math.min(10_000_000, parseFloat(t.replace(/[^\d.]/g, '') || '1000') || 1000)),
+                      })
+                    )
                   }
                   onEndEditing={() => void persist(settings)}
                   keyboardType="decimal-pad"
@@ -1513,7 +1515,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               </View>
               <Switch
                 value={settings.trailing.enabled}
-                onValueChange={(v) => void persist({ ...settings, trailing: { ...settings.trailing, enabled: v } })}
+                onValueChange={(v) => void persist(withModeParams(settings, { trailing: { ...settings.trailing, enabled: v } }))}
                 trackColor={{ true: colors.dark.green + '88', false: colors.dark.card }}
                 thumbColor={settings.trailing.enabled ? colors.dark.green : colors.dark.textMuted}
                 style={{ transform: [{ scale: 0.7 }] }}
@@ -1528,7 +1530,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               </View>
               <Switch
                 value={settings.aiCapital.enabled}
-                onValueChange={(v) => void persist({ ...settings, aiCapital: { ...settings.aiCapital, enabled: v } })}
+                onValueChange={(v) => void persist(withModeParams(settings, { aiCapital: { ...settings.aiCapital, enabled: v } }))}
                 trackColor={{ true: colors.dark.green + '88', false: colors.dark.card }}
                 thumbColor={settings.aiCapital.enabled ? colors.dark.green : colors.dark.textMuted}
                 style={{ transform: [{ scale: 0.7 }] }}

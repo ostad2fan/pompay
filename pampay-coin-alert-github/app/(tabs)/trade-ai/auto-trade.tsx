@@ -32,24 +32,50 @@ import {
   EnabledStrategies,
   STRATEGY_ORDER,
   DEFAULT_ENABLED_STRATEGIES,
-  loadEnabledStrategies,
-  saveEnabledStrategies,
+  loadEnabledStrategiesFor,
+  saveEnabledStrategiesFor,
   primaryStrategy,
+  type StrategyOwner,
 } from '@/utils/tradeAiService';
 import { STRATEGY_CONFIGS, TradingStrategy } from '@/types/tradeAi';
-import { loadAutoSettings, saveAutoSettings } from '@/utils/autoTradingEngine';
+import {
+  loadAutoSettings,
+  saveAutoSettings,
+  subscribeAutoSettings,
+  withModeParams,
+  type AutoMode,
+} from '@/utils/autoTradingEngine';
 
 export default function AutoTradeScreen() {
   const queryClient = useQueryClient();
   const [enabledStrategies, setEnabledStrategies] = useState<EnabledStrategies>(DEFAULT_ENABLED_STRATEGIES);
+  /** v1.5.13 — استراتژی‌های معاملاتی «به‌تفکیک مود»: لیست این بخش، لیستِ
+   *  مودِ فعلیِ ربات (دمو/واقعی — دکمه‌های داخل کارت ربات) است و تغییرش
+   *  فقط همان مود را عوض می‌کند، نه هر دو را. */
+  const [owner, setOwner] = useState<StrategyOwner>('demo');
   const [loaded, setLoaded] = useState(false);
+
+  const reloadForOwner = useCallback(async (o: StrategyOwner) => {
+    setEnabledStrategies(await loadEnabledStrategiesFor(o));
+  }, []);
 
   useEffect(() => {
     (async () => {
-      setEnabledStrategies(await loadEnabledStrategies());
+      const cur = await loadAutoSettings();
+      const o: StrategyOwner = cur.mode === 'real' ? 'real' : 'demo';
+      setOwner(o);
+      await reloadForOwner(o);
       setLoaded(true);
     })().catch(() => setLoaded(true));
-  }, []);
+    // وقتی کاربر داخل کارت ربات مود را عوض می‌کند، لیست استراتژی‌ها هم
+    // همان لحظه به لیست همان مود می‌رود (subscribeAutoSettings).
+    const unsub = subscribeAutoSettings((next) => {
+      const o: StrategyOwner = next.mode === 'real' ? 'real' : 'demo';
+      setOwner(o);
+      void loadEnabledStrategiesFor(o).then(setEnabledStrategies).catch(() => {});
+    });
+    return unsub;
+  }, [reloadForOwner]);
 
   const toggleStrategy = useCallback(
     (key: TradingStrategy) => {
@@ -59,7 +85,8 @@ export default function AutoTradeScreen() {
           ThemedAlert.alert('غیرممکن', 'حداقل یک استراتژی باید روشن باشد.');
           return prev;
         }
-        void saveEnabledStrategies(next).then(() => {
+        // v1.5.13 — ذخیره فقط برای مود فعلی (دمو یا واقعی)
+        void saveEnabledStrategiesFor(owner, next).then(() => {
           queryClient.invalidateQueries({ queryKey: ['trading-strategies'] });
         });
         // v1.5.3 — «هر نوع استراتژی انتخاب میکنم بک‌تست طبق همون جدولشو پر کنه»:
@@ -73,12 +100,12 @@ export default function AutoTradeScreen() {
           void (async () => {
             try {
               const cur = await loadAutoSettings();
-              const updated = {
-                ...cur,
+              // v1.5.13 — پریست استراتژی فقط روی جدول همین مود اعمال می‌شود
+              const updated = withModeParams(cur, {
                 leverage: preset.maxLeverage,
                 maxLossPercent: preset.stopLossPercent,
                 rewardRatio: preset.takeProfitMultiplier,
-              };
+              }, owner);
               await saveAutoSettings(updated);
               ThemedAlert.alert(
                 'جدول با استراتژی مچ شد ✅',
@@ -90,7 +117,7 @@ export default function AutoTradeScreen() {
         return next;
       });
     },
-    [queryClient]
+    [queryClient, owner]
   );
 
   const strategy = primaryStrategy(enabledStrategies);
@@ -111,10 +138,12 @@ export default function AutoTradeScreen() {
           <View style={styles.section}>
             <View style={styles.sectionHead}>
               <Gauge size={14} color={colors.dark.accent} />
-              <Text style={styles.sectionTitle}>استراتژی‌های معاملاتی بک‌تست (روشن/خاموش)</Text>
+              <Text style={styles.sectionTitle}>
+                استراتژی‌های معاملاتی (روشن/خاموش) — حالت {owner === 'real' ? 'واقعی' : 'دمو'}
+              </Text>
             </View>
             <Text style={styles.hint}>
-              استراتژی‌های روشن در تحلیل AI ربات لحاظ می‌شوند — همین لیست مشترکاً در تب‌های «دمو» و «واقعی» هم استفاده می‌شود. حداقل یک استراتژی باید روشن بماند.
+              v1.5.13 — لیست استراتژی‌های هر حالت جدا است: آنچه برای «حالت واقعی» انتخاب می‌کنید فقط ربات واقعی را عوض می‌کند و تنظیمات «دمو» دست‌نخورده می‌ماند (و برعکس). با عوض کردن مود در کارت رباتِ پایین، همین لیست به لیست همان مود می‌رود. حداقل یک استراتژی باید روشن بماند.
               {'\n'}★ با روشن کردن هر استراتژی، جدول «تنظیمات هر معامله» (لوریج / حد ضرر / ریوارد) همان لحظه با پارامترهای همان استراتژی پر می‌شود — مثلاً اسکالپر: لوریج ۷ و حد ضرر ۱٪.
             </Text>
             {STRATEGY_ORDER.map((key) => {

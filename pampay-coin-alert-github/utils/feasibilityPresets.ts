@@ -18,7 +18,7 @@
  */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import type { AutoTradeSettings } from '@/utils/autoTradingEngine';
+import { withModeParams, type AutoTradeSettings } from '@/utils/autoTradingEngine';
 import type { TradingStrategy } from '@/types/tradeAi';
 
 const PRESETS_KEY = '@feasibility_presets_v1';
@@ -114,24 +114,28 @@ export function applyFeasibilityPresetToSettings(
     1,
     Math.min(100, Math.floor((preset.totalMarginUsd || marginPerTrade) / marginPerTrade))
   );
-  return {
-    ...current,
-    ...(opts.realMode ? { mode: 'real' as const } : {}),
-    leverage,
-    positionSizeUsd: marginPerTrade,
-    maxLossPercent: Math.max(0.5, Math.min(90, preset.slPercent || current.maxLossPercent)),
-    rewardRatio: Math.max(0.5, Math.min(20, preset.rewardRatio || current.rewardRatio)),
-    maxOpenPositions: maxOpen,
-    initialCapitalUsd: Math.max(1, Math.round(preset.totalMarginUsd || current.initialCapitalUsd)),
-    aiCapital: {
-      ...current.aiCapital,
-      enabled: true,
-      dailyLossLimitPercent: Math.max(
-        0.5,
-        Math.min(50, preset.dailyLossPercent > 0 ? preset.dailyLossPercent : current.aiCapital.dailyLossLimitPercent)
-      ),
+  // v1.5.13 — پریست محاسبه‌گر همیشه فقط روی پارامترهای «واقعی» اعمال می‌شود
+  // (تنظیمات دمو دست‌نخورده می‌ماند — جداسازی کامل دمو/واقعی).
+  return withModeParams(
+    { ...current, ...(opts.realMode ? { mode: 'real' as const } : {}) },
+    {
+      leverage,
+      positionSizeUsd: marginPerTrade,
+      maxLossPercent: Math.max(0.5, Math.min(90, preset.slPercent || current.maxLossPercent)),
+      rewardRatio: Math.max(0.5, Math.min(20, preset.rewardRatio || current.rewardRatio)),
+      maxOpenPositions: maxOpen,
+      initialCapitalUsd: Math.max(1, Math.round(preset.totalMarginUsd || current.initialCapitalUsd)),
+      aiCapital: {
+        ...current.aiCapital,
+        enabled: true,
+        dailyLossLimitPercent: Math.max(
+          0.5,
+          Math.min(50, preset.dailyLossPercent > 0 ? preset.dailyLossPercent : current.aiCapital.dailyLossLimitPercent)
+        ),
+      },
     },
-  };
+    'real'
+  );
 }
 
 /** خلاصه‌ی فارسیِ یک پریست برای نمایش در لیست. */

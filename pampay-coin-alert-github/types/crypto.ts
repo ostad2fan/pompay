@@ -129,6 +129,10 @@ export interface AppSettings {
   themeMode?: 'dark' | 'light';
   /** Home-scanner auto mode — persisted so it survives app restarts. */
   autoScanEnabled?: boolean;
+  /** v1.5.13 — نمایش نام کاربری (آیدی) منبع سیگنال سوشال‌مدیا در برنامه و تلگرام. پیش‌فرض خاموش — کلیدش داخل راهنمای تب سوشال‌مدیا است. */
+  socialShowSourceName?: boolean;
+  /** v1.5.13 — نمایش لینک توییت منبع سوشال‌مدیا در برنامه و تلگرام. پیش‌فرض خاموش — کلیدش داخل راهنمای تب سوشال‌مدیا است. */
+  socialShowSourceLink?: boolean;
 }
 
 /** All GainzAlgo-supported scan timeframes. */

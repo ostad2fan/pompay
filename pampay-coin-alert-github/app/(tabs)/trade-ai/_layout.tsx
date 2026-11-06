@@ -32,6 +32,13 @@ export default function TradeAiLayout() {
           headerTitleAlign: 'center',
         }}
       />
+      <Stack.Screen
+        name="social-signals"
+        options={{
+          title: 'ترید با AI — سوشال‌مدیا',
+          headerTitleAlign: 'center',
+        }}
+      />
     </Stack>
   );
 }

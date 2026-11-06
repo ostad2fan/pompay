@@ -120,30 +120,110 @@ export interface AutoAiCapitalSettings {
   dailyLossLimitPercent: number;
 }
 
+/**
+ * v1.5.13 — پارامترهای معاملاتی «هر حالت» (ماشین‌حساب + نوع استراتژی).
+ * طبق درخواست کاربر: تنظیماتی که در حالت دمو ذخیره می‌شود فقط روی ربات دمو
+ * اعمال می‌شود و تنظیمات حالت واقعی فقط روی ربات واقعی — دو حالت دیگر
+ * تنظیمات مشترک ندارند.
+ */
+export interface BotModeParams {
+  leverage: number;
+  positionSizeUsd: number;
+  maxLossPercent: number;
+  rewardRatio: number;
+  maxOpenPositions: number;
+  trailing: AutoTrailingSettings;
+  aiCapital: AutoAiCapitalSettings;
+  initialCapitalUsd: number;
+}
+
 export interface AutoTradeSettings {
   enabled: boolean;
   mode: AutoMode;
   whale: AutoWhaleSource;
   indicators: AutoIndicatorSource;
-  /** لوریج هر پوزیشن */
+  /** v1.5.13 — پارامترهای حالت دمو (مستقل). */
+  demo: BotModeParams;
+  /** v1.5.13 — پارامترهای حالت واقعی (مستقل). */
+  real: BotModeParams;
+  /** آینه‌ی پارامترهای «حالت فعلی» — موتور/سرور همان را می‌خوانند؛
+   *  saveAutoSettings همیشه آن را با mode همگام نگه می‌دارد. */
   leverage: number;
-  /** حجم هر پوزیشن (دلار مارجین) */
   positionSizeUsd: number;
-  /** حداکثر ضرر — درصدِ حجم → فاصله استاپ‌لاس از نقطه ورود */
   maxLossPercent: number;
-  /** ریوارد R:R — تیک‌پرافیت = فاصله استاپ × این عدد */
   rewardRatio: number;
-  /** حداکثر پوزیشن باز همزمان (v1.5.2 — تا ۱۰۰؛ طبق درخواست کاربر بیشتر از ۱۰) */
   maxOpenPositions: number;
-  /** v1.5.0 — trailing stop (system-managed, on by default). */
   trailing: AutoTrailingSettings;
-  /** v1.5.0 — AI capital management (on by default). */
   aiCapital: AutoAiCapitalSettings;
-  /** v1.5.2 — سرمایه اولیه برای محاسبه PnL/ROI (مثل خروجی فیوچرز بایننس). */
   initialCapitalUsd: number;
-  /** v1.5.2 — اعلام تلگرام ۲۴/۷ از سرور (حتی وقتی برنامه بسته است). */
   server247: { enabled: boolean };
 }
+
+/** پارامترهای حالت هدف (پیش‌فرض = حالت فعلی). */
+export function modeParamsOf(s: AutoTradeSettings, owner?: AutoMode): BotModeParams {
+  const p = (owner ?? s.mode) === 'real' ? s.real : s.demo;
+  return p;
+}
+
+/** اعمال یک تغییر پارامتر فقط روی حالت مشخص‌شده (پیش‌فرض = حالت فعلی). */
+export function withModeParams(
+  s: AutoTradeSettings,
+  patch: Partial<BotModeParams>,
+  owner?: AutoMode
+): AutoTradeSettings {
+  const target = (owner ?? s.mode) === 'real' ? 'real' : 'demo';
+  const merged: BotModeParams = { ...s[target], ...patch };
+  const next: AutoTradeSettings = target === 'real' ? { ...s, real: merged } : { ...s, demo: merged };
+  return syncFlatParams(next);
+}
+
+/** نسخه‌ای از تنظیمات که فلتش = پارامترهای مود مشخص (برای موتور). */
+function withParams(s: AutoTradeSettings, owner: AutoMode): AutoTradeSettings {
+  const p = modeParamsOf(s, owner);
+  return {
+    ...s,
+    leverage: p.leverage,
+    positionSizeUsd: p.positionSizeUsd,
+    maxLossPercent: p.maxLossPercent,
+    rewardRatio: p.rewardRatio,
+    maxOpenPositions: p.maxOpenPositions,
+    trailing: p.trailing,
+    aiCapital: p.aiCapital,
+    initialCapitalUsd: p.initialCapitalUsd,
+  };
+}
+
+/** آینه‌ی فلت = پارامترهای حالت فعلی (بعد از هر تغییر صدا زده می‌شود). */
+export function syncFlatParams(s: AutoTradeSettings): AutoTradeSettings {
+  const p = modeParamsOf(s);
+  if (!p) return s;
+  return {
+    ...s,
+    leverage: p.leverage,
+    positionSizeUsd: p.positionSizeUsd,
+    maxLossPercent: p.maxLossPercent,
+    rewardRatio: p.rewardRatio,
+    maxOpenPositions: p.maxOpenPositions,
+    trailing: p.trailing,
+    aiCapital: p.aiCapital,
+    initialCapitalUsd: p.initialCapitalUsd,
+  };
+}
+
+/** پارامترهای پیش‌فرض یک حالت (مثل پیش‌فرض‌های قدیمی ربات). */
+export function defaultModeParams(): BotModeParams {
+  return {
+    leverage: 5,
+    positionSizeUsd: 50,
+    maxLossPercent: 5,
+    rewardRatio: 2,
+    maxOpenPositions: 3,
+    trailing: { enabled: true, activationRatio: 0.5, trailRatio: 0.5 },
+    aiCapital: { enabled: true, dailyLossLimitPercent: 3 },
+    initialCapitalUsd: 1000,
+  };
+}
+
 
 /** v1.5.0 — indicator option row for the auto-trader picker UI. */
 export interface IndicatorOption {
@@ -305,6 +385,9 @@ export const DEFAULT_AUTO_SETTINGS: AutoTradeSettings = {
   mode: 'demo',
   whale: { enabled: false, address: '', label: '', mirrorSide: true },
   indicators: { enabled: false, selections: [] },
+  demo: defaultModeParams(),
+  real: defaultModeParams(),
+  // فلت = پارامترهای حالت فعلی (با saveAutoSettings/loadAutoSettings همگام می‌ماند)
   leverage: 5,
   positionSizeUsd: 50,
   maxLossPercent: 5,
@@ -342,12 +425,38 @@ export async function loadAutoSettings(): Promise<AutoTradeSettings> {
       initialCapitalUsd: typeof parsed.initialCapitalUsd === 'number' && parsed.initialCapitalUsd > 0 ? parsed.initialCapitalUsd : DEFAULT_AUTO_SETTINGS.initialCapitalUsd,
       server247: { ...DEFAULT_AUTO_SETTINGS.server247, ...parsed.server247 },
     };
+    // v1.5.13 — مهاجرت به پارامترهای به‌تفکیک مود: اگر ذخیره قدیمی demo/real
+    // نداشت، مقادیر فعلی (مشترک سابق) به «هر دو» حالت کپی می‌شود تا رفتار
+    // قبلی دست‌نخورده بماند؛ از این به بعد هر مود مستقل ذخیره می‌شود.
+    const legacyP: BotModeParams = {
+      leverage: merged.leverage,
+      positionSizeUsd: merged.positionSizeUsd,
+      maxLossPercent: merged.maxLossPercent,
+      rewardRatio: merged.rewardRatio,
+      maxOpenPositions: merged.maxOpenPositions,
+      trailing: merged.trailing,
+      aiCapital: merged.aiCapital,
+      initialCapitalUsd: merged.initialCapitalUsd,
+    };
+    const sanitizeParams = (base: BotModeParams, raw?: Partial<BotModeParams> | null): BotModeParams => ({
+      leverage: typeof raw?.leverage === 'number' && raw.leverage > 0 ? raw.leverage : base.leverage,
+      positionSizeUsd: typeof raw?.positionSizeUsd === 'number' && raw.positionSizeUsd > 0 ? raw.positionSizeUsd : base.positionSizeUsd,
+      maxLossPercent: typeof raw?.maxLossPercent === 'number' && raw.maxLossPercent > 0 ? raw.maxLossPercent : base.maxLossPercent,
+      rewardRatio: typeof raw?.rewardRatio === 'number' && raw.rewardRatio > 0 ? raw.rewardRatio : base.rewardRatio,
+      maxOpenPositions: typeof raw?.maxOpenPositions === 'number' && raw.maxOpenPositions >= 1 ? raw.maxOpenPositions : base.maxOpenPositions,
+      trailing: { ...base.trailing, ...(raw?.trailing ?? {}) },
+      aiCapital: { ...base.aiCapital, ...(raw?.aiCapital ?? {}) },
+      initialCapitalUsd: typeof raw?.initialCapitalUsd === 'number' && raw.initialCapitalUsd > 0 ? raw.initialCapitalUsd : base.initialCapitalUsd,
+    });
+    merged.demo = sanitizeParams(legacyP, parsed.demo);
+    merged.real = sanitizeParams(legacyP, parsed.real);
     // v1.5.7 — حذف مهاجرتِ «خاموش‌کردن قهوه‌ای server247» (v1.5.5): کاربر
     // می‌خواهد اعلان‌های بک‌تست با برنامه بسته هم در تلگرام بیاید (مثل
     // اسکنرهای میم‌کوین). حالت ۲۴/۷ دیگر سوییچ دستی نیست؛ وقتی ربات روشن
     // باشد + آدرس سرور + توکن تلگرام تنظیم باشند، خودکار فعال می‌شود
     // (enabled = settings.enabled && telegram در pushAutoTradeConfigToServer).
-    return merged;
+    // v1.5.13 — فلت = پارامترهای حالت فعلی تا موتور/سرور بدون تغییر بخوانند.
+    return syncFlatParams(merged);
   } catch {
     return DEFAULT_AUTO_SETTINGS;
   }
@@ -375,7 +484,10 @@ export function subscribeAutoSettings(cb: AutoSettingsListener): () => void {
   };
 }
 
-export async function saveAutoSettings(s: AutoTradeSettings): Promise<void> {
+export async function saveAutoSettings(input: AutoTradeSettings): Promise<void> {
+  // v1.5.13 — قبل از ذخیره، فلت با پارامترهای «حالت فعلی» همگام می‌شود تا
+  // موتور/سرور/سرور-قدیمی همیشه پارامترهای درست حالت فعال را ببینند.
+  const s = syncFlatParams(input);
   await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
   for (const cb of autoSettingsListeners) {
     try {
@@ -588,13 +700,22 @@ const STRATEGY_LABELS: Record<string, string> = {
   scalper: 'اسکالپر',
 };
 
-async function currentStrategyLabel(): Promise<string> {
+/** v1.5.13 — نام استراتژی فعال «به‌تفکیک مود» (لیست روشن/خاموش تب بک‌تست). */
+async function currentStrategyLabel(owner: 'demo' | 'real' = 'demo'): Promise<string> {
   try {
-    const raw = await AsyncStorage.getItem('@trading_strategies_v1');
-    if (!raw) return STRATEGY_LABELS.balanced;
-    const m = JSON.parse(raw) as Record<string, boolean>;
+    // v1.5.13 — ذخیره‌ی جدید: هر مود لیست خودش را دارد؛ اگر نبود به v1 مشترک برمی‌گردیم.
+    const raw2 = await AsyncStorage.getItem('@trading_strategies_v2');
+    let m: Record<string, boolean> | null = null;
+    if (raw2) {
+      const v2 = JSON.parse(raw2) as { demo?: Record<string, boolean>; real?: Record<string, boolean> };
+      m = (owner === 'real' ? v2.real : v2.demo) ?? null;
+    }
+    if (!m) {
+      const raw = await AsyncStorage.getItem('@trading_strategies_v1');
+      if (raw) m = JSON.parse(raw) as Record<string, boolean>;
+    }
     const order = ['conservative', 'balanced', 'aggressive', 'scalper'];
-    const first = order.find((k) => m[k]);
+    const first = order.find((k) => m?.[k]);
     return STRATEGY_LABELS[first ?? 'balanced'] ?? STRATEGY_LABELS.balanced;
   } catch {
     return STRATEGY_LABELS.balanced;
@@ -813,7 +934,8 @@ async function openDemo(
   }
   const sizeUsd = gate.sizeUsd;
   const { stopPrice, takePrice } = computeStopTake(side, price, settings.maxLossPercent, settings.rewardRatio, settings.leverage);
-  const strategyName = await currentStrategyLabel();
+  // v1.5.13 — برچسب استراتژی «دمو» (لیست هر مود جداست)
+  const strategyName = await currentStrategyLabel('demo');
   const qty = (sizeUsd * settings.leverage) / price;
   const pos: DemoAutoPosition = {
     id: `d-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -1388,7 +1510,8 @@ async function backfillDemoPositions(settings: AutoTradeSettings, prices: Record
     await appendLog('info', `بک‌فیل انجام نشد: ${gate.pausedReason}`);
     return 0;
   }
-  const strategyName = await currentStrategyLabel();
+  // v1.5.13 — برچسب استراتژی «دمو»
+  const strategyName = await currentStrategyLabel('demo');
   let opened = 0;
   for (const c of picked) {
     seen[c.id] = true;
@@ -1441,7 +1564,8 @@ async function openReal(
   }
   const sizeUsd = gate.sizeUsd;
   const { stopPrice, takePrice } = computeStopTake(side, price, settings.maxLossPercent, settings.rewardRatio, settings.leverage);
-  const strategyName = await currentStrategyLabel();
+  // v1.5.13 — برچسب استراتژی «واقعی» (لیست هر مود جداست)
+  const strategyName = await currentStrategyLabel('real');
   await openRealPosition(
     keys.apiKey,
     keys.apiSecret,
@@ -1610,7 +1734,8 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
   try {
     // 1) demo mark-to-market + trailing + SL/TP checks (always — even real
     //    mode usually has no demo positions, this is a cheap no-op then)
-    await markDemoPositions(prices, settings);
+    // v1.5.13 — MTM دمو همیشه با پارامترهای «دمو» (مستقل از حالت فعلی)
+    await markDemoPositions(prices, withParams(settings, 'demo'));
   } catch (e) {
     result.errors.push(`MTM: ${e instanceof Error ? e.message : 'خطا'}`);
   }
@@ -1618,7 +1743,7 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
   // 1.5) v1.5.0 — manage tracked REAL positions (trailing + closed detection)
   if (settings.mode === 'real' && ctx.realKeys) {
     try {
-      const m = await manageRealPositions(settings, ctx.realKeys);
+      const m = await manageRealPositions(withParams(settings, 'real'), ctx.realKeys);
       result.closed += m.closed;
       result.errors.push(...m.errors);
     } catch (e) {
@@ -1649,13 +1774,13 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
         if (settings.mode === 'real') {
           if (ctx.realKeys) {
             try {
-              if (await openReal(settings, ctx.realKeys, o.coin, side, price, label)) result.opened++;
+              if (await openReal(withParams(settings, 'real'), ctx.realKeys, o.coin, side, price, label)) result.opened++;
             } catch (e) {
               result.errors.push(`واقعی ${o.coin}: ${e instanceof Error ? e.message : 'خطا'}`);
             }
           }
         } else {
-          if (await openDemo(settings, o.coin, side, price, 'whale', label)) result.opened++;
+          if (await openDemo(withParams(settings, 'demo'), o.coin, side, price, 'whale', label)) result.opened++;
         }
       }
       for (const c of closed) {
@@ -1704,10 +1829,10 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
           for (const p of open) {
             if (await closeDemo(p.id, price, 'signal')) result.closed++;
           }
-          if (await openDemo(settings, coin, side, price, 'indicator', label)) result.opened++;
+          if (await openDemo(withParams(settings, 'demo'), coin, side, price, 'indicator', label)) result.opened++;
         } else if (ctx.realKeys) {
           try {
-            if (await openReal(settings, ctx.realKeys, coin, side, price, label)) result.opened++;
+            if (await openReal(withParams(settings, 'real'), ctx.realKeys, coin, side, price, label)) result.opened++;
           } catch (e) {
             result.errors.push(`واقعی ${coin}: ${e instanceof Error ? e.message : 'خطا'}`);
           }
@@ -1721,7 +1846,7 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
   // 4) v1.5.5 — بک‌فیل: پوزیشن بازِ دمو تا سقف تنظیم‌شده پر می‌شود
   //    (بازپخش سیگنال‌های ۷ روز اخیر — هر سیگنال یک بار)
   try {
-    const bf = await backfillDemoPositions(settings, prices);
+    const bf = await backfillDemoPositions(withParams(settings, 'demo'), prices);
     result.opened += bf;
   } catch {}
 
@@ -2043,13 +2168,13 @@ export async function runLightMtm(): Promise<void> {
     // قیمت با کش ۲.۵ ثانیه‌ای تا PnL نمایش واقعاً هر ۳ ثانیه تازه شود
     const prices = await getBinancePrices(1_500).catch(() => ({}) as Record<string, number>);
     try {
-      await markDemoPositions(prices, settings);
+      await markDemoPositions(prices, withParams(settings, 'demo'));
     } catch {}
     if (settings.mode === 'real') {
       const keys = await loadRealKeys();
       if (keys) {
         try {
-          await manageRealPositions(settings, keys);
+          await manageRealPositions(withParams(settings, 'real'), keys);
         } catch {}
       }
     }
@@ -2260,6 +2385,9 @@ export async function pushAutoTradeConfigToServer(
         mode: settings.mode,
         whale: settings.whale,
         indicators: settings.indicators,
+        // v1.5.13 — پارامترهای هر مود جداگانه (دمو مستقل از واقعی)
+        demo: settings.demo,
+        real: settings.real,
         leverage: settings.leverage,
         positionSizeUsd: settings.positionSizeUsd,
         maxLossPercent: settings.maxLossPercent,
@@ -2269,7 +2397,7 @@ export async function pushAutoTradeConfigToServer(
         aiCapital: settings.aiCapital,
         initialCapitalUsd: settings.initialCapitalUsd,
         // v1.5.3 — برچسب استراتژی فعال + پرچم ریست کامل دمو
-        strategyLabel: await currentStrategyLabel(),
+        strategyLabel: await currentStrategyLabel(settings.mode),
         reset,
         // v1.5.4/v1.5.7 — توکن تلگرام برنامه → اعلان‌های ۲۴/۷ سرور بدون تنظیم جداگانه
         telegram,

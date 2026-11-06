@@ -21,8 +21,8 @@ import { Linking, Platform } from 'react-native';
 import { getServerUrl } from './scanServerApi';
 
 /** Must match app.json «version» at release time. */
-export const APP_VERSION = '1.5.11';
-export const APP_VERSION_CODE = 36;
+export const APP_VERSION = '1.5.13';
+export const APP_VERSION_CODE = 38;
 
 const REPO_OWNER = 'ostad2fan';
 const REPO_NAME = 'pompay';
@@ -39,6 +39,15 @@ const APK_NAME = 'PampDumpCoins-latest.apk';
  * The fixed-name copy stays in the repo as a fallback for older app builds.
  */
 const VERSIONED_APK_NAME = `PampDumpCoins-v${APP_VERSION}.apk`;
+
+/**
+ * v1.5.13 — the APK now ALSO ships as a GitHub RELEASE asset
+ * (repo → Releases → v1.5.13 → PampDumpCoins-v1.5.13.apk). The release URL is
+ * the first download candidate: the file is attached to the release itself, so
+ * it exists even if the repo files are removed, and GitHub's asset CDN
+ * (objects.githubusercontent.com) is reachable from Iran without a VPN.
+ */
+const RELEASE_APK_URL = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${APP_VERSION}/${VERSIONED_APK_NAME}`;
 
 /** Direct GitHub raw URL for version.json (blocked in Iran without VPN). */
 export const DEFAULT_UPDATE_URL =
@@ -236,10 +245,11 @@ export async function dismissUpdate(version: string): Promise<void> {
 
 /** The versioned (primary) and fixed-name (fallback) raw/CDN APK URLs. */
 function apkDownloadCandidates(apkUrl: string): string[] {
-  // Always start from the URL version.json gave us (versioned name since
-  // v1.4.10) + cache-buster so no layer can serve a stale copy.
+  // Always start from the URL version.json gave us (the GitHub release asset
+  // since v1.5.13) + cache-buster so no layer can serve a stale copy.
   const bust = (u: string) => `${u}${u.includes('?') ? '&' : '?'}v=${APP_VERSION_CODE}-${Date.now()}`;
   const urls = [bust(apkUrl)];
+  if (!urls[0].startsWith(RELEASE_APK_URL)) urls.unshift(bust(RELEASE_APK_URL));
   const rawVersioned = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}/${REPO_DIR}/apk/${VERSIONED_APK_NAME}`;
   const cdnVersioned = `https://cdn.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${VERSIONED_APK_NAME}`;
   const fastlyVersioned = `https://fastly.jsdelivr.net/gh/${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH}/${REPO_DIR}/apk/${VERSIONED_APK_NAME}`;
