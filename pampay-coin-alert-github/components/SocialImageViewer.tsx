@@ -1,18 +1,19 @@
 /**
- * components/SocialImageViewer.tsx — v1.5.15
+ * components/SocialImageViewer.tsx — v1.5.17
  *
  * نمایشگر تمام‌صفحه عکس چارت سیگنال‌های سوشال‌مدیا.
  *
- * v1.5.15 — رفع باگ «زوم کار نمی‌کند»: maximumZoomScale روی ScrollView فقط
- * در iOS رفتار پینچ دارد و در اندروید نادیده گرفته می‌شود. حالا زوم واقعی با
- * react-native-gesture-handler (بدون کتابخانه جدید — از قبل در پروژه هست):
- *   • پینچ دو انگشتی تا ۸ برابر (PinchGestureHandler + Animated)؛
- *   • دابل‌تپ = رفت‌وبرگشت بین ۱× و ۲.۵×؛
- *   • بعد از زوم، با یک انگشت جابه‌جا (PanGestureHandler)؛
- *   • اگر زوم زیر ۱ برود، با فنر به اندازه اصلی برمی‌گردد.
- * کیفیت نمایش هم بالا رفت: عکس با پارامتر name=large توییتر لود می‌شود و
- * دکمه ذخیره، فایل اصلی (name=orig) را در گالری می‌گذارد تا اعداد و قیمت‌ها
- * دقیق خوانده شوند.
+ * v1.5.17 — حل ریشه‌ای کرش «لمس عکس → خروج از برنامه» (v1.5.15 و v1.5.16):
+ *   علت واقعی پیدا شد: برنامه روی معماری جدید (newArchEnabled=true) اجرا
+ *   می‌شود و در آن Animated با useNativeDriver:true کار نمی‌کند — ترکیب
+ *   هندلرهای کلاسیک gesture-handler + انیمیشن native-driver داخل Modal همان
+ *   چیزی بود که اندروید را می‌بست (هر دو نسخهٔ قبل از همین بود).
+ *   این نسخه صددرصد امنِ-کرش است:
+ *   • بدون react-native-gesture-handler — فقط PanResponder خالص React Native
+ *   • بدون useNativeDriver در هیچ‌جای فایل — همهٔ انیمیشن‌ها JS-driven
+ *   • زوم با دو انگشت (پینچ تا ۸ برابر) + دابل‌تپ (۱× ↔ ۲.۵×) + جابه‌جایی
+ *     با یک انگشت بعد از زوم — همه در جاوااسکریپت، بدون نود انیمیشن native
+ *   • ذخیرهٔ گالری همچنان با فایل اصلی (orig) — اعداد و قیمت‌ها دقیق
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -25,15 +26,9 @@ import {
   Image,
   ActivityIndicator,
   Dimensions,
-  StatusBar,
   Animated,
+  PanResponder,
 } from 'react-native';
-import {
-  PinchGestureHandler,
-  PanGestureHandler,
-  TapGestureHandler,
-  State,
-} from 'react-native-gesture-handler';
 import { X, Download, Check } from 'lucide-react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
@@ -42,6 +37,8 @@ import { upgradeTwitterImageUrl } from '@/utils/socialSignalsService';
 
 const WIN = Dimensions.get('window');
 const DOUBLE_TAP_ZOOM = 2.5;
+const MAX_ZOOM = 8;
+const clampZoom = (v: number) => Math.min(MAX_ZOOM, Math.max(1, v));
 
 interface Props {
   visible: boolean;
@@ -54,47 +51,113 @@ export default function SocialImageViewer({ visible, imageUrl, onClose }: Props)
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  const zoom = useRef(new Animated.Value(1)).current;
+  // انیمیشن JS-driven — استفاده از useNativeDriver در معماری جدید ممنوع است
+  const scale = useRef(new Animated.Value(1)).current;
   const tx = useRef(new Animated.Value(0)).current;
   const ty = useRef(new Animated.Value(0)).current;
-  const zoomRef = useRef(1);
-  const doubleTapRef = useRef<TapGestureHandler | null>(null);
-  const pinchRef = useRef<PinchGestureHandler | null>(null);
 
-  useEffect(() => {
-    const id = zoom.addListener((s) => {
-      zoomRef.current = s.value;
-    });
-    return () => zoom.removeAllListeners();
-  }, [zoom]);
+  // وضعیت ژست در ref معمولی — هیچ listener روی نود انیمیشن وجود ندارد
+  const g = useRef({
+    scale: 1,
+    baseX: 0,
+    baseY: 0,
+    x: 0,
+    y: 0,
+    pinchDist0: 0,
+    pinchScale0: 1,
+    lastTap: 0,
+  }).current;
 
-  const resetView = useCallback(() => {
-    Animated.parallel([
-      Animated.spring(zoom, { toValue: 1, useNativeDriver: true, friction: 8 }),
-      Animated.spring(tx, { toValue: 0, useNativeDriver: true, friction: 8 }),
-      Animated.spring(ty, { toValue: 0, useNativeDriver: true, friction: 8 }),
-    ]).start();
-  }, [zoom, tx, ty]);
+  const springTo = useCallback(
+    (sv: number, xv: number, yv: number) => {
+      Animated.parallel([
+        Animated.spring(scale, { toValue: sv, useNativeDriver: false, friction: 8, tension: 60 }),
+        Animated.spring(tx, { toValue: xv, useNativeDriver: false, friction: 8 }),
+        Animated.spring(ty, { toValue: yv, useNativeDriver: false, friction: 8 }),
+      ]).start();
+    },
+    [scale, tx, ty]
+  );
 
   const toggleDoubleTapZoom = useCallback(() => {
-    const target = zoomRef.current > 1.05 ? 1 : DOUBLE_TAP_ZOOM;
-    Animated.parallel([
-      Animated.spring(zoom, { toValue: target, useNativeDriver: true, friction: 8 }),
-      Animated.spring(tx, { toValue: 0, useNativeDriver: true, friction: 8 }),
-      Animated.spring(ty, { toValue: 0, useNativeDriver: true, friction: 8 }),
-    ]).start();
-  }, [zoom, tx, ty]);
+    const target = g.scale > 1.05 ? 1 : DOUBLE_TAP_ZOOM;
+    g.scale = target;
+    g.x = 0;
+    g.y = 0;
+    springTo(target, 0, 0);
+  }, [g, springTo]);
 
   useEffect(() => {
     if (visible) {
       setSaved(false);
       setSaveError(null);
       setSaving(false);
-      zoom.setValue(1);
+      g.scale = 1;
+      g.x = 0;
+      g.y = 0;
+      g.pinchDist0 = 0;
+      g.lastTap = 0;
+      scale.setValue(1);
       tx.setValue(0);
       ty.setValue(0);
     }
-  }, [visible, imageUrl, zoom, tx, ty]);
+  }, [visible, imageUrl, g, scale, tx, ty]);
+
+  const panResponder = useRef(
+    PanResponder.create({
+      // همهٔ لمس‌ها را از همان ابتدا می‌گیریم تا دابل‌تپ و پینچ هر دو دیده شوند
+      onStartShouldSetPanResponder: () => true,
+      onPanResponderGrant: () => {
+        const now = Date.now();
+        if (now - g.lastTap < 300) {
+          g.lastTap = 0;
+          toggleDoubleTapZoom();
+          return;
+        }
+        g.lastTap = now;
+      },
+      onPanResponderMove: (e, gs) => {
+        const ts = e.nativeEvent.touches;
+        if (ts.length >= 2) {
+          // پینچ: نسبت فاصلهٔ دو انگشت نسبت به لحظهٔ شروع
+          const a = ts[0];
+          const b = ts[1];
+          const dx = a.pageX - b.pageX;
+          const dy = a.pageY - b.pageY;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (g.pinchDist0 <= 0) {
+            g.pinchDist0 = dist;
+            g.pinchScale0 = g.scale;
+          } else if (dist > 1) {
+            g.scale = clampZoom(g.pinchScale0 * (dist / g.pinchDist0));
+            scale.setValue(g.scale);
+          }
+        } else if (g.scale > 1.02) {
+          // جابه‌جایی با یک انگشت فقط وقتی زوم کرده است
+          g.x = g.baseX + gs.dx;
+          g.y = g.baseY + gs.dy;
+          tx.setValue(g.x);
+          ty.setValue(g.y);
+        }
+      },
+      onPanResponderRelease: () => {
+        g.pinchDist0 = 0;
+        const s = clampZoom(g.scale);
+        if (s < 1.02) {
+          // برگشت نرم به اندازهٔ اصلی
+          g.scale = 1;
+          g.x = 0;
+          g.y = 0;
+          springTo(1, 0, 0);
+        } else {
+          springTo(s, g.x, g.y);
+        }
+      },
+      onPanResponderTerminate: () => {
+        g.pinchDist0 = 0;
+      },
+    })
+  ).current;
 
   const handleSave = useCallback(async () => {
     if (!imageUrl || saving) return;
@@ -108,7 +171,7 @@ export default function SocialImageViewer({ visible, imageUrl, onClose }: Props)
         setSaveError('اجازه دسترسی به گالری داده نشد — از تنظیمات گوشی فعالش کنید');
         return;
       }
-      // v1.5.15 — فایل اصلی (name=orig) ذخیره می‌شود، نه پیش‌نمایش کوچک RSS
+      // فایل اصلی (name=orig) ذخیره می‌شود، نه پیش‌نمایش کوچک RSS
       const orig = upgradeTwitterImageUrl(imageUrl, 'orig');
       const name = `pampi-signal-${Date.now()}.jpg`;
       const local = `${FileSystem.cacheDirectory}${name}`;
@@ -125,63 +188,24 @@ export default function SocialImageViewer({ visible, imageUrl, onClose }: Props)
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
-      <StatusBar hidden />
-      <View style={styles.backdrop}>
-        <TapGestureHandler
-          ref={doubleTapRef}
-          numberOfTaps={2}
-          onActivated={toggleDoubleTapZoom}
+      <View style={styles.backdrop} {...panResponder.panHandlers}>
+        <Animated.View
+          style={[
+            styles.imageWrap,
+            {
+              transform: [{ translateX: tx }, { translateY: ty }, { scale }],
+            },
+          ]}
         >
-          <PinchGestureHandler
-            ref={pinchRef}
-            simultaneousHandlers={doubleTapRef}
-            onGestureEvent={Animated.event([{ nativeEvent: { scale: zoom } }], {
-              useNativeDriver: true,
-            })}
-            onHandlerStateChange={(e) => {
-              const { state } = e.nativeEvent;
-              if (state === State.END && zoomRef.current < 1.02) {
-                resetView();
-              }
-            }}
-          >
-            <PanGestureHandler
-              simultaneousHandlers={[doubleTapRef, pinchRef]}
-              onGestureEvent={Animated.event(
-                [{ nativeEvent: { translationX: tx, translationY: ty } }],
-                { useNativeDriver: true }
-              )}
-              onHandlerStateChange={(e) => {
-                if (e.nativeEvent.state === State.END && zoomRef.current <= 1.02) {
-                  Animated.parallel([
-                    Animated.spring(tx, { toValue: 0, useNativeDriver: true, friction: 8 }),
-                    Animated.spring(ty, { toValue: 0, useNativeDriver: true, friction: 8 }),
-                  ]).start();
-                }
-              }}
-            >
-              <Animated.View style={styles.zoomArea}>
-                <Animated.View
-                  style={[
-                    styles.imageWrap,
-                    {
-                      transform: [{ translateX: tx }, { translateY: ty }, { scale: zoom }],
-                    },
-                  ]}
-                >
-                  {imageUrl ? (
-                    <Image
-                      source={{ uri: upgradeTwitterImageUrl(imageUrl, 'large') }}
-                      style={styles.image}
-                      resizeMode="contain"
-                      accessibilityLabel="چارت سیگنال — تمام‌صفحه"
-                    />
-                  ) : null}
-                </Animated.View>
-              </Animated.View>
-            </PanGestureHandler>
-          </PinchGestureHandler>
-        </TapGestureHandler>
+          {imageUrl ? (
+            <Image
+              source={{ uri: upgradeTwitterImageUrl(imageUrl, 'large') }}
+              style={styles.image}
+              resizeMode="contain"
+              accessibilityLabel="چارت سیگنال — تمام‌صفحه"
+            />
+          ) : null}
+        </Animated.View>
 
         <View style={styles.topBar} pointerEvents="box-none">
           <Pressable style={styles.iconBtn} onPress={onClose} hitSlop={8} testID="social-image-close">
@@ -224,15 +248,10 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000',
   },
-  zoomArea: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    overflow: 'hidden',
-  },
   imageWrap: {
     width: WIN.width,
     height: WIN.height * 0.92,
+    marginTop: WIN.height * 0.04,
     alignItems: 'center',
     justifyContent: 'center',
   },

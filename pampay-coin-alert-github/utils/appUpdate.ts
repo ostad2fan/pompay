@@ -21,8 +21,8 @@ import { Linking, Platform } from 'react-native';
 import { getServerUrl } from './scanServerApi';
 
 /** Must match app.json «version» at release time. */
-export const APP_VERSION = '1.5.15';
-export const APP_VERSION_CODE = 40;
+export const APP_VERSION = '1.5.17';
+export const APP_VERSION_CODE = 42;
 
 const REPO_OWNER = 'ostad2fan';
 const REPO_NAME = 'pompay';
@@ -186,15 +186,75 @@ async function fetchVersionJson(url: string): Promise<RawVersionJson> {
 
 function mirrorLabel(url: string): string {
   if (url.includes('/latest-version')) return 'سرور برنامه';
+  if (url.includes('api.github.com')) return 'گیت‌هاب (ریلیز)';
   if (url.includes('jsdelivr')) return 'CDN jsDelivr';
   if (url.includes('raw.githubusercontent')) return 'گیت‌هاب';
   return 'آدرس سفارشی';
+}
+
+/**
+ * v1.5.16 — منبع اولِ بررسی: خود API گیت‌هاب (releases/latest). این پاسخ
+ * همیشه آخرین ریلیز واقعی است و هیچ کش CDN وسطش نیست — پس «همیشه آخرین
+ * نسخه از ریلیز» تضمین می‌شود. اگر api.github.com در دسترس نبود (بلاک/کند —
+ * تایم‌اوت ۴ ثانیه)، زنجیرهٔ قبلی (سرور برنامه → CDN → raw) همان کار را
+ * انجام می‌دهد.
+ */
+async function fetchLatestReleaseViaApi(): Promise<RawVersionJson | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4_000);
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest`,
+      { headers: { Accept: 'application/vnd.github+json' }, signal: controller.signal }
+    );
+    if (!res.ok) return null;
+    const j = (await res.json()) as {
+      tag_name?: string;
+      body?: string;
+      assets?: Array<{ name?: string; browser_download_url?: string }>;
+    };
+    const tag = String(j.tag_name ?? '')
+      .trim()
+      .replace(/^v/i, '');
+    const asset = Array.isArray(j.assets)
+      ? j.assets.find((a) => /\.apk$/i.test(String(a.name ?? '')))
+      : undefined;
+    if (!tag || !asset?.browser_download_url) return null;
+    return {
+      latestVersion: tag,
+      apkUrl: String(asset.browser_download_url),
+      notes: j.body ? String(j.body).slice(0, 600) : undefined,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Fetch + parse version.json (multi-mirror) and decide whether an update is available. */
 export async function fetchUpdateInfo(urlOverride?: string): Promise<AppUpdateInfo | null> {
   const candidates = urlOverride ? [urlOverride] : await versionCheckCandidates();
   lastUpdateError = null;
+
+  // v1.5.16 — اول از خود ریلیزِ گیت‌هاب (بدون کش)، بعد زنجیرهٔ مانیفست‌ها
+  if (!urlOverride) {
+    const viaApi = await fetchLatestReleaseViaApi();
+    if (viaApi) {
+      const latestVersion = String(viaApi.latestVersion).trim();
+      const apkUrl = String(viaApi.apkUrl).trim();
+      const info: AppUpdateInfo = {
+        available: compareVersions(latestVersion, getInstalledVersion()) > 0,
+        latestVersion,
+        apkUrl,
+        notes: viaApi.notes,
+        checkedAt: Date.now(),
+        source: mirrorLabel('api.github.com'),
+      };
+      emitUpdateInfo(info);
+      return info;
+    }
+  }
 
   for (const url of candidates) {
     if (!/^https?:\/\//i.test(url)) continue;
