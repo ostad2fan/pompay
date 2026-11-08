@@ -1,9 +1,9 @@
 {
-  "latestVersion": "1.5.17",
-  "versionCode": 42,
-  "apkUrl": "https://github.com/ostad2fan/pompay/releases/download/v1.5.17/PampDumpCoins-v1.5.17.apk",
-  "releaseUrl": "https://github.com/ostad2fan/pompay/releases/tag/v1.5.17",
-  "updatedAt": "2026-11-07",
-  "notes": "نسخه ۱.۵.۱۷ — حل ریشه‌ای کرش لمس عکس: علت واقعی، ناسازگاری انیمیشن native با معماری جدید اندروید داخل نمایشگر عکس بود؛ نمایشگر با موتور امن و سازگار با هر دو معماری بازنویسی شد. همهٔ امکانات زوم (پینچ تا ۸ برابر + دابل‌تپ + جابه‌جایی) و ذخیره با کیفیت اصلی سر جایشان هستند.",
+  "latestVersion": "1.5.18",
+  "versionCode": 43,
+  "apkUrl": "https://github.com/ostad2fan/pompay/releases/download/v1.5.18/PampDumpCoins-v1.5.18.apk",
+  "releaseUrl": "https://github.com/ostad2fan/pompay/releases/tag/v1.5.18",
+  "updatedAt": "2026-11-08",
+  "notes": "نسخه ۱.۵.۱۸ — رفع باز نشدن اولین اجرا (تایید دوم برای قفل IP) + رفع ربات دمو (موتور سیگنال‌های اندیکاتور مستقل از تلگرام) + اعلان همهٔ بخش‌ها فقط با اینترنت گوشی و بدون سرور (بک‌فچ ربات و اسکنر).",
   "commit": "see https://github.com/ostad2fan/pompay/tree/main/pampay-coin-alert-github"
 }

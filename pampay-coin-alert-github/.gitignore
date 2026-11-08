@@ -1,0 +1,4 @@
+
+# never publish signing keys
+keystore/
+*.jks

@@ -46,6 +46,7 @@ import {
   notifySocialSignalsLocal,
 } from '@/utils/socialSignalsService';
 import { registerSocialBackgroundTask } from '@/utils/socialBackgroundTask';
+import { registerAllSignalsBackgroundTask } from '@/utils/allSignalsBackgroundTask';
 
 import { ThemedAlert } from '@/components/ThemedAlert';
 const TRACKED_WALLETS_KEY = '@tracked_whale_wallets';
@@ -161,6 +162,11 @@ export const [AppProvider, useApp] = createContextHook(() => {
   const scanIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const knownGainzIdsRef = useRef<Set<string>>(new Set());
   const knownHookIdsRef = useRef<Set<string>>(new Set());
+  // v1.5.18 — fresh settings inside long-lived scheduler listeners (no stale
+  // closures): the listeners below are registered once and must see the
+  // CURRENT notification toggles, not the ones from mount time.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
 
   const settingsQuery = useQuery({
     queryKey: ['settings'],
@@ -308,27 +314,34 @@ export const [AppProvider, useApp] = createContextHook(() => {
   });
 
   useEffect(() => {
-    if (settings.notificationsEnabled) {
+    if (!settings.notificationsEnabled) return;
+    // v1.5.18 — deferred 3s: permission dialogs + FCM token + server
+    // registration are NOT first-frame work; running them at t=0 made the
+    // cold start («بار اول باز نمی‌شود») heavier than it needs to be.
+    const t = setTimeout(() => {
       registerForPushNotifications();
       // Auto-register the device push token with the scan server (best-effort
-      // — Telegram remains the always-on channel when push isn't configured).
+      // — local notifications + Telegram never depend on this).
       ensureNotificationPermission().then((granted) => {
         if (granted) {
           registerPushOnServer().catch(() => {});
         }
       });
-    }
+    }, 3_000);
+    return () => clearTimeout(t);
   }, [settings.notificationsEnabled]);
 
   // Indicator schedulers + listeners: GainzAlgo scans daily candles hourly and
   // user-defined indicators scan their own timeframes; new BUY/SELL signals go
   // to local notifications here and to Telegram (inside the services).
+  // v1.5.18 — THE DEMO-BOT FIX: schedulers are NO LONGER gated on
+  // «telegramEnabled». With Telegram off they never started → no hook/gainz/
+  // custom signals were ever generated or stored → the demo bot had nothing
+  // to trade («ربات دمو دیگر سیگنال‌ها را درست معامله نمی‌کرد») and indicator
+  // notifications were dead. Signal generation + local notifications now run
+  // with the phone's internet alone; Telegram sending stays optional inside
+  // the services. Starts are also deferred 8s to keep the cold start light.
   useEffect(() => {
-    if (!settings.telegramEnabled) {
-      stopGainzAlgoScheduler();
-      stopCustomIndicatorsScheduler();
-      return;
-    }
     setGainzAlgoUpdateListener((newSignals: GainzAlgoSignal[]) => {
       setGainzSignals((prev) => {
         const prevIds = new Set(prev.map((s) => s.id));
@@ -339,7 +352,8 @@ export const [AppProvider, useApp] = createContextHook(() => {
         if (knownGainzIdsRef.current.has(sig.id)) continue;
         knownGainzIdsRef.current.add(sig.id);
         if (Platform.OS === 'web') continue;
-        if (settings.gainzAlgoNotifications === false) continue;
+        if (!settingsRef.current.notificationsEnabled) continue;
+        if (settingsRef.current.gainzAlgoNotifications === false) continue;
         const icon = sig.action === 'buy' ? '🟢' : '🔴';
         const tfLabels: Record<string, string> = {
           '15m': '۱۵ دقیقه',
@@ -362,6 +376,7 @@ export const [AppProvider, useApp] = createContextHook(() => {
         if (knownGainzIdsRef.current.has(sig.id)) continue;
         knownGainzIdsRef.current.add(sig.id);
         if (Platform.OS === 'web') continue;
+        if (!settingsRef.current.notificationsEnabled) continue;
         const icon = sig.action === 'buy' ? '🟢' : '🔴';
         const title = `${icon} سیگنال اندیکاتور «${sig.indicatorName}»`;
         const body = `${sig.displayName} — ${sig.action === 'buy' ? 'خرید' : 'فروش'} | قیمت: $${sig.price.toFixed(4)}`;
@@ -381,7 +396,8 @@ export const [AppProvider, useApp] = createContextHook(() => {
         if (knownHookIdsRef.current.has(sig.id)) continue;
         knownHookIdsRef.current.add(sig.id);
         if (Platform.OS === 'web') continue;
-        if (settings.hookReversalNotifications === false) continue;
+        if (!settingsRef.current.notificationsEnabled) continue;
+        if (settingsRef.current.hookReversalNotifications === false) continue;
         const icon = sig.action === 'buy' ? '🟢' : '🔴';
         const title = `${icon} هوک ${sig.action === 'buy' ? 'صعودی' : 'نزولی'} ریورسال`;
         const body = `${sig.displayName} | قیمت: $${sig.price.toFixed(4)} | تایم‌فریم ${HOOK_TF_LABEL[sig.timeframe] ?? sig.timeframe}`;
@@ -391,10 +407,13 @@ export const [AppProvider, useApp] = createContextHook(() => {
         }).catch(() => {});
       }
     });
-    startGainzAlgoScheduler();
-    startCustomIndicatorsScheduler();
-    startHookReversalScheduler(settings.hookTimeframes ?? ['1d']);
+    const t = setTimeout(() => {
+      startGainzAlgoScheduler();
+      startCustomIndicatorsScheduler();
+      startHookReversalScheduler(settingsRef.current.hookTimeframes ?? ['1d']);
+    }, 8_000);
     return () => {
+      clearTimeout(t);
       stopGainzAlgoScheduler();
       stopCustomIndicatorsScheduler();
       stopHookReversalScheduler();
@@ -402,7 +421,7 @@ export const [AppProvider, useApp] = createContextHook(() => {
       setCustomIndicatorsUpdateListener(null);
       setHookReversalUpdateListener(null);
     };
-  }, [settings.telegramEnabled]);
+  }, [settings.hookTimeframes]);
 
   // Keep the running hook scheduler in sync with the selected timeframes.
   useEffect(() => {
@@ -423,6 +442,9 @@ export const [AppProvider, useApp] = createContextHook(() => {
     startSocialSignalsScheduler(refreshIntervalRef.current);
     // بک‌فچ پس‌زمینه — اعلان حتی وقتی برنامه در پس‌زمینه است (بدون سرور).
     registerSocialBackgroundTask().catch(() => {});
+    // v1.5.18 — بک‌فچ موتور ربات + اسکنر پامپ/دامپ: اعلان همهٔ بخش‌ها با
+    // اینترنت خود گوشی، بدون هیچ سرور رله‌ای (هر ≥۱۵ دقیقه، بهترین‌تلاش).
+    registerAllSignalsBackgroundTask().catch(() => {});
     return () => {
       stopSocialSignalsScheduler();
       setSocialSignalsUpdateListener(null);

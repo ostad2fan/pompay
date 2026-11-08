@@ -28,7 +28,7 @@ import UpdateBanner from "@/components/UpdateBanner";
 import WhatsNewModal from "@/components/WhatsNewModal";
 import StartupIpGate from "@/components/StartupIpGate";
 import { ThemedAlertHost } from "@/components/ThemedAlert";
-import { startGlobalAutoEngine } from "@/utils/autoTradingEngine";
+import { startGlobalAutoEngine, stopGlobalAutoEngine } from "@/utils/autoTradingEngine";
 
 SplashScreen.preventAutoHideAsync();
 
@@ -79,7 +79,15 @@ export default function RootLayout() {
     // باز شدن دوباره برنامه فوراً اجرا می‌شود. حالت سرور ۲۴/۷ (اعلام تلگرام
     // با برنامه بسته) خودکار فعال می‌شود وقتی ربات روشن + سرور + تلگرام
     // تنظیم باشند — pushAutoTradeConfigToServer داخل persist انجام می‌شود.
-    startGlobalAutoEngine();
+    // v1.5.18 — شروع با ۵ ثانیه تاخیر: چرخهٔ اول موتور اسکن‌های شبکه‌ای
+    // سنگینی دارد و نباید با فریم اول برنامه (استارت سرد) رقابت کند —
+    // بخشی از رفع «بار اول برنامه باز نمی‌شود». AppState-resume هم مثل
+    // قبل بلافاصله چرخه می‌زند، پس عملاً تاخیری حس نمی‌شود.
+    const t = setTimeout(() => startGlobalAutoEngine(), 5_000);
+    return () => {
+      clearTimeout(t);
+      stopGlobalAutoEngine();
+    };
   }, []);
 
   return (

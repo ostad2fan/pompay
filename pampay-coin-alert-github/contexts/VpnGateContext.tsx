@@ -39,6 +39,15 @@ interface VpnGateState {
   lastCheckedAt: number | null;
   /** true ONLY on a POSITIVE Iranian-IP match (never for 'unknown'). */
   blocked: boolean;
+  /**
+   * v1.5.18 — the blocking overlay is armed only after TWO consecutive
+   * «iran» checks (cold start): the very first check often races the VPN
+   * tunnel still warming up (app opened right after unlock) and a single
+   * false «iran» made the app feel like «بار اول باز نمی‌شود». `blocked`
+   * (query cut-off) stays TRUE from the FIRST positive match — safety is
+   * not debounced, only the full-screen overlay is.
+   */
+  gateArmed: boolean;
   /** The moment the gate re-armed after having been released before
    *  (mid-session VPN-off) — used to switch the gate's message. */
   reArmedAt: number | null;
@@ -52,6 +61,7 @@ export function VpnGateProvider({ children }: { children: React.ReactNode }) {
   const [checking, setChecking] = useState(true);
   const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null);
   const [reArmedAt, setReArmedAt] = useState<number | null>(null);
+  const [iranStreak, setIranStreak] = useState(0);
   const appState = useRef(AppState.currentState);
   const releasedOnce = useRef(false);
 
@@ -64,9 +74,13 @@ export function VpnGateProvider({ children }: { children: React.ReactNode }) {
       if (result.status === 'vpn') {
         releasedOnce.current = true;
         setReArmedAt(null);
+        setIranStreak(0);
       } else if (result.status === 'iran') {
+        setIranStreak((n) => n + 1);
         // Released before + now Iranian again → mid-session VPN drop.
         if (releasedOnce.current) setReArmedAt(Date.now());
+      } else {
+        setIranStreak(0);
       }
     } finally {
       setChecking(false);
@@ -97,6 +111,7 @@ export function VpnGateProvider({ children }: { children: React.ReactNode }) {
     checking,
     lastCheckedAt,
     blocked: info?.status === 'iran',
+    gateArmed: (info?.status === 'iran' && iranStreak >= 2) || reArmedAt !== null,
     reArmedAt,
     recheck: runCheck,
   };
@@ -113,6 +128,7 @@ export function useVpnGate(): VpnGateState {
       checking: false,
       lastCheckedAt: null,
       blocked: false,
+      gateArmed: false,
       reArmedAt: null,
       recheck: async () => {},
     };

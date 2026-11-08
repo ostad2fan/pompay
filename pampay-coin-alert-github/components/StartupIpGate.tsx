@@ -22,9 +22,13 @@ import { createThemedStyles } from '@/utils/themeStyles';
 import { useVpnGate } from '@/contexts/VpnGateContext';
 
 export default function StartupIpGate() {
-  const { status, ip, countryNameFa, country, checking, reArmedAt, recheck } = useVpnGate();
+  const { ip, countryNameFa, country, checking, reArmedAt, recheck, gateArmed } = useVpnGate();
 
-  const visible = status === 'iran';
+  // v1.5.18 — armed only after TWO consecutive «iran» checks (cold start):
+  // the first check can race the VPN tunnel warming up and a single false
+  // positive made the app feel like «بار اول باز نمی‌شود». A confirmed
+  // Iranian IP still blocks within ~one extra poll cycle (≈2s).
+  const visible = gateArmed;
 
   // While the blocking gate is up, the Android hardware back button exits
   // the app too (there is no "sneaking past" the gate).
