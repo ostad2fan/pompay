@@ -110,6 +110,16 @@ import {
 } from '@/utils/feasibilityPresets';
 import { saveEnabledStrategies, STRATEGY_ORDER } from '@/utils/tradeAiService';
 import type { TradingStrategy } from '@/types/tradeAi';
+// v1.5.19 — انتخاب صرافیِ اجرای ربات واقعی (از صرافی‌های اضافه‌شدهٔ کاربر)
+// v1.5.20 — لیست صرافی‌های دارای اجرای کامل داینامیک شد (بایننس/بای‌بیت/بیتیونیکس/توبیت/بینگ‌ایکس/OKX/بیتگت)
+import { EXECUTABLE_EXCHANGE_IDS, exchangeNeedsPassphrase, isExchangeExecutable } from '@/utils/exchangeFutures';
+import { EXCHANGES } from '@/constants/exchanges';
+import type { ExchangeId } from '@/types/crypto';
+
+/** لیست خوانای صرافی‌های دارای اجرای کامل (برای پیام‌های UI). */
+function executableExchangesLabel(): string {
+  return EXECUTABLE_EXCHANGE_IDS.map((id) => EXCHANGES[id]?.name?.replace(/\s*\(.*\)/, '') ?? id).join('، ');
+}
 // v1.5.6 — بازیابی دقت قیمت بایننس (getFuturesPricePrecisionMap از v1.5.4)
 import {
   formatBinancePrice,
@@ -136,6 +146,7 @@ import {
   closeAllOpenPositions,
   getAutoLogs,
   getLastGlobalCycleAt,
+  listAddedExchangeConfigs,
   listIndicatorOptions,
   listTrackedWhales,
   loadAutoSettings,
@@ -313,7 +324,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   // چیزی در حال ساخت است و چقدر طول می‌کشد (قبلاً فقط «در حال ساخت…»).
   const [pdfStatus, setPdfStatus] = useState('');
   /** v1.5.12 — تقویم ۳۰ روزه: باز/بسته + رفر عکس + نوع پیش‌نمایش (PnL یا تقویم). */
-  const [calOpen, setCalOpen] = useState(false);
+  // v1.5.21 — تقویم دمو و واقعی هر کدام باز/بستهٔ خودشان
+  const [calOpenDemo, setCalOpenDemo] = useState(false);
+  const [calOpenReal, setCalOpenReal] = useState(false);
   const [previewKind, setPreviewKind] = useState<'pnl' | 'cal'>('pnl');
   /** v1.5.12 — رخدادهای درآمد بایننس (فاندینگ + کارمزد) برای پوزیشن‌های واقعی. */
   const [realFeeRows, setRealFeeRows] = useState<BinanceIncomeRow[]>([]);
@@ -321,18 +334,27 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [pricePrecision, setPricePrecision] = useState<Record<string, number>>({});
   const pnlCardRef = useRef<View>(null);
   /** v1.5.12 — رفر کارت تقویم ۳۰ روزه برای ساخت عکس اشتراک/ذخیره. */
-  const calCardRef = useRef<View>(null);
+  // v1.5.21 — رفر عکس تقویم دمو/واقعی جدا
+  const calCardRefDemo = useRef<View>(null);
+  const calCardRefReal = useRef<View>(null);
 
   /** v1.5.8 — R2: پریست‌های محاسبه‌گر (حالت واقعی) */
   const [feasPresets, setFeasPresets] = useState<FeasibilityPreset[]>([]);
   const [feasOpen, setFeasOpen] = useState(true);
-  /** v1.5.9 — بستن همه پوزیشن‌های باز (با پیغام تایید). */
+  // v1.5.9 — بستن همه پوزیشن‌های باز (با پیغام تایید).
   const [closeAllBusy, setCloseAllBusy] = useState(false);
+  /** v1.5.19 — صرافی‌های اضافه‌شدهٔ کاربر (تب «واقعی») برای dropdown انتخاب صرافی ربات واقعی. */
+  const [addedExchanges, setAddedExchanges] = useState<
+    { exchangeId: ExchangeId; hasKeys: boolean; hasPassphrase: boolean; enabled: boolean }[]
+  >([]);
+  const [exDropdownOpen, setExDropdownOpen] = useState(false);
+  /** v1.5.19 — کلید API صرافی انتخابی فعال است؟ (برای اعتبارسنجی شروع ربات واقعی) */
+  const [selExchangeKeys, setSelExchangeKeys] = useState(false);
 
   // load everything on mount
   useEffect(() => {
     (async () => {
-      const [s, w, opts, p, rp, l, keys] = await Promise.all([
+      const [s, w, opts, p, rp, l, keys, exs] = await Promise.all([
         loadAutoSettings(),
         listTrackedWhales(),
         listIndicatorOptions(),
@@ -340,6 +362,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         loadRealPositions(),
         getAutoLogs(),
         realKeysProp ? Promise.resolve(realKeysProp) : loadRealKeys(),
+        listAddedExchangeConfigs(),
       ]);
       setSettings(s);
       setWhales(w);
@@ -348,6 +371,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       setRealPositions(rp);
       setLogs(l.slice(0, 30));
       setRealKeys(keys);
+      setAddedExchanges(exs);
       setLastCycleAt(getLastGlobalCycleAt());
       setLoaded(true);
       // v1.5.9 — شروع برنامه: فقط sync سبک + heartbeat برنامه‌باز. دیگر
@@ -392,6 +416,22 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     setLogs((await getAutoLogs()).slice(0, 30));
     setLastCycleAt(getLastGlobalCycleAt());
   }, []);
+
+  // v1.5.19 — کلیدِ فعالِ «صرافی انتخابی» (بایننس/بای‌بیت/…) — با تغییر صرافی
+  // یا تغییر لیست صرافی‌های اضافه‌شده دوباره خوانده می‌شود.
+  useEffect(() => {
+    let cancelled = false;
+    loadRealKeys(settings.realExchangeId)
+      .then((k) => {
+        if (!cancelled) setSelExchangeKeys(!!k);
+      })
+      .catch(() => {
+        if (!cancelled) setSelExchangeKeys(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.realExchangeId, addedExchanges.length]);
 
   // v1.5.8 — R2: پریست‌های محاسبه‌گر در حالت واقعی هر بار که مود عوض می‌شود
   //  دوباره خوانده می‌شوند (ذخیره/حذف در محاسبه‌گر لحظه‌ای منعکس می‌شود).
@@ -524,7 +564,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   // دمو کارمزد/فاندینگ ندارد → چیزی نمایش داده نمی‌شود (واقعیتِ حساب).
   useEffect(() => {
     if (Platform.OS === 'web') return;
-    if (settings.mode !== 'real' || !realKeys?.apiKey || !realKeys?.apiSecret) {
+    // v1.5.19 — کارمزد/فاندینگ از درآمد حساب خوانده می‌شود؛ فعلاً فقط اجرای
+    // بایننس این گزارش را دارد (بای‌بیت/بقیه: ردیف کارمزد نمایش داده نمی‌شود).
+    if (settings.mode !== 'real' || settings.realExchangeId !== 'binance' || !realKeys?.apiKey || !realKeys?.apiSecret) {
       setRealFeeRows([]);
       return;
     }
@@ -572,15 +614,15 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
 
   // ── v1.5.12 — «تقویم ۳۰ روزه جدولی که در هر روز سود و زیان کلی اون روز را
   // نشان بدهد تفکیک شده» — سطر هر روز: تعداد، سود، ضرر، خالص (جدیدترین اول).
-  const calendarRows = useMemo(() => {
-    const rowsSrc = settings.mode === 'demo' ? positions : realPositions;
+  // v1.5.21 — تقویم دمو و واقعی جدا شد (هر بخش مستقل دیده می‌شود).
+  const calendarRowsFor = useCallback((src: (typeof positions[number] | typeof realPositions[number])[]) => {
     const now = Date.now();
     const win = CAL_DAYS * 86_400_000;
     const map = new Map<
       string,
       { key: string; label: string; ts: number; trades: number; wins: number; profit: number; loss: number; net: number }
     >();
-    for (const p of rowsSrc) {
+    for (const p of src) {
       if (p.status !== 'closed') continue;
       const at = p.closedAt ?? p.openedAt;
       if (!at || now - at > win) continue;
@@ -602,17 +644,25 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       row.net += pnl;
     }
     return Array.from(map.values()).sort((a, b) => b.ts - a.ts);
-  }, [settings.mode, positions, realPositions]);
+  }, []);
 
-  /** v1.5.12 — ردیف جمع کل تقویم. */
-  const calTotals = useMemo(
-    () =>
-      calendarRows.reduce(
+  const demoCalendarRows = useMemo(() => calendarRowsFor(positions), [calendarRowsFor, positions]);
+  const realCalendarRows = useMemo(() => calendarRowsFor(realPositions), [calendarRowsFor, realPositions]);
+  // نسخهٔ مود-فعلی (سازگاری با کدهای قبلی)
+  const calendarRows = settings.mode === 'demo' ? demoCalendarRows : realCalendarRows;
+
+  /** v1.5.21 — ردیف جمع کل تقویم هر بخش. */
+  const calTotalsFor = useCallback(
+    (rows: ReturnType<typeof calendarRowsFor>) =>
+      rows.reduce(
         (acc, r) => ({ trades: acc.trades + r.trades, profit: acc.profit + r.profit, loss: acc.loss + r.loss, net: acc.net + r.net }),
         { trades: 0, profit: 0, loss: 0, net: 0 }
       ),
-    [calendarRows]
+    [calendarRowsFor]
   );
+  const demoCalTotals = useMemo(() => calTotalsFor(demoCalendarRows), [calTotalsFor, demoCalendarRows]);
+  const realCalTotals = useMemo(() => calTotalsFor(realCalendarRows), [calTotalsFor, realCalendarRows]);
+  const calTotals = settings.mode === 'demo' ? demoCalTotals : realCalTotals;
   // v1.5.7 — R2: جمع سود/زیانِ «تمام» معاملات همان بازه در سرتیتر تاریخچه
   // محاسبه می‌شود (closedFiltered دیگر سقف ۱۰۰تایی ندارد — PDF هم همین است).
 
@@ -627,10 +677,10 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
 
   // v1.5.4 (بازیابی‌شده در v1.5.6) — مارجین درگیر پوزیشن‌های باز حالت فعال
   // (حجم ÷ لوریج) — «حجم مارجین درگیر را هم نشون بده تا بدونم چقد آزاد دارم».
-  const engagedMarginUsd = useMemo(() => {
-    const list = settings.mode === 'demo' ? openPositions : realOpen;
-    return list.reduce((s, p) => s + marginOfPosition(p), 0);
-  }, [settings.mode, openPositions, realOpen]);
+  // v1.5.21 — مارجین درگیر دمو و واقعی جدا شد (هر بخش خودش را نشان می‌دهد).
+  const demoEngagedMarginUsd = useMemo(() => openPositions.reduce((s, p) => s + marginOfPosition(p), 0), [openPositions]);
+  const realEngagedMarginUsd = useMemo(() => realOpen.reduce((s, p) => s + marginOfPosition(p), 0), [realOpen]);
+  const engagedMarginUsd = settings.mode === 'demo' ? demoEngagedMarginUsd : realEngagedMarginUsd;
 
   // ── PnL stats per period (demo + real) ──
   const demoStats = useMemo(
@@ -689,22 +739,51 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
       ThemedAlert.alert('اندیکاتور انتخاب نشده', 'از منوی کشویی، حداقل یک اندیکاتور انتخاب کنید.');
       return;
     }
-    if (settings.mode === 'real' && !realKeys) {
-      ThemedAlert.alert('کلید API نیست', 'برای معامله واقعی، ابتدا کلید API فیوچرز بایننس را در تب «واقعی» اضافه کنید.');
-      return;
+    // v1.5.19 — ربات واقعی روی «صرافی انتخابی» استارت می‌شود (نه فقط بایننس):
+    // صرافی باید اجرای کامل ربات داشته باشد و کلیدش اضافه/فعال باشد.
+    // v1.5.20 — لیست صرافی‌های پشتیبانی‌شده داینامیک است.
+    if (settings.mode === 'real') {
+      if (!isExchangeExecutable(settings.realExchangeId)) {
+        ThemedAlert.alert(
+          'به‌زودی',
+          `اجرای ربات روی «${EXCHANGES[settings.realExchangeId]?.name ?? settings.realExchangeId}» هنوز فعال نشده.\nصرافی‌های دارای اجرای کامل: ${executableExchangesLabel()} — از لیست صرافی یکی از آن‌ها را انتخاب کنید. اگر به صرافی دیگری نیاز دارید بگید تا در نسخه بعدی اضافه شود.`
+        );
+        return;
+      }
+      if (!selExchangeKeys) {
+        ThemedAlert.alert(
+          'کلید API نیست',
+          `برای معامله واقعی روی «${EXCHANGES[settings.realExchangeId]?.name ?? settings.realExchangeId}»، ابتدا کلید API آن را در تب «واقعی» اضافه و فعال کنید.`
+        );
+        return;
+      }
+      // v1.5.20 — OKX/بیتگت/کوکوین برای امضا به passphrase هم نیاز دارند
+      if (exchangeNeedsPassphrase(settings.realExchangeId)) {
+        const cfg = addedExchanges.find((e) => e.exchangeId === settings.realExchangeId);
+        if (cfg && !cfg.hasPassphrase) {
+          ThemedAlert.alert(
+            'Passphrase لازم است',
+            `کلید API «${EXCHANGES[settings.realExchangeId]?.name ?? settings.realExchangeId}» به Passphrase هم نیاز دارد — در تب «واقعی» موقع افزودن/ویرایش صرافی آن را وارد کنید.`
+          );
+          return;
+        }
+      }
     }
     ThemedAlert.alert(
       settings.mode === 'demo' ? 'شروع دمو' : 'شروع واقعی',
       settings.mode === 'demo'
         ? 'ربات در حالت دمو شروع می‌شود — پوزیشن‌های شبیه‌سازی‌شده با تنظیمات شما باز/بسته می‌شوند. ربات روشن می‌ماند و با بستن برنامه خاموش نمی‌شود.'
-        : 'ربات با پول واقعی شروع می‌شود! هر سیگنال = سفارش مارکت + استاپ + تیک‌پرافیت روی فیوچرز بایننس. استاپ و تیک‌پرافیت روی خود صرافی live می‌مانند و حتی با بسته بودن برنامه محافظت می‌کنند. مطمئنید؟',
+        : `ربات با پول واقعی روی «${EXCHANGES[settings.realExchangeId]?.name ?? settings.realExchangeId}» شروع می‌شود! هر سیگنال = سفارش مارکت + استاپ + تیک‌پرافیت روی همین صرافی. استاپ و تیک‌پرافیت روی خود صرافی live می‌مانند و حتی با بسته بودن برنامه محافظت می‌کنند.\n\n(بک‌تست دمو اگر روشن است، مستقل و روشن می‌ماند — دو ربات به هم ربطی ندارند.) مطمئنید؟`,
       [
         { text: 'لغو', style: 'cancel' },
         {
           text: 'شروع',
           style: settings.mode === 'real' ? 'destructive' : 'default',
           onPress: () => {
-            void persist({ ...settings, enabled: true }).then(() => {
+            // v1.5.19 — فقط فلگِ همین مود روشن می‌شود؛ ربات دیگر دست‌نخورده می‌ماند
+            void persist(
+              settings.mode === 'demo' ? { ...settings, enabledDemo: true } : { ...settings, enabledReal: true }
+            ).then(() => {
               void runCycleAndRefresh();
             });
           },
@@ -747,7 +826,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
 
   // ── v1.5.12 — «گزینه اشتراک عکسو ذخیره هم ذخیره باشه» برای تقویم ۳۰ روزه:
   // اول عکس ساخته و در همان پیش‌نمایش نشان داده می‌شود؛ بعد ذخیره/اشتراک.
-  const handleMakeCalImage = async () => {
+  const handleMakeCalImage = async (cardRef: React.RefObject<View | null>) => {
     if (captureBusy) return;
     setCaptureBusy(true);
     try {
@@ -755,8 +834,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         ThemedAlert.alert('وب', 'خروجی عکس فقط روی گوشی (اندروید/iOS) پشتیبانی می‌شود.');
         return;
       }
-      if (!calCardRef.current) return;
-      const uri = await captureRef(calCardRef, { format: 'png', quality: 1, result: 'tmpfile' });
+      if (!cardRef.current) return;
+      const uri = await captureRef(cardRef, { format: 'png', quality: 1, result: 'tmpfile' });
       setPreviewKind('cal');
       setPreviewUri(uri);
     } catch {
@@ -880,10 +959,18 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     setPartialTarget(t);
   };
 
-  // v1.5.1 — نمایش سخت‌گیرانه: در هر حالت فقط داده‌های همان حالت (واقعی = بدون ریز دمو)
-  const hasAnyPosition = settings.mode === 'demo'
-    ? openPositions.length > 0 || positions.some((p) => p.status === 'closed')
-    : realOpen.length > 0 || realPositions.some((p) => p.status === 'closed');
+  // v1.5.21 — دو بخش دمو/واقعی هم‌زمان دیده می‌شوند؛ گیت نمایش = ربات روشن
+  // یا دادهٔ موجود در همان بخش (هر بخش مستقل معامله/اعلان/بروزرسانی خودش را دارد).
+  const hasAnyPosition =
+    settings.enabledDemo ||
+    settings.enabledReal ||
+    openPositions.length > 0 ||
+    positions.some((p) => p.status === 'closed') ||
+    realOpen.length > 0 ||
+    realPositions.some((p) => p.status === 'closed');
+
+  // v1.5.19 — ربات مودِ فعلی روشن است؟ (دمو و واقعی کلید مستقل دارند)
+  const modeEnabled = settings.mode === 'real' ? settings.enabledReal : settings.enabledDemo;
 
   // v1.5.2 — ROI٪ بر سرمایه اولیه (مثل خروجی فیوچرز بایننس)
   // (plain function, not a hook — placed after the early `!loaded` return)
@@ -1141,21 +1228,22 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     <View style={styles.card}>
       <Pressable style={styles.header} onPress={() => setShowDetail((v) => !v)}>
         <View style={styles.headerRight}>
-          <View style={[styles.headerIcon, settings.enabled && styles.headerIconActive]}>
-            <Bot size={16} color={settings.enabled ? colors.dark.background : colors.dark.accent} />
+          <View style={[styles.headerIcon, (settings.enabledDemo || settings.enabledReal) && styles.headerIconActive]}>
+            <Bot size={16} color={settings.enabledDemo || settings.enabledReal ? colors.dark.background : colors.dark.accent} />
           </View>
           <View>
             <Text style={styles.title}>معامله‌گر خودکار</Text>
+            {/* v1.5.19 — وضعیت دو رباتِ مستقل کنار هم */}
             <Text style={styles.subtitle}>
-              {settings.enabled
-                ? `${settings.mode === 'demo' ? 'دمو' : 'واقعی'} فعال • ${settings.mode === 'demo' ? `${openPositions.length}/${settings.maxOpenPositions} پوزیشن دمو` : `${realOpen.length} پوزیشن واقعی`} • همیشه روشن`
+              {settings.enabledDemo || settings.enabledReal
+                ? `${settings.enabledDemo ? 'دمو فعال' : 'دمو خاموش'} • ${settings.enabledReal ? 'واقعی فعال' : 'واقعی خاموش'} • همیشه روشن`
                 : 'کپی نهنگ‌ها + سیگنال اندیکاتورها — دمو یا واقعی'}
             </Text>
           </View>
         </View>
         <View style={styles.headerLeft}>
           {cycleBusy && <ActivityIndicator size="small" color={colors.dark.accent} />}
-          {settings.enabled ? (
+          {modeEnabled ? (
             <Square size={16} color={colors.dark.red} />
           ) : (
             <Play size={16} color={colors.dark.green} />
@@ -1163,7 +1251,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
         </View>
       </Pressable>
 
-      {(settings.enabled || showDetail) && (
+      {(modeEnabled || showDetail) && (
         <View style={styles.body}>
           {/* mode + enable */}
           <View style={styles.row}>
@@ -1172,16 +1260,27 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 <Pressable
                   key={m}
                   style={[styles.modeBtn, settings.mode === m && styles.modeBtnActive, m === 'real' && settings.mode === m && styles.modeBtnReal]}
-                  onPress={() => void persist({ ...settings, mode: m, enabled: settings.enabled && m === 'demo' ? settings.enabled : false })}
+                  onPress={() => void persist({ ...settings, mode: m })}
                 >
-                  <Text style={[styles.modeBtnText, settings.mode === m && styles.modeBtnTextActive]}>
-                    {m === 'demo' ? 'دمو' : 'واقعی'}
-                  </Text>
+                  <View style={styles.modeBtnInner}>
+                    <Text style={[styles.modeBtnText, settings.mode === m && styles.modeBtnTextActive]}>
+                      {m === 'demo' ? 'دمو' : 'واقعی'}
+                    </Text>
+                    {/* v1.5.19 — نقطهٔ وضعیت ربات همان مود (روشن/خاموش مستقل) */}
+                    <View style={[styles.modeDot, (m === 'demo' ? settings.enabledDemo : settings.enabledReal) && styles.modeDotOn]} />
+                  </View>
                 </Pressable>
               ))}
             </View>
-            {settings.enabled ? (
-              <Pressable style={styles.stopBtn} onPress={() => void persist({ ...settings, enabled: false })}>
+            {modeEnabled ? (
+              <Pressable
+                style={styles.stopBtn}
+                onPress={() =>
+                  void persist(
+                    settings.mode === 'demo' ? { ...settings, enabledDemo: false } : { ...settings, enabledReal: false }
+                  )
+                }
+              >
                 <Square size={12} color={colors.dark.red} />
                 <Text style={styles.stopBtnText}>توقف</Text>
               </Pressable>
@@ -1203,11 +1302,93 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               </Pressable>
             )}
           </View>
-          {settings.mode === 'real' && !realKeys && (
-            <Text style={styles.warn}>کلید API فیوچرز بایننس اضافه نشده — از تب «واقعی» اضافه کنید (برای دمو لازم نیست).</Text>
+          <Text style={styles.independenceHint}>
+            v1.5.19 — دو ربات کاملاً مستقل‌اند: استارت «واقعی» بک‌تست دمو را متوقف نمی‌کند و فعال‌کردن هر ربات دیگری هم دمو را نمی‌بندد؛ هر کدام فقط با دکمه خودش خاموش/روشن می‌شود.
+          </Text>
+          {settings.mode === 'real' && !isExchangeExecutable(settings.realExchangeId) && (
+            <Text style={styles.warn}>
+              اجرای ربات روی «{EXCHANGES[settings.realExchangeId]?.name ?? settings.realExchangeId}» هنوز فعال نشده — صرافی‌های دارای اجرای کامل: {executableExchangesLabel()}.
+            </Text>
           )}
-          {settings.mode === 'real' && realKeys && (
-            <Text style={styles.warnReal}>⚠ حالت واقعی: هر سیگنال با پول واقعی معامله می‌شود — استاپ/تیپی روی صرافی live می‌ماند.</Text>
+          {settings.mode === 'real' && isExchangeExecutable(settings.realExchangeId) && !selExchangeKeys && (
+            <Text style={styles.warn}>
+              کلید API {EXCHANGES[settings.realExchangeId]?.name ?? settings.realExchangeId} اضافه/فعال نشده — از تب «واقعی» اضافه کنید (برای دمو لازم نیست).
+            </Text>
+          )}
+          {settings.mode === 'real' &&
+            isExchangeExecutable(settings.realExchangeId) &&
+            selExchangeKeys &&
+            exchangeNeedsPassphrase(settings.realExchangeId) &&
+            !addedExchanges.find((e) => e.exchangeId === settings.realExchangeId)?.hasPassphrase && (
+              <Text style={styles.warn}>
+                کلید این صرافی به Passphrase هم نیاز دارد — در تب «واقعی» موقع افزودن/ویرایش صرافی، آن را وارد کنید.
+              </Text>
+            )}
+          {settings.mode === 'real' && isExchangeExecutable(settings.realExchangeId) && selExchangeKeys && (
+            <Text style={styles.warnReal}>
+              ⚠ حالت واقعی روی {EXCHANGES[settings.realExchangeId]?.name ?? settings.realExchangeId}: هر سیگنال با پول واقعی معامله می‌شود — استاپ/تیپی روی صرافی live می‌ماند.
+            </Text>
+          )}
+
+          {/* ── v1.5.19 — انتخاب صرافی اجرای ربات واقعی (کشویی) — از صرافی‌های
+              اضافه‌شده در تب «واقعی»؛ قبلاً همیشه بایننس اجباری بود. ── */}
+          {settings.mode === 'real' && (
+            <View style={styles.exBox}>
+              <Pressable style={styles.exHead} onPress={() => setExDropdownOpen((v) => !v)}>
+                <Text style={styles.exLabel}>
+                  صرافی اجرای ربات: {EXCHANGES[settings.realExchangeId]?.name ?? settings.realExchangeId}
+                </Text>
+                {exDropdownOpen ? (
+                  <ChevronUp size={14} color={colors.dark.accent} />
+                ) : (
+                  <ChevronDown size={14} color={colors.dark.accent} />
+                )}
+              </Pressable>
+              {exDropdownOpen && (
+                <View style={styles.exPanel}>
+                  {addedExchanges.length === 0 ? (
+                    <Text style={styles.exHint}>
+                      هنوز صرافی‌ای اضافه نکرده‌اید — در تب «واقعی» کلید API صرافی‌ها را اضافه کنید تا این‌جا برای انتخاب بیایند.
+                    </Text>
+                  ) : (
+                    addedExchanges.map((ex) => {
+                      const executable = isExchangeExecutable(ex.exchangeId);
+                      const selected = settings.realExchangeId === ex.exchangeId;
+                      return (
+                        <Pressable
+                          key={ex.exchangeId}
+                          style={[styles.exRow, selected && styles.exRowActive]}
+                          onPress={() => {
+                            setExDropdownOpen(false);
+                            void persist({ ...settings, realExchangeId: ex.exchangeId });
+                          }}
+                        >
+                          <View style={styles.exTexts}>
+                            <Text style={styles.exName} numberOfLines={1}>
+                              {EXCHANGES[ex.exchangeId]?.name ?? ex.exchangeId}
+                            </Text>
+                            <Text style={styles.exHint}>
+                              {executable
+                                ? 'پشتیبانی کامل ربات ✅'
+                                : 'اجرای ربات به‌زودی'}
+                              {ex.hasKeys ? ' • کلید اضافه شده' : ' • بدون کلید API'}
+                              {executable && exchangeNeedsPassphrase(ex.exchangeId)
+                                ? ex.hasPassphrase
+                                  ? ' • passphrase ✓'
+                                  : ' • بدون passphrase'
+                                : ''}
+                            </Text>
+                          </View>
+                          <View style={[styles.exCheck, selected && { backgroundColor: colors.dark.accent, borderColor: colors.dark.accent }]}>
+                            {selected && <Text style={styles.exCheckTick}>✓</Text>}
+                          </View>
+                        </Pressable>
+                      );
+                    })
+                  )}
+                </View>
+              )}
+            </View>
           )}
 
           {/* ── v1.5.8 — R2: «تنظیمات محاسبه‌گر (ذخیره‌شده)» — پریست‌هایی که
@@ -1264,7 +1445,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               )}
             </View>
           )}
-          {settings.enabled && (
+          {modeEnabled && (
             <View style={styles.engineBadge}>
               <ShieldCheck size={11} color={colors.dark.green} />
               <Text style={styles.engineBadgeText}>
@@ -1596,7 +1777,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     </Pressable>
                   ))}
                 </View>
-                {settings.mode === 'demo' ? (
+                {/* v1.5.21 — هر دو بلوک PnL هم‌زمان (هر بخش مستقل) */}
+                {(settings.enabledDemo || positions.length > 0) && (
                   <View style={styles.pnlModeBlock}>
                     <Text style={styles.pnlModeLabel}>دمو</Text>
                     {/* ردیف‌های بایننس‌مانند: سود/زیان دلاری + درصد ROI بر سرمایه اولیه */}
@@ -1607,7 +1789,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     <PnlRow label="موجودی فعلی (سرمایه اولیه + PNL)" value={settings.initialCapitalUsd + demoStats.realized + demoStats.open} pct={roiOf(demoStats.realized + demoStats.open)} bold />
                     {/* v1.5.6 — مارجین درگیر/آزاد (بازیابی از v1.5.4): «حجم مارجین
                         درگیر را هم نشون بده تا بدونم چقد آزاد دارم» */}
-                    <PnlRow label="مارجین درگیر (پوزیشن‌های باز)" value={engagedMarginUsd} neutral />
+                    <PnlRow label="مارجین درگیر (پوزیشن‌های باز)" value={demoEngagedMarginUsd} neutral />
                     <PnlRow
                       label="مارجین آزاد (قابل معامله)"
                       value={Math.max(0, settings.initialCapitalUsd + demoStats.realized - engagedMarginUsd)}
@@ -1621,8 +1803,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       ٪
                     </Text>
                   </View>
-                ) : null}
-                {settings.mode === 'real' && (
+                )}
+                {/* v1.5.21 — بلوک واقعی هم همیشه (هر بخش مستقل) */}
+                {(settings.enabledReal || realPositions.length > 0) && (
                   <View style={[styles.pnlModeBlock, styles.pnlModeBlockReal]}>
                     <Text style={styles.pnlModeLabel}>واقعی</Text>
                     <PnlRow label="PNL بسته‌شده" value={realStats.realized} pct={roiOf(realStats.realized)} />
@@ -1631,7 +1814,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     {/* v1.5.3 — موجودی = سرمایه اولیه ± PnL */}
                     <PnlRow label="موجودی فعلی (سرمایه اولیه + PNL)" value={settings.initialCapitalUsd + realStats.realized + realStats.open} pct={roiOf(realStats.realized + realStats.open)} bold />
                     {/* v1.5.6 — مارجین درگیر/آزاد در حالت واقعی (بازیابی از v1.5.4) */}
-                    <PnlRow label="مارجین درگیر (پوزیشن‌های باز)" value={engagedMarginUsd} neutral />
+                    <PnlRow label="مارجین درگیر (پوزیشن‌های باز)" value={realEngagedMarginUsd} neutral />
                     <PnlRow
                       label="مارجین آزاد (قابل معامله)"
                       value={Math.max(0, settings.initialCapitalUsd + realStats.realized - engagedMarginUsd)}
@@ -1658,27 +1841,26 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 </Pressable>
               </View>
 
-              {/* ── v1.5.12 — تقویم ۳۰ روزه سود/زیان (جدولی، تفکیک روزانه،
-                  با فلش باز/بسته + ساخت عکس برای ذخیره/اشتراک) ── */}
-              {hasAnyPosition && (
+              {/* ── v1.5.12 — تقویم ۳۰ روزه سود/زیان — v1.5.21: تقویم دمو و واقعی جدا و هم‌زمان ── */}
+              {(settings.enabledDemo || positions.some((p) => p.status === 'closed')) && (
                 <View style={styles.calBox}>
-                  <Pressable style={styles.calHead} onPress={() => setCalOpen((v) => !v)} testID="cal-toggle">
+                  <Pressable style={styles.calHead} onPress={() => setCalOpenDemo((v) => !v)} testID="cal-toggle">
                     <CalendarDays size={13} color={colors.dark.accent} />
                     <Text style={styles.calTitle}>
-                      تقویم ۳۰ روزه سود/زیان — {settings.mode === 'demo' ? 'دمو' : 'واقعی'}
+                      تقویم ۳۰ روزه سود/زیان — دمو
                     </Text>
                     <View style={styles.calHeadSpace} />
-                    {calOpen ? (
+                    {calOpenDemo ? (
                       <ChevronUp size={14} color={colors.dark.textMuted} />
                     ) : (
                       <ChevronDown size={14} color={colors.dark.textMuted} />
                     )}
                   </Pressable>
-                  {calOpen && (
+                  {calOpenDemo && (
                     <View>
-                      <View ref={calCardRef} collapsable={false} style={styles.calCard}>
+                      <View ref={calCardRefDemo} collapsable={false} style={styles.calCard}>
                         <Text style={styles.calCardTitle}>
-                          🤖 بک‌تست — تقویم ۳۰ روزه ({settings.mode === 'demo' ? 'دمو' : 'واقعی'})
+                          🤖 بک‌تست — تقویم ۳۰ روزه (دمو)
                         </Text>
                         <View style={[styles.calGridRow, styles.calGridHead]}>
                           <Text style={[styles.calCell, styles.calCellDate, styles.calCellHead]}>تاریخ</Text>
@@ -1722,7 +1904,84 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                         )}
                         <Text style={styles.calFooter}>PampDumpCoins • سود/زیان روزانه‌ی معاملات بسته‌شده در ۳۰ روز اخیر</Text>
                       </View>
-                      <Pressable style={styles.shareBtn} onPress={() => void handleMakeCalImage()} disabled={captureBusy} testID="cal-make-image">
+                      <Pressable style={styles.shareBtn} onPress={() => void handleMakeCalImage(calCardRefDemo)} disabled={captureBusy} testID="cal-make-image">
+                        {captureBusy ? (
+                          <ActivityIndicator size="small" color={colors.dark.background} />
+                        ) : (
+                          <Camera size={13} color={colors.dark.background} />
+                        )}
+                        <Text style={styles.shareBtnText}>ساخت عکس تقویم (پیش‌نمایش)</Text>
+                      </Pressable>
+                    </View>
+                  )}
+                </View>
+              )}
+
+              {/* ── v1.5.12 — تقویم ۳۰ روزه سود/زیان (جدولی، تفکیک روزانه،
+                  با فلش باز/بسته + ساخت عکس برای ذخیره/اشتراک) ── */}
+              {(settings.enabledReal || realPositions.some((p) => p.status === 'closed')) && (
+                <View style={styles.calBox}>
+                  <Pressable style={styles.calHead} onPress={() => setCalOpenDemo((v) => !v)} testID="cal-toggle-real">
+                    <CalendarDays size={13} color={colors.dark.accent} />
+                    <Text style={styles.calTitle}>
+                      تقویم ۳۰ روزه سود/زیان — واقعی
+                    </Text>
+                    <View style={styles.calHeadSpace} />
+                    {calOpenReal ? (
+                      <ChevronUp size={14} color={colors.dark.textMuted} />
+                    ) : (
+                      <ChevronDown size={14} color={colors.dark.textMuted} />
+                    )}
+                  </Pressable>
+                  {calOpenReal && (
+                    <View>
+                      <View ref={calCardRefReal} collapsable={false} style={styles.calCard}>
+                        <Text style={styles.calCardTitle}>
+                          🤖 بک‌تست — تقویم ۳۰ روزه (واقعی)
+                        </Text>
+                        <View style={[styles.calGridRow, styles.calGridHead]}>
+                          <Text style={[styles.calCell, styles.calCellDate, styles.calCellHead]}>تاریخ</Text>
+                          <Text style={[styles.calCell, styles.calCellHead]}>معاملات</Text>
+                          <Text style={[styles.calCell, styles.calCellHead]}>سود</Text>
+                          <Text style={[styles.calCell, styles.calCellHead]}>ضرر</Text>
+                          <Text style={[styles.calCell, styles.calCellHead]}>خالص</Text>
+                        </View>
+                        {realCalendarRows.map((r) => (
+                          <View key={r.key} style={styles.calGridRow}>
+                            <Text style={[styles.calCell, styles.calCellDate]}>{r.label}</Text>
+                            <Text style={styles.calCell}>{r.trades.toLocaleString('fa-IR')}</Text>
+                            <Text style={[styles.calCell, { color: r.profit > 0 ? colors.dark.green : colors.dark.textMuted }]}>
+                              +${r.profit.toFixed(2)}
+                            </Text>
+                            <Text style={[styles.calCell, { color: r.loss < 0 ? colors.dark.red : colors.dark.textMuted }]}>
+                              −${Math.abs(r.loss).toFixed(2)}
+                            </Text>
+                            <Text style={[styles.calCell, styles.calCellNet, { color: r.net >= 0 ? colors.dark.green : colors.dark.red }]}>
+                              {r.net >= 0 ? '+' : '−'}${Math.abs(r.net).toFixed(2)}
+                            </Text>
+                          </View>
+                        ))}
+                        {realCalendarRows.length === 0 && (
+                          <Text style={styles.calEmpty}>در ۳۰ روز اخیر معامله‌ی بسته‌شده‌ای نیست.</Text>
+                        )}
+                        {realCalendarRows.length > 0 && (
+                          <View style={[styles.calGridRow, styles.calGridTotal]}>
+                            <Text style={[styles.calCell, styles.calCellDate, styles.calCellTotalLabel]}>مجموع ۳۰ روز</Text>
+                            <Text style={[styles.calCell, styles.calCellTotalLabel]}>{realCalTotals.trades.toLocaleString('fa-IR')}</Text>
+                            <Text style={[styles.calCell, { color: realCalTotals.profit > 0 ? colors.dark.green : colors.dark.textMuted }]}>
+                              +${realCalTotals.profit.toFixed(2)}
+                            </Text>
+                            <Text style={[styles.calCell, { color: realCalTotals.loss < 0 ? colors.dark.red : colors.dark.textMuted }]}>
+                              −${Math.abs(realCalTotals.loss).toFixed(2)}
+                            </Text>
+                            <Text style={[styles.calCell, styles.calCellNet, { color: realCalTotals.net >= 0 ? colors.dark.green : colors.dark.red }]}>
+                              {realCalTotals.net >= 0 ? '+' : '−'}${Math.abs(realCalTotals.net).toFixed(2)}
+                            </Text>
+                          </View>
+                        )}
+                        <Text style={styles.calFooter}>PampDumpCoins • سود/زیان روزانه‌ی معاملات بسته‌شده در ۳۰ روز اخیر</Text>
+                      </View>
+                      <Pressable style={styles.shareBtn} onPress={() => void handleMakeCalImage(calCardRefReal)} disabled={captureBusy} testID="cal-make-image-real">
                         {captureBusy ? (
                           <ActivityIndicator size="small" color={colors.dark.background} />
                         ) : (
@@ -1898,8 +2157,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             </Pressable>
           </Modal>
 
-          {/* demo positions — فقط حالت دمو (در واقعی، ریز معاملات دمو نمایش داده نمی‌شود) */}
-          {settings.mode === 'demo' && (
+          {/* v1.5.21 — پوزیشن‌های دمو همیشه دیده می‌شوند (حتی وقتی ربات واقعی روشن است) */}
+          {(settings.enabledDemo || positions.length > 0) && (
             <View style={styles.sourceBox}>
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={totalPnl >= 0 ? colors.dark.green : colors.dark.red} />
@@ -2139,8 +2398,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             </View>
           )}
 
-          {/* real positions (tracked by the engine) — فقط حالت واقعی */}
-          {settings.mode === 'real' && realKeys && (
+          {/* v1.5.21 — پوزیشن‌های واقعی هم همیشه دیده می‌شوند (مستقل از مود کارت) */}
+          {(settings.enabledReal || realPositions.length > 0) && (
             <View style={styles.sourceBox}>
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={realTotalPnl >= 0 ? colors.dark.green : colors.dark.red} />
@@ -2518,6 +2777,96 @@ const styles = StyleSheet.create({
   },
   modeBtnTextActive: {
     color: colors.dark.background,
+  },
+  // v1.5.19 — نقطهٔ وضعیت کنار اسم مود (روشن/خاموشِ مستقل هر ربات)
+  modeBtnInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+  },
+  modeDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: colors.dark.textMuted,
+  },
+  modeDotOn: {
+    backgroundColor: colors.dark.green,
+  },
+  // v1.5.19 — یادداشت استقلال دو ربات
+  independenceHint: {
+    fontSize: 9.5,
+    color: colors.dark.textSecondary,
+    lineHeight: 14,
+    marginTop: 6,
+    marginBottom: 4,
+  },
+  // v1.5.19 — dropdown انتخاب صرافی اجرای ربات واقعی
+  exBox: {
+    backgroundColor: colors.dark.background,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    padding: 8,
+    marginBottom: 8,
+  },
+  exHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 6,
+  },
+  exLabel: {
+    flex: 1,
+    fontSize: 11,
+    fontWeight: '800',
+    color: colors.dark.text,
+  },
+  exPanel: {
+    marginTop: 6,
+    gap: 4,
+  },
+  exRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: colors.dark.surface,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    padding: 8,
+  },
+  exRowActive: {
+    borderColor: colors.dark.accent + '66',
+    backgroundColor: colors.dark.accent + '0D',
+  },
+  exTexts: {
+    flex: 1,
+  },
+  exName: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: colors.dark.text,
+  },
+  exHint: {
+    fontSize: 9,
+    color: colors.dark.textSecondary,
+    marginTop: 2,
+    lineHeight: 13,
+  },
+  exCheck: {
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    borderWidth: 1.5,
+    borderColor: colors.dark.textMuted,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  exCheckTick: {
+    fontSize: 10,
+    color: colors.dark.background,
+    fontWeight: '900',
   },
   startBtn: {
     flexDirection: 'row',

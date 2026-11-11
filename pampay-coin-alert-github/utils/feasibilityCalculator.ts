@@ -34,16 +34,33 @@ export interface ExchangeFeeProfile {
  * (۲۰۲۵/۲۰۲۶). اعداد تقریبی‌اند و در UI هم قابل ویرایش‌اند؛ توکن صرافی
  * (BNB/BGB/MX…) معمولاً ۱۰-۲۰٪ تخفیف می‌دهد.
  */
+/**
+ * کارمزد فیوچرز USDT-M سطح عادی (VIP0) — منبع: صفحه رسمی کارمزد هر صرافی
+ * (۲۰۲۵/۲۰۲۶). اعداد تقریبی‌اند و در UI هم قابل ویرایش‌اند؛ توکن صرافی
+ * (BNB/BGB/MX…) معمولاً ۱۰-۲۰٪ تخفیف می‌دهد.
+ *
+ * v1.5.19 — «همه صرافی‌ها را اضاف کن که بتونم رو اون صرافی محاسبه کنم»:
+ * کل صرافی‌های فیوچرز پشتیبانی‌شدهٔ برنامه (constants/exchanges) + هایپرلیکوئید
+ * + گزینهٔ دستی. UI با منوی کشویی نمایش می‌دهد.
+ */
 export const EXCHANGE_FEE_PROFILES: ExchangeFeeProfile[] = [
   { id: 'binance', name: 'بایننس (Binance)', takerPercent: 0.05, makerPercent: 0.02, note: 'با پرداخت کارمزد با BNB حدود ۱۰٪ ارزان‌تر' },
   { id: 'bybit', name: 'بای‌بیت (Bybit)', takerPercent: 0.055, makerPercent: 0.02 },
-  { id: 'okx', name: 'OKX', takerPercent: 0.05, makerPercent: 0.02 },
+  { id: 'okx', name: 'اوکی‌اکس (OKX)', takerPercent: 0.05, makerPercent: 0.02 },
   { id: 'kucoin', name: 'کوکوین (KuCoin)', takerPercent: 0.06, makerPercent: 0.02 },
   { id: 'bitget', name: 'بیت‌گت (Bitget)', takerPercent: 0.06, makerPercent: 0.02, note: 'توکن BGB تخفیف می‌دهد' },
   { id: 'gateio', name: 'گیت (Gate.io)', takerPercent: 0.05, makerPercent: 0.02 },
   { id: 'mexc', name: 'مکسی (MEXC)', takerPercent: 0.06, makerPercent: 0.02, note: 'گاهی پروموشن کارمزد صفر دارد' },
-  { id: 'lbank', name: 'البانک (LBank)', takerPercent: 0.05, makerPercent: 0.02 },
-  { id: 'xt', name: 'XT.com', takerPercent: 0.05, makerPercent: 0.02 },
+  { id: 'bingx', name: 'بینگ‌ایکس (BingX)', takerPercent: 0.05, makerPercent: 0.02 },
+  { id: 'toobit', name: 'توبیت (Toobit)', takerPercent: 0.06, makerPercent: 0.02 },
+  { id: 'bitunix', name: 'بیتیونیکس (Bitunix)', takerPercent: 0.05, makerPercent: 0.02 },
+  { id: 'htx', name: 'اچ‌تی‌ایکس (HTX)', takerPercent: 0.05, makerPercent: 0.02 },
+  { id: 'coinex', name: 'کوینکس (CoinEx)', takerPercent: 0.05, makerPercent: 0.02 },
+  { id: 'xt', name: 'ایکس‌تی (XT.com)', takerPercent: 0.05, makerPercent: 0.02 },
+  { id: 'lbank', name: 'ال‌بانک (LBank)', takerPercent: 0.06, makerPercent: 0.02 },
+  { id: 'phemex', name: 'فیمکس (Phemex)', takerPercent: 0.06, makerPercent: 0.02 },
+  { id: 'superex', name: 'سوپراکس (SuperEx)', takerPercent: 0.06, makerPercent: 0.02 },
+  { id: 'bitmart', name: 'بیت‌مارت (BitMart)', takerPercent: 0.06, makerPercent: 0.02 },
   { id: 'hyperliquid', name: 'هایپرلیکوئید (Hyperliquid)', takerPercent: 0.045, makerPercent: 0.015 },
   { id: 'custom', name: 'سایر / دستی', takerPercent: 0.05, makerPercent: 0.02, note: 'کارمزد را خودتان وارد کنید' },
 ];

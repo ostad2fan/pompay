@@ -9,7 +9,7 @@
  */
 
 import React, { useMemo, useState } from 'react';
-import { View, Text, StyleSheet, Pressable, TextInput, Switch, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, Pressable, TextInput, Switch, ActivityIndicator, ScrollView } from 'react-native';
 import { Calculator, ChevronDown, ChevronUp, CheckCircle2, XCircle, Save, Rocket } from 'lucide-react-native';
 import colors from '@/constants/colors';
 import { ThemedAlert } from '@/components/ThemedAlert';
@@ -63,6 +63,8 @@ function NumInput({ label, value, onChange, suffix, hint }: NumField) {
 export default function FeasibilityCalculator() {
   const [open, setOpen] = useState(false);
   const [exchangeId, setExchangeId] = useState('binance');
+  /** v1.5.19 — dropdown صرافی‌ها (به‌جای چیپ‌های اسکرولی — نمایش بهتر با لیست کامل صرافی‌ها) */
+  const [exOpen, setExOpen] = useState(false);
   const [strategy, setStrategy] = useState<TradingStrategy>('scalper');
   const [tradesPerDay, setTradesPerDay] = useState('10');
   const [leverage, setLeverage] = useState('7');
@@ -221,24 +223,46 @@ export default function FeasibilityCalculator() {
         </Text>
       ) : (
         <>
-          {/* انتخاب صرافی */}
+          {/* v1.5.19 — انتخاب صرافی: منوی کشویی با «همه» صرافی‌ها (۱۸ صرافی + دستی)
+              — قبلاً چیپ‌های اسکرولی با لیست محدود بود. */}
           <Text style={styles.sectionLabel}>صرافی</Text>
-          <View style={styles.chipRow}>
-            {EXCHANGE_FEE_PROFILES.map((e) => (
-              <Pressable
-                key={e.id}
-                style={[styles.chip, exchangeId === e.id && styles.chipActive]}
-                onPress={() => {
-                  setExchangeId(e.id);
-                  setTakerText('');
-                }}
-              >
-                <Text style={[styles.chipText, exchangeId === e.id && styles.chipTextActive]} numberOfLines={1}>
-                  {e.name}
-                </Text>
-              </Pressable>
-            ))}
-          </View>
+          <Pressable style={styles.exDropdownBtn} onPress={() => setExOpen((v) => !v)}>
+            <Text style={styles.exDropdownText} numberOfLines={1}>
+              {exchange.name} — تیکر {exchange.takerPercent}٪ / میکر {exchange.makerPercent}٪
+            </Text>
+            {exOpen ? (
+              <ChevronUp size={14} color={colors.dark.accent} />
+            ) : (
+              <ChevronDown size={14} color={colors.dark.accent} />
+            )}
+          </Pressable>
+          {exOpen && (
+            <View style={styles.exDropdownPanel}>
+              <ScrollView style={styles.exDropdownScroll} nestedScrollEnabled showsVerticalScrollIndicator>
+                {EXCHANGE_FEE_PROFILES.map((e) => {
+                  const active = exchangeId === e.id;
+                  return (
+                    <Pressable
+                      key={e.id}
+                      style={[styles.exDropdownRow, active && styles.exDropdownRowActive]}
+                      onPress={() => {
+                        setExchangeId(e.id);
+                        setTakerText('');
+                        setExOpen(false);
+                      }}
+                    >
+                      <Text style={[styles.exDropdownRowText, active && styles.exDropdownRowTextActive]} numberOfLines={1}>
+                        {e.name}
+                      </Text>
+                      <Text style={styles.exDropdownRowFee}>
+                        تیکر {e.takerPercent}٪ / میکر {e.makerPercent}٪
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            </View>
+          )}
           <Text style={styles.feeNote}>
             کارمزد تیکر: {exchange.takerPercent}٪ • میکر: {exchange.makerPercent}٪{exchange.note ? ` • ${exchange.note}` : ''} — سطح عادی (VIP0)؛ اگر کارمزد شما فرق دارد در کادر زیر بنویسید.
           </Text>
@@ -472,6 +496,62 @@ const styles = StyleSheet.create({
     color: colors.dark.accent,
     marginTop: 10,
     marginBottom: 6,
+  },
+  // v1.5.19 — dropdown صرافی‌ها (لیست کامل با اسکرول)
+  exDropdownBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 6,
+    backgroundColor: colors.dark.background,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    paddingVertical: 9,
+    paddingHorizontal: 10,
+  },
+  exDropdownText: {
+    flex: 1,
+    fontSize: 11,
+    fontWeight: '800',
+    color: colors.dark.text,
+  },
+  exDropdownPanel: {
+    marginTop: 4,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.dark.cardBorder,
+    backgroundColor: colors.dark.surface,
+    overflow: 'hidden',
+  },
+  exDropdownScroll: {
+    maxHeight: 220,
+  },
+  exDropdownRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.dark.cardBorder,
+  },
+  exDropdownRowActive: {
+    backgroundColor: colors.dark.accent + '14',
+  },
+  exDropdownRowText: {
+    flex: 1,
+    fontSize: 10.5,
+    fontWeight: '700',
+    color: colors.dark.text,
+  },
+  exDropdownRowTextActive: {
+    color: colors.dark.accent,
+  },
+  exDropdownRowFee: {
+    fontSize: 9,
+    color: colors.dark.textSecondary,
   },
   chipRow: {
     flexDirection: 'row',

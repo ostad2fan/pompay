@@ -1490,10 +1490,38 @@ export async function getAutoTradeStateFor(secret: string): Promise<{ status: nu
 // sync می‌شود تا سیگنالِ قبلاً معامله‌شده دوباره باز نشود.
 // ---------------------------------------------------------------------------
 
-function mergeById<T extends { id: string }>(local: T[], incoming: T[]): T[] {
+// v1.5.21 — «بسته‌شدن، قطعی است» (ریشهٔ «اعلان بسته‌شدن می‌آید ولی اپ باز نشون
+// می‌دهد»): قبلاً نسخهٔ اپ روی id مشترک «بی‌قید و شرط» برنده بود؛ نتیجه:
+// سرور پوزیشن را می‌بست و اعلان می‌فرستاد → heartbeat بعدی نسخهٔ «بازِ» قدیمی
+// اپ را روی سرور برمی‌گرداند → سرور دوباره می‌بست و دوباره اعلان می‌داد و state
+// مدام بین باز/بسته نوسان می‌کرد. حالا مثل سمت اپ (v1.5.11):
+//   • نسخهٔ «بسته» همیشه برنده است (از هر طرف) — بسته‌شدن برگشت‌پذیر نیست.
+//   • بین دو «بسته»: جدیدترین closedAt.
+//   • بین دو «باز»: نسخهٔ اپ (MTM تازه‌تر دارد).
+function mergeById<T extends { id: string; status?: string; closedAt?: number }>(local: T[], incoming: T[]): T[] {
   const byId = new Map<string, T>();
   for (const p of local) byId.set(p.id, p);
-  for (const p of incoming) byId.set(p.id, p); // incoming (app) wins on same id
+  for (const p of incoming) {
+    const l = byId.get(p.id);
+    if (!l) {
+      byId.set(p.id, p);
+      continue;
+    }
+    const lClosed = l.status === "closed";
+    const pClosed = p.status === "closed";
+    if (lClosed && !pClosed) continue; // بسته‌شدن قطعی است — نسخهٔ باز اپ رد می‌شود
+    if (!lClosed && pClosed) {
+      byId.set(p.id, p); // اپ بسته است — واقعیت نهایی
+      continue;
+    }
+    if (lClosed && pClosed) {
+      const lAt = typeof l.closedAt === "number" ? l.closedAt : 0;
+      const pAt = typeof p.closedAt === "number" ? p.closedAt : 0;
+      if (pAt >= lAt) byId.set(p.id, p);
+      continue;
+    }
+    byId.set(p.id, p); // هر دو باز — نسخهٔ اپ (تازه‌تر)
+  }
   return [...byId.values()];
 }
 

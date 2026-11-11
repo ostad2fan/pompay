@@ -48,18 +48,14 @@ import {
   fetchAccountState,
   parsePositions,
 } from './hyperliquidApi';
-import {
-  closePosition as closeRealPosition,
-  closePartialPosition,
-  getPositions,
-  openRealPosition,
-  updateStopLoss,
-  updateTakeProfit,
-} from './binanceFuturesTrading';
+// v1.5.19 — اجرای واقعی دیگر مستقیم به بایننس گره نیست: همهٔ عملیات از
+// لایهٔ آداپتور (./exchangeFutures) با «صرافی انتخابی» کار می‌کند.
 import { getUserIndicators, scanCustomIndicators } from './customIndicatorsService';
 import { getStoredHookSignals } from './hookReversalService';
 import { getStoredGainzAlgoSignals } from './gainzAlgoService';
 import { getServerUrl, getInstallSecret } from './scanServerApi';
+import { futuresAdapterFor } from './exchangeFutures';
+import type { ExchangeId } from '@/types/crypto';
 import { mergePositionsById } from './autoMerge';
 
 // ---------------------------------------------------------------------------
@@ -138,8 +134,18 @@ export interface BotModeParams {
 }
 
 export interface AutoTradeSettings {
+  /** deprecated (v1.5.18-) — فلگ قدیمی «رباتِ مود فعلی روشن است»؛ save همیشه
+   *  آن را با فلگ مود فعلی همگام می‌کند تا کدهای قدیمی/سرور درست بمانند. */
   enabled: boolean;
   mode: AutoMode;
+  /** v1.5.19 — ربات دمو مستقل: روشن/خاموشِ خودش (تأثیری از ربات واقعی ندارد). */
+  enabledDemo: boolean;
+  /** v1.5.19 — ربات واقعی مستقل: روشن/خاموشِ خودش؛ استارت آن بک‌تست دمو را
+   *  متوقف نمی‌کند (و برعکس) — هر کدام فقط با دکمه خودش مدیریت می‌شود. */
+  enabledReal: boolean;
+  /** v1.5.19 — صرافیِ اجرای ربات واقعی: انتخاب از صرافی‌های اضافه‌شده در
+   *  تب «واقعی» (قبلاً همیشه بایننس اجباری بود). */
+  realExchangeId: ExchangeId;
   whale: AutoWhaleSource;
   indicators: AutoIndicatorSource;
   /** v1.5.13 — پارامترهای حالت دمو (مستقل). */
@@ -383,6 +389,9 @@ const BACKFILL_SEEN_CAP = 600;
 export const DEFAULT_AUTO_SETTINGS: AutoTradeSettings = {
   enabled: false,
   mode: 'demo',
+  enabledDemo: false,
+  enabledReal: false,
+  realExchangeId: 'binance',
   whale: { enabled: false, address: '', label: '', mirrorSide: true },
   indicators: { enabled: false, selections: [] },
   demo: defaultModeParams(),
@@ -450,6 +459,18 @@ export async function loadAutoSettings(): Promise<AutoTradeSettings> {
     });
     merged.demo = sanitizeParams(legacyP, parsed.demo);
     merged.real = sanitizeParams(legacyP, parsed.real);
+    // v1.5.19 — مهاجرت دو ربات مستقل: از فلگ قدیمیِ واحد (enabled+mode) یک‌بار
+    // فلگ مود همان مود گرفته می‌شود؛ از این به بعد هر ربات کلید خودش را دارد
+    // (استارت واقعی دیگر دمو را نمی‌کُشد و برعکس).
+    const legacyOn = parsed.enabled === true;
+    merged.enabledDemo =
+      typeof parsed.enabledDemo === 'boolean' ? parsed.enabledDemo : legacyOn && merged.mode !== 'real';
+    merged.enabledReal =
+      typeof parsed.enabledReal === 'boolean' ? parsed.enabledReal : legacyOn && merged.mode === 'real';
+    merged.realExchangeId =
+      typeof parsed.realExchangeId === 'string' && parsed.realExchangeId
+        ? (parsed.realExchangeId as ExchangeId)
+        : 'binance';
     // v1.5.7 — حذف مهاجرتِ «خاموش‌کردن قهوه‌ای server247» (v1.5.5): کاربر
     // می‌خواهد اعلان‌های بک‌تست با برنامه بسته هم در تلگرام بیاید (مثل
     // اسکنرهای میم‌کوین). حالت ۲۴/۷ دیگر سوییچ دستی نیست؛ وقتی ربات روشن
@@ -488,10 +509,14 @@ export async function saveAutoSettings(input: AutoTradeSettings): Promise<void> 
   // v1.5.13 — قبل از ذخیره، فلت با پارامترهای «حالت فعلی» همگام می‌شود تا
   // موتور/سرور/سرور-قدیمی همیشه پارامترهای درست حالت فعال را ببینند.
   const s = syncFlatParams(input);
-  await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  // v1.5.19 — فلگ قدیمی enabled = فلگِ مود فعلی (ربات دمو و واقعی مستقل‌اند؛
+  // کدهای قدیمی/سرور که فقط enabled را می‌خوانند همچنان درست کار می‌کنند).
+  const legacy = s.mode === 'real' ? s.enabledReal : s.enabledDemo;
+  const out: AutoTradeSettings = { ...s, enabled: legacy };
+  await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(out));
   for (const cb of autoSettingsListeners) {
     try {
-      cb(s);
+      cb(out);
     } catch {}
   }
 }
@@ -1076,12 +1101,16 @@ async function partialCloseReal(
   pos: RealAutoPosition,
   price: number,
   fraction: number,
-  reason: 'partial' | 'partial-manual'
+  reason: 'partial' | 'partial-manual',
+  exchangeId?: ExchangeId
 ): Promise<boolean> {
   const closedQty = pos.qty * Math.max(0.1, Math.min(0.9, fraction));
   if (!(closedQty > 0)) return false;
   try {
-    await closePartialPosition(keys.apiKey, keys.apiSecret, `${pos.symbol}USDT`, pos.side, closedQty);
+    // v1.5.19 — بستن کسری از طریق آداپتور صرافی انتخابی
+    const adapter = futuresAdapterFor(exchangeId);
+    if (!adapter) return false;
+    await adapter.closePartial(keys, `${pos.symbol}USDT`, pos.side, Math.max(0.1, Math.min(0.9, fraction)));
   } catch {
     return false;
   }
@@ -1438,7 +1467,8 @@ async function openDemoBackfill(
 }
 
 async function backfillDemoPositions(settings: AutoTradeSettings, prices: Record<string, number>): Promise<number> {
-  if (settings.mode !== 'demo' || !settings.enabled) return 0;
+  // v1.5.19 — بک‌فیل مال ربات دمو است: فقط وقتی «ربات دمو» روشن است (مستقل).
+  if (!settings.enabledDemo) return 0;
   const positions = await loadDemoPositions();
   const openCount = positions.filter((p) => p.status === 'open').length;
   const free = settings.maxOpenPositions - openCount;
@@ -1534,18 +1564,59 @@ async function backfillDemoPositions(settings: AutoTradeSettings, prices: Record
 export interface RealKeys {
   apiKey: string;
   apiSecret: string;
+  /** v1.5.20 — OKX/بیتگت/کوکوین برای امضا به passphrase هم نیاز دارند. */
+  passphrase?: string;
 }
 
-/** v1.5.0 — real keys straight from the exchange-config storage (global engine). */
-export async function loadRealKeys(): Promise<RealKeys | undefined> {
+/** v1.5.0 — real keys straight from the exchange-config storage (global engine).
+ *  v1.5.19 — exchangeId اختیاری: ربات واقعی روی «صرافی انتخابی» کار می‌کند
+ *  (هر صرافیِ اضافه‌شده در تب «واقعی» قابل انتخاب است؛ بدون پارامتر = بایننس).
+ *  v1.5.20 — passphrase صرافی‌هایی که لازم دارند هم برگردانده می‌شود. */
+export async function loadRealKeys(exchangeId?: ExchangeId): Promise<RealKeys | undefined> {
   try {
     const raw = await AsyncStorage.getItem(EXCHANGE_CONFIGS_KEY);
     if (!raw) return undefined;
-    const arr = JSON.parse(raw) as { exchangeId: string; apiKey: string; apiSecret: string; enabled: boolean }[];
-    const binance = arr.find((e) => e.enabled && e.exchangeId === 'binance' && e.apiKey && e.apiSecret);
-    return binance ? { apiKey: binance.apiKey, apiSecret: binance.apiSecret } : undefined;
+    const arr = JSON.parse(raw) as {
+      exchangeId: string;
+      apiKey: string;
+      apiSecret: string;
+      passphrase?: string;
+      enabled: boolean;
+    }[];
+    const want = exchangeId ?? 'binance';
+    const cfg = arr.find((e) => e.enabled && e.exchangeId === want && e.apiKey && e.apiSecret);
+    if (!cfg) return undefined;
+    return { apiKey: cfg.apiKey, apiSecret: cfg.apiSecret, passphrase: cfg.passphrase };
   } catch {
     return undefined;
+  }
+}
+
+/** v1.5.19 — صرافی‌هایی که کاربر در تب «واقعی» اضافه کرده (برای dropdown ربات). */
+export async function listAddedExchangeConfigs(): Promise<
+  { exchangeId: ExchangeId; hasKeys: boolean; hasPassphrase: boolean; enabled: boolean }[]
+> {
+  try {
+    const raw = await AsyncStorage.getItem(EXCHANGE_CONFIGS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw) as {
+      exchangeId: string;
+      apiKey: string;
+      apiSecret: string;
+      passphrase?: string;
+      enabled: boolean;
+    }[];
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((e) => e && typeof e.exchangeId === 'string')
+      .map((e) => ({
+        exchangeId: e.exchangeId as ExchangeId,
+        hasKeys: !!(e.apiKey && e.apiSecret),
+        hasPassphrase: !!e.passphrase,
+        enabled: e.enabled === true,
+      }));
+  } catch {
+    return [];
   }
 }
 
@@ -1566,9 +1637,14 @@ async function openReal(
   const { stopPrice, takePrice } = computeStopTake(side, price, settings.maxLossPercent, settings.rewardRatio, settings.leverage);
   // v1.5.13 — برچسب استراتژی «واقعی» (لیست هر مود جداست)
   const strategyName = await currentStrategyLabel('real');
-  await openRealPosition(
-    keys.apiKey,
-    keys.apiSecret,
+  // v1.5.19 — اجرا روی صرافی انتخابی (بایننس همان مسیر قبلی؛ بای‌بیت V5؛
+  // بقیه صرافی‌ها هنوز «به‌زودی» هستند و قبل از استارت رد می‌شوند).
+  const adapter = futuresAdapterFor(settings.realExchangeId);
+  if (!adapter) {
+    throw new Error(`اجرای ربات روی این صرافی هنوز فعال نیست (به‌زودی)`);
+  }
+  await adapter.openMarket(
+    keys,
     `${symbol}USDT`,
     side,
     sizeUsd,
@@ -1615,10 +1691,19 @@ async function openReal(
   return pos;
 }
 
-async function closeReal(keys: RealKeys, symbol: string, side: 'long' | 'short', reason: string): Promise<void> {
-  // closePosition takes positionAmt (signed) — long = +, short = −
-  const positionAmt = side === 'long' ? 1 : -1;
-  await closeRealPosition(keys.apiKey, keys.apiSecret, `${symbol}USDT`, positionAmt);
+async function closeReal(
+  keys: RealKeys,
+  symbol: string,
+  side: 'long' | 'short',
+  reason: string,
+  exchangeId?: ExchangeId
+): Promise<void> {
+  // v1.5.19 — بستن کامل از طریق آداپتور صرافی انتخابی. قبلاً اندازهٔ پوزیشن
+  // از صرافی خوانده نمی‌شد (±1 نمادین) و روی بایننس برای هر نمادی که qty≠1
+  // بود سفارش بسته‌شدن رد می‌شد؛ حالا اندازهٔ واقعی از خود صرافی گرفته می‌شود.
+  const adapter = futuresAdapterFor(exchangeId);
+  if (!adapter) throw new Error('اجرای ربات روی این صرافی هنوز فعال نیست (به‌زودی)');
+  await adapter.closeAll(keys, `${symbol}USDT`, side);
   await appendLog('close', `بستن واقعی ${symbol} (${side === 'long' ? 'لانگ' : 'شورت'}) — ${reason}`);
 }
 
@@ -1637,9 +1722,15 @@ async function manageRealPositions(
   const tracked = await loadRealPositions();
   const openTracked = tracked.filter((p) => p.status === 'open');
   if (openTracked.length === 0) return { closed, errors };
+  // v1.5.19 — همهٔ خواندن‌ها/نوشتن‌های صرافی از آداپتور «صرافی انتخابی».
+  const adapter = futuresAdapterFor(settings.realExchangeId);
+  if (!adapter) {
+    errors.push('اجرای ربات روی این صرافی هنوز فعال نیست (به‌زودی)');
+    return { closed, errors };
+  }
   let live: { symbol: string; positionAmt: string; markPrice: string }[];
   try {
-    live = await getPositions(keys.apiKey, keys.apiSecret);
+    live = await adapter.listPositions(keys);
   } catch (e) {
     errors.push(`پوزیشن‌های واقعی: ${e instanceof Error ? e.message.slice(0, 60) : 'خطا'}`);
     return { closed, errors };
@@ -1680,7 +1771,7 @@ async function manageRealPositions(
     const done = tracked[i].partialsDone ?? 0;
     if (done < PARTIAL_TAKE_PNL_PCTS.length && marginPct >= PARTIAL_TAKE_PNL_PCTS[done]) {
       await saveRealPositions(tracked);
-      await partialCloseReal(keys, tracked[i], mark, 0.5, 'partial');
+      await partialCloseReal(keys, tracked[i], mark, 0.5, 'partial', settings.realExchangeId);
       const fresh = await loadRealPositions();
       tracked.length = 0;
       tracked.push(...fresh);
@@ -1696,13 +1787,15 @@ async function manageRealPositions(
     tracked[i].trailArmed = tr.armed;
     if (tr.changed) {
       try {
-        await updateStopLoss(
-          keys.apiKey,
-          keys.apiSecret,
+        // v1.5.19 — آپدیت استاپ روی صرافی انتخابی (بایننس: لغو SL قبلی +
+        // SL جدید؛ بای‌بیت: trading-stop). TP هم فرستاده می‌شود تا بی‌دفاع نماند.
+        await adapter.updateTradingStop(
+          keys,
           `${p.symbol}USDT`,
           p.side,
-          liveQty > 0 ? liveQty : p.qty,
-          Number(tr.newStop.toFixed(6))
+          Number(tr.newStop.toFixed(6)),
+          tracked[i].takePrice,
+          liveQty
         );
         await appendLog('info', `تریلینگ استاپ واقعی ${p.symbol} → ${tr.newStop.toFixed(4)}`);
       } catch (e) {
@@ -1727,21 +1820,27 @@ export interface RunCycleCtx {
 export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
   const { settings } = ctx;
   const result: AutoCycleResult = { opened: 0, closed: 0, errors: [] };
-  if (!settings.enabled) return result;
+  // v1.5.19 — دو ربات مستقل: هر مود کلید روشن/خاموشِ خودش را دارد؛ استارت
+  // واقعی دمو را نمی‌کُشد (و برعکس) — سیگنال‌ها به «هر دو رباتِ روشن» اعمال
+  // می‌شوند و هر کدام با پارامترهای خودشان.
+  const demoOn = settings.enabledDemo === true;
+  const realOn = settings.enabledReal === true;
+  if (!demoOn && !realOn) return result;
 
   const prices = await getBinancePrices().catch(() => ({}) as Record<string, number>);
 
   try {
-    // 1) demo mark-to-market + trailing + SL/TP checks (always — even real
-    //    mode usually has no demo positions, this is a cheap no-op then)
-    // v1.5.13 — MTM دمو همیشه با پارامترهای «دمو» (مستقل از حالت فعلی)
-    await markDemoPositions(prices, withParams(settings, 'demo'));
+    // 1) demo mark-to-market + trailing + SL/TP checks (only while the DEMO
+    //    bot is on — خاموش‌کردن دمو یعنی دمو دیگر معامله/بروزرسانی نمی‌کند)
+    // MTM دمو همیشه با پارامترهای «دمو» (مستقل از حالت فعلی)
+    if (demoOn) await markDemoPositions(prices, withParams(settings, 'demo'));
   } catch (e) {
     result.errors.push(`MTM: ${e instanceof Error ? e.message : 'خطا'}`);
   }
 
   // 1.5) v1.5.0 — manage tracked REAL positions (trailing + closed detection)
-  if (settings.mode === 'real' && ctx.realKeys) {
+  //  — فقط وقتی «ربات واقعی» روشن است، مستقل از اینکه مود انتخابی UI کدام است.
+  if (realOn && ctx.realKeys) {
     try {
       const m = await manageRealPositions(withParams(settings, 'real'), ctx.realKeys);
       result.closed += m.closed;
@@ -1771,30 +1870,29 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
         }
         const side = settings.whale.mirrorSide ? o.side : o.side === 'long' ? 'short' : 'long';
         const label = `نهنگ ${settings.whale.label}`;
-        if (settings.mode === 'real') {
-          if (ctx.realKeys) {
-            try {
-              if (await openReal(withParams(settings, 'real'), ctx.realKeys, o.coin, side, price, label)) result.opened++;
-            } catch (e) {
-              result.errors.push(`واقعی ${o.coin}: ${e instanceof Error ? e.message : 'خطا'}`);
-            }
-          }
-        } else {
+        // v1.5.19 — سیگنال به هر دو رباتِ روشن اعمال می‌شود (استقلال دمو/واقعی)
+        if (demoOn) {
           if (await openDemo(withParams(settings, 'demo'), o.coin, side, price, 'whale', label)) result.opened++;
+        }
+        if (realOn && ctx.realKeys) {
+          try {
+            if (await openReal(withParams(settings, 'real'), ctx.realKeys, o.coin, side, price, label)) result.opened++;
+          } catch (e) {
+            result.errors.push(`واقعی ${o.coin}: ${e instanceof Error ? e.message : 'خطا'}`);
+          }
         }
       }
       for (const c of closed) {
-        if (settings.mode === 'real') {
-          if (ctx.realKeys) {
-            const side = settings.whale.mirrorSide ? c.side : c.side === 'long' ? 'short' : 'long';
-            try {
-              await closeReal(ctx.realKeys, c.coin, side, 'کپی بستن نهنگ');
-              result.closed++;
-            } catch (e) {
-              result.errors.push(`واقعی ${c.coin}: ${e instanceof Error ? e.message : 'خطا'}`);
-            }
+        const cSide = settings.whale.mirrorSide ? c.side : c.side === 'long' ? 'short' : 'long';
+        if (realOn && ctx.realKeys) {
+          try {
+            await closeReal(ctx.realKeys, c.coin, cSide, 'کپی بستن نهنگ', settings.realExchangeId);
+            result.closed++;
+          } catch (e) {
+            result.errors.push(`واقعی ${c.coin}: ${e instanceof Error ? e.message : 'خطا'}`);
           }
-        } else {
+        }
+        if (demoOn) {
           // close matching open demo positions of that coin
           const open = (await loadDemoPositions()).filter(
             (p) => p.status === 'open' && p.symbol === c.coin && p.source === 'whale'
@@ -1822,7 +1920,8 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
         const side: 'long' | 'short' = s.action === 'buy' ? 'long' : 'short';
         const label = `اندیکاتور ${s.indicatorName}`;
         // opposite signal closes same-coin indicator positions first
-        if (settings.mode === 'demo') {
+        // v1.5.19 — هر سیگنال به «هر دو رباتِ روشن» اعمال می‌شود (مستقل از مود UI)
+        if (demoOn) {
           const open = (await loadDemoPositions()).filter(
             (p) => p.status === 'open' && p.symbol === coin && p.source === 'indicator' && p.side !== side
           );
@@ -1830,7 +1929,8 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
             if (await closeDemo(p.id, price, 'signal')) result.closed++;
           }
           if (await openDemo(withParams(settings, 'demo'), coin, side, price, 'indicator', label)) result.opened++;
-        } else if (ctx.realKeys) {
+        }
+        if (realOn && ctx.realKeys) {
           try {
             if (await openReal(withParams(settings, 'real'), ctx.realKeys, coin, side, price, label)) result.opened++;
           } catch (e) {
@@ -1910,13 +2010,15 @@ async function runGlobalCycle(): Promise<void> {
   cycleRunning = true;
   try {
     const settings = await loadAutoSettings();
-    if (!settings.enabled) return;
+    // v1.5.19 — چرخه وقتی معنا دارد که حداقل یکی از دو ربات (دمو/واقعی) روشن است
+    if (!settings.enabledDemo && !settings.enabledReal) return;
     // v1.5.5 — «اعلام تلگرام ۲۴/۷ (سرور)» حذف شد: چرخه همیشه «محلی» اجرا
     // می‌شود. قبلاً وقتی سوییچ سرور روشن بود، sync موفق کل چرخه محلی را
     // skip می‌کرد (return) و اگر سرور کاری نمی‌کرد، «نه در برنامه نه در
     // تلگرام» چیزی نمی‌آمد — بازخورد کاربر. حالا ربات روی خود گوشی
     // اجرا می‌شود و اعلام تلگرام از خود برنامه ارسال می‌شود.
-    const realKeys = settings.mode === 'real' ? await loadRealKeys() : undefined;
+    // v1.5.19 — کلیدِ «صرافی انتخابی» ربات واقعی (نه همیشه بایننس)
+    const realKeys = settings.enabledReal ? await loadRealKeys(settings.realExchangeId) : undefined;
     const res = await runAutoCycle({ settings, realKeys });
     for (const e of res.errors.slice(0, 2)) await appendLog('error', e);
     // v1.5.9 — heartbeat برنامه‌باز: تا برنامه باز است سرور موتور خودش را
@@ -1998,7 +2100,7 @@ export async function manualClosePosition(
   if (settings.mode === 'demo') return closeDemo(pos.id, pos.lastPrice, 'manual');
   if (keys) {
     try {
-      await closeReal(keys, pos.symbol, pos.side, 'دستی');
+      await closeReal(keys, pos.symbol, pos.side, 'دستی', settings.realExchangeId);
       const tracked = await loadRealPositions();
       const idx = tracked.findIndex(
         (p) => p.status === 'open' && p.symbol === pos.symbol && p.side === pos.side
@@ -2038,7 +2140,7 @@ export async function manualPartialClosePosition(
       (p) => p.status === 'open' && p.id === pos.id
     );
     if (idx < 0) return false;
-    return partialCloseReal(keys, tracked[idx], pos.lastPrice, fraction, 'partial-manual');
+    return partialCloseReal(keys, tracked[idx], pos.lastPrice, fraction, 'partial-manual', settings.realExchangeId);
   }
   return false;
 }
@@ -2107,8 +2209,10 @@ export async function updatePositionTpsl(
 
   if (keys) {
     try {
-      await updateStopLoss(keys.apiKey, keys.apiSecret, `${pos.symbol}USDT`, pos.side, pos.qty, newStop);
-      await updateTakeProfit(keys.apiKey, keys.apiSecret, `${pos.symbol}USDT`, pos.side, pos.qty, newTake);
+      // v1.5.19 — ویرایش SL/TP روی صرافی انتخابی (هر دو مقدار بازنویسی می‌شوند)
+      const adapter = futuresAdapterFor(settings.realExchangeId);
+      if (!adapter) return false;
+      await adapter.updateTradingStop(keys, `${pos.symbol}USDT`, pos.side, newStop, newTake, pos.qty, true);
       const tracked = await loadRealPositions();
       const idx = tracked.findIndex((p) => p.id === pos.id && p.status === 'open');
       if (idx >= 0) {
@@ -2157,7 +2261,8 @@ export async function runLightMtm(): Promise<void> {
   lightMtmRunning = true;
   try {
     const settings = await loadAutoSettings();
-    if (!settings.enabled) return;
+    // v1.5.19 — MTM هر ربات مستقل: فقط ربات‌های روشن قیمت/تریل می‌گیرند
+    if (!settings.enabledDemo && !settings.enabledReal) return;
     // v1.5.9 — sync سرور همیشه «غیرمسدودکننده» است: در بک‌گراند و حداکثر
     // هر ۱۰ ثانیه؛ دیگر چرخه سبک روی سرورِ خواب معطل نمی‌ماند (بازخورد:
     // «بروزرسانی اطلاعات و موجودی در PnL دیر انجام می‌شد»). MTM محلی همیشه
@@ -2165,13 +2270,15 @@ export async function runLightMtm(): Promise<void> {
     if (await isServerModeActive()) {
       void syncAutoTradeStateFromServer().catch(() => {});
     }
-    // قیمت با کش ۲.۵ ثانیه‌ای تا PnL نمایش واقعاً هر ۳ ثانیه تازه شود
+    // قیمت با کش ۱.۵ ثانیه‌ای تا PnL نمایش واقعاً هر ۲ ثانیه تازه شود
     const prices = await getBinancePrices(1_500).catch(() => ({}) as Record<string, number>);
-    try {
-      await markDemoPositions(prices, withParams(settings, 'demo'));
-    } catch {}
-    if (settings.mode === 'real') {
-      const keys = await loadRealKeys();
+    if (settings.enabledDemo) {
+      try {
+        await markDemoPositions(prices, withParams(settings, 'demo'));
+      } catch {}
+    }
+    if (settings.enabledReal) {
+      const keys = await loadRealKeys(settings.realExchangeId);
       if (keys) {
         try {
           await manageRealPositions(withParams(settings, 'real'), keys);
@@ -2260,7 +2367,9 @@ export async function getAutoServerStatus(): Promise<AutoServerStatus> {
     return { active: false, reason: 'توکن ربات/چت‌آیدی تلگرام در تنظیمات ثبت نشده — برای اعلان ۲۴/۷ تلگرام لازم است' };
   }
   const settings = await loadAutoSettings();
-  if (!settings.enabled) {
+  // v1.5.19 — وضعیت نسبت به «ربات مود فعلی» (دمو و واقعی مستقل‌اند)
+  const curModeOn = settings.mode === 'real' ? settings.enabledReal : settings.enabledDemo;
+  if (!curModeOn) {
     return { active: false, reason: 'ربات روشن نیست — با روشن کردن ربات، حالت ۲۴/۷ خودکار فعال می‌شود' };
   }
   const active = await isServerModeActive();
@@ -2358,10 +2467,14 @@ export async function pushAutoTradeConfigToServer(
     // می‌کند و همه‌ی باز/بسته‌شدن‌ها را با برنامه بسته هم به تلگرام می‌فرستد
     // (همان الگوی اسکنر میم‌کوین). بدون تلگرام سروری کاری برای اعلام ندارد.
     const telegram = await loadTelegramAnnounceCreds();
-    const serverEnabled = settings.enabled && !!telegram;
-    const keys = settings.mode === 'real' && serverEnabled ? await loadRealKeys() : undefined;
+    // v1.5.19 — ربات‌ها مستقل‌اند: سرور همان مودِ فعلی را با فلگ خودش می‌گیرد
+    // (استارت ربات واقعی دیگر دمو را روی سرور نمی‌کُشد و برعکس؛ اجرای محلیِ
+    // هر دو ربات روی گوشی مستقل از این است).
+    const curModeEnabled = settings.mode === 'real' ? settings.enabledReal : settings.enabledDemo;
+    const serverEnabled = curModeEnabled && !!telegram;
+    const keys = settings.mode === 'real' && serverEnabled ? await loadRealKeys(settings.realExchangeId) : undefined;
     if (settings.mode === 'real' && serverEnabled && !keys) {
-      return { ok: false, error: 'کلید API بایننس برای حالت واقعی پیدا نشد' };
+      return { ok: false, error: 'کلید API صرافی انتخابی برای حالت واقعی پیدا نشد' };
     }
     // v1.5.4 — snapshot وضعیت محلی به‌عنوان seed: سرور بک‌تست را از همان‌جایی که
     // برنامه بوده ادامه می‌دهد (تاریخچه حفظ می‌شود — «روشن کردن سوییچ تلگرام
@@ -2458,7 +2571,7 @@ let lastStateSyncAt = 0;
 export async function syncAutoTradeStateFromServer(force = false): Promise<boolean> {
   try {
     const settings = await loadAutoSettings();
-    if (!settings.enabled) return false;
+    if (!(settings.mode === 'real' ? settings.enabledReal : settings.enabledDemo)) return false;
     const base = await getServerUrl();
     if (!base) return false;
     if (!force && Date.now() - lastStateSyncAt < 10_000) return true;
@@ -2540,7 +2653,7 @@ export async function sendAppOpenHeartbeat(force = false): Promise<void> {
   try {
     if (!force && Date.now() - lastHeartbeatAt < 50_000) return;
     const settings = await loadAutoSettings();
-    if (!settings.enabled) return;
+    if (!(settings.mode === 'real' ? settings.enabledReal : settings.enabledDemo)) return;
     if (!(await isServerModeActive())) return;
     const base = await getServerUrl();
     if (!base) return;
@@ -2601,15 +2714,16 @@ export async function closeAllOpenPositions(
     await appendLog('info', `بستن همه پوزیشن‌های باز (دستی گروهی): ${closed} بسته شد${failed > 0 ? ` • ${failed} ناموفق` : ''}`);
     return { closed, failed };
   }
-  // حالت واقعی — بستن مارکت هر پوزیشن روی بایننس
+  // حالت واقعی — بستن مارکت هر پوزیشن روی «صرافی انتخابی» (v1.5.19)
   if (!keys) return { closed: 0, failed: 0 };
+  const adapter = futuresAdapterFor(settings.realExchangeId);
+  if (!adapter) return { closed: 0, failed: 0 };
   const positions = await loadRealPositions();
   const open = positions.filter((p) => p.status === 'open');
   for (const p of open) {
     try {
-      // positionAmt امضادار: مثبت = لانگ، منفی = شورت
-      const positionAmt = (p.side === 'long' ? 1 : -1) * p.qty;
-      await closeRealPosition(keys.apiKey, keys.apiSecret, `${p.symbol}USDT`, positionAmt);
+      // آداپتور اندازهٔ واقعی را از صرافی می‌خواند و کامل reduce-only می‌بندد
+      await adapter.closeAll(keys, `${p.symbol}USDT`, p.side);
       const dir = p.side === 'long' ? 1 : -1;
       const pnl = ((p.lastPrice ?? p.entryPrice) - p.entryPrice) * dir * p.qty;
       const idx = positions.findIndex((x) => x.id === p.id && x.status === 'open');

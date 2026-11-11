@@ -315,7 +315,9 @@ export default function SettingsScreen() {
       const localIndActive = localIndicators.filter(
         (x) => x.receiveSignals && (x.code ?? '').trim().length > 0
       ).length;
-      const localBotOn = !!autoSettings?.enabled;
+      // v1.5.19 — ربات دمو و ربات واقعی مستقل‌اند؛ «ربات روشن» یعنی هر کدام
+      // از دو فلگ مستقل روشن باشد.
+      const localBotOn = !!autoSettings?.enabledDemo || !!autoSettings?.enabledReal;
       setLocalHealth({ indActive: localIndActive, botOn: localBotOn });
 
       let h = await fetchScanHealth();

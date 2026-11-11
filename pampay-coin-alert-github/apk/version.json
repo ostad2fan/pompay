@@ -1,9 +1,9 @@
 {
-  "latestVersion": "1.5.18",
-  "versionCode": 43,
-  "apkUrl": "https://github.com/ostad2fan/pompay/releases/download/v1.5.18/PampDumpCoins-v1.5.18.apk",
-  "releaseUrl": "https://github.com/ostad2fan/pompay/releases/tag/v1.5.18",
-  "updatedAt": "2026-11-08",
-  "notes": "نسخه ۱.۵.۱۸ — رفع باز نشدن اولین اجرا (تایید دوم برای قفل IP) + رفع ربات دمو (موتور سیگنال‌های اندیکاتور مستقل از تلگرام) + اعلان همهٔ بخش‌ها فقط با اینترنت گوشی و بدون سرور (بک‌فچ ربات و اسکنر).",
+  "latestVersion": "1.5.21",
+  "versionCode": 46,
+  "apkUrl": "https://github.com/ostad2fan/pompay/releases/download/v1.5.21/PampDumpCoins-v1.5.21.apk",
+  "releaseUrl": "https://github.com/ostad2fan/pompay/releases/tag/v1.5.21",
+  "updatedAt": "2026-11-11",
+  "notes": "نسخه ۱.۵.۲۱ — مکسی/گیت/کوکوین به ربات بک‌تست واقعی اضافه شدند + تاریخچه مستقل حالت واقعی (تقویم روزانه و PnL جدا) + رفع تداخل نمایش دمو/واقعی.",
   "commit": "see https://github.com/ostad2fan/pompay/tree/main/pampay-coin-alert-github"
 }

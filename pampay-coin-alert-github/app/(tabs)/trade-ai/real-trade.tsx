@@ -89,11 +89,16 @@ interface ExchangeConfig {
   exchangeId: ExchangeId;
   apiKey: string;
   apiSecret: string;
+  /** v1.5.20 — صرافی‌هایی که کلیدشان passphrase هم دارد (OKX/بیتگت/کوکوین). */
+  passphrase?: string;
   enabled: boolean;
   tradeSource: TradeSource;
   selectedSymbols: string[];
   tradeAllSymbols: boolean;
 }
+
+/** v1.5.20 — صرافی‌های دارای passphrase در کلید API. */
+const PASSPHRASE_EXCHANGES: ExchangeId[] = ['okx', 'bitget', 'kucoin'];
 
 interface AutoTradeConfig {
   enabled: boolean;
@@ -158,6 +163,8 @@ export default function RealTradeScreen() {
   const [newExchangeId, setNewExchangeId] = useState<ExchangeId>('binance');
   const [newApiKey, setNewApiKey] = useState('');
   const [newApiSecret, setNewApiSecret] = useState('');
+  /** v1.5.20 — OKX/بیتگت/کوکوین برای API به passphrase هم نیاز دارند. */
+  const [newPassphrase, setNewPassphrase] = useState('');
   const [newTradeSource, setNewTradeSource] = useState<TradeSource>('ai');
   const [newTradeAllSymbols, setNewTradeAllSymbols] = useState(true);
   const [newSelectedSymbols, setNewSelectedSymbols] = useState<string[]>([]);
@@ -749,6 +756,8 @@ export default function RealTradeScreen() {
       exchangeId: newExchangeId,
       apiKey: newApiKey.trim(),
       apiSecret: newApiSecret.trim(),
+      // v1.5.20 — passphrase صرافی‌هایی که لازم دارند (OKX/بیتگت/کوکوین)
+      passphrase: PASSPHRASE_EXCHANGES.includes(newExchangeId) ? newPassphrase.trim() || undefined : undefined,
       enabled: true,
       tradeSource: newTradeSource,
       selectedSymbols: newTradeAllSymbols ? [] : newSelectedSymbols,
@@ -758,11 +767,12 @@ export default function RealTradeScreen() {
     saveExchangeConfigs(updated);
     setNewApiKey('');
     setNewApiSecret('');
+    setNewPassphrase('');
     setNewSelectedSymbols([]);
     setNewCoinInput('');
     setShowExchangeForm(false);
     ThemedAlert.alert('موفق', `صرافی ${EXCHANGES[newExchangeId].name} اضافه شد`);
-  }, [newApiKey, newApiSecret, newExchangeId, newTradeSource, newTradeAllSymbols, exchangeConfigs, saveExchangeConfigs]);
+  }, [newApiKey, newApiSecret, newPassphrase, newExchangeId, newTradeSource, newTradeAllSymbols, exchangeConfigs, saveExchangeConfigs]);
 
   const handleRemoveExchange = useCallback((idx: number) => {
     ThemedAlert.alert('حذف صرافی', 'آیا مطمئنید؟', [
@@ -880,6 +890,22 @@ export default function RealTradeScreen() {
           autoCapitalize="none"
           autoCorrect={false}
         />
+        {/* v1.5.20 — کلید OKX/بیتگت/کوکوین به Passphrase هم نیاز دارد */}
+        {PASSPHRASE_EXCHANGES.includes(newExchangeId) && (
+          <>
+            <Text style={styles.inputLabel}>Passphrase</Text>
+            <TextInput
+              style={styles.input}
+              value={newPassphrase}
+              onChangeText={setNewPassphrase}
+              placeholder="Passphrase کلید API (الزامی برای این صرافی)"
+              placeholderTextColor={colors.dark.textMuted}
+              secureTextEntry
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+          </>
+        )}
         {/* v1.5.0 — «منبع سیگنال‌ها» از فرم افزودن صرافی حذف شد؛ منبع‌ها
             (نهنگ/اندیکاتور) به‌صورت گزینه‌های روشن/خاموش در تب «معامله خودکار»
             هستند — انتخاب بهتر برای کاربر. */}
