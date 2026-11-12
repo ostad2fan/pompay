@@ -982,10 +982,13 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   // یا دادهٔ موجود در همان بخش (هر بخش مستقل معامله/اعلان/بروزرسانی خودش را دارد).
   // v1.5.22 — «هر مود فقط بخش خودش»: گیت نمایش هم فقط از داده‌های مودِ فعلی
   // حساب می‌شود (در دمو دادهٔ واقعی و برعکس دیده نمی‌شود).
+  // v1.5.23 — در حالت واقعی PnL/تقویم/تاریخچه/پوزیشن‌ها همیشه دیده می‌شوند
+  // (قبلاً با ربات خاموش و بدون پوزیشنِ محلی، همه‌چیز مخفی می‌شد و کاربر
+  // معاملات سرور ۲۴/۷ را هم نمی‌دید — بازخورد: «در واقعی نشون نمیده»).
   const hasAnyPosition =
     settings.mode === 'demo'
       ? settings.enabledDemo || openPositions.length > 0 || positions.some((p) => p.status === 'closed')
-      : settings.enabledReal || realOpen.length > 0 || realPositions.some((p) => p.status === 'closed');
+      : true;
 
   // v1.5.19 — ربات مودِ فعلی روشن است؟ (دمو و واقعی کلید مستقل دارند)
   const modeEnabled = settings.mode === 'real' ? settings.enabledReal : settings.enabledDemo;
@@ -1290,10 +1293,6 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 </Pressable>
               ))}
             </View>
-            {/* v1.5.22 — نشانگر واضح «الان کدام بخش را می‌بینم» (نمایش = مود فعال) */}
-            <Text style={[styles.viewingBadge, settings.mode === 'real' && styles.viewingBadgeReal]}>
-              در حال نمایش: {settings.mode === 'demo' ? 'دمو' : 'واقعی'}
-            </Text>
             {modeEnabled ? (
               <Pressable
                 style={styles.stopBtn}
@@ -1699,7 +1698,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               </View>
             </View>
             <Text style={styles.sourceHint}>
-              استاپ‌لاس با لوریج حساب می‌شود: حد ضرر {settings.maxLossPercent}٪ با لوریج {settings.leverage} = ضررِ حساب {Number(settings.maxLossPercent) * settings.leverage}٪ (فاصله قیمت = حد ضرر ÷ لوریج). تیک‌پرافیت = فاصله استاپ × {settings.rewardRatio} (R:R).
+              حد ضرر {settings.maxLossPercent}٪ یعنی وقتی ضرر معامله (با هر لوریجی) به {settings.maxLossPercent}٪ رسید، ربات معامله را می‌بندد — فاصله قیمت استاپ = حد ضرر ÷ لوریج ({settings.leverage}x ← {(Number(settings.maxLossPercent) / Math.max(1, settings.leverage)).toFixed(2)}٪ حرکت قیمت). تیک‌پرافیت = فاصله استاپ × {settings.rewardRatio} (R:R).
             </Text>
           </View>
 
@@ -1829,7 +1828,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   </View>
                 )}
                 {/* v1.5.22 — بلوک واقعی فقط در مود واقعی + موجودی کیف فیوچرز صرافی */}
-                {settings.mode === 'real' && (settings.enabledReal || realPositions.length > 0) && (
+                {/* v1.5.23 — همیشه در مود واقعی دیده می‌شود (حتی با ربات خاموش) */}
+                {settings.mode === 'real' && (
                   <View style={[styles.pnlModeBlock, styles.pnlModeBlockReal]}>
                     <Text style={styles.pnlModeLabel}>واقعی</Text>
                     <PnlRow label="PNL بسته‌شده" value={realStats.realized} pct={roiOf(realStats.realized)} />
@@ -1954,7 +1954,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
 
               {/* ── v1.5.12 — تقویم ۳۰ روزه سود/زیان (جدولی، تفکیک روزانه،
                   با فلش باز/بسته + ساخت عکس برای ذخیره/اشتراک) ── */}
-              {settings.mode === 'real' && (settings.enabledReal || realPositions.some((p) => p.status === 'closed')) && (
+              {/* v1.5.23 — همیشه در مود واقعی دیده می‌شود (حتی با ربات خاموش) */}
+              {settings.mode === 'real' && (
                 <View style={styles.calBox}>
                   <Pressable style={styles.calHead} onPress={() => setCalOpenDemo((v) => !v)} testID="cal-toggle-real">
                     <CalendarDays size={13} color={colors.dark.accent} />
@@ -2217,111 +2218,15 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   )}
                 </Pressable>
               </View>
-              {openPositions.length === 0 && (
-                <Text style={styles.sourceHint}>پوزیشن بازی نیست — با اولین سیگنال/حرکت نهنگ باز می‌شود.</Text>
-              )}
-              {openPositions.map((p) => {
-                const dir = p.side === 'long' ? 1 : -1;
-                const pnl = (p.lastPrice - p.entryPrice) * dir * p.qty;
-                // v1.5.2 — درصد سود/زیان هر معامله باز (نسبت به مارجین)
-                const pnlPct = positionPnlPercent(p);
-                // v1.5.4 — «حجم مارجین ورودی تو پوزیشنا باز هم نشون بده»
-                const posMarginUsd = p.leverage > 0 ? (p.qty * p.entryPrice) / p.leverage : 0;
-                const posNotionalUsd = p.qty * p.entryPrice;
-                return (
-                  <View key={p.id} style={styles.posRow}>
-                    <View style={styles.posMain}>
-                      <Text style={styles.posSymbol}>
-                        {p.side === 'long' ? '🟢' : '🔴'} {p.symbol} ×{p.leverage}
-                        {p.trailArmed ? ' 🛡' : ''}
-                        {/* v1.5.3 — نام استراتژی کنار ارز */}
-                        {p.strategyName ? <Text style={styles.posStrategy}> • {p.strategyName}</Text> : null}
-                      </Text>
-                      <Text style={styles.posSource} numberOfLines={1}>
-                        {p.source === 'whale' ? '🐋 ' : '📈 '}{p.sourceLabel}
-                      </Text>
-                      {/* v1.5.3 — قیمت ورود دقیق در خط جدا + قیمت فعلی/SL/TP در خط بعد */}
-                      {/* v1.5.6 — قیمت با دقت بایننس (BTC دو رقم — نه ۵–۸ رقم) */}
-                      <Text style={styles.posPrices}>
-                        ورود: {fmtPrice(p.symbol, p.entryPrice)} → فعلی: {fmtPrice(p.symbol, p.lastPrice)}
-                      </Text>
-                      <Text style={styles.posPrices}>
-                        SL {fmtPrice(p.symbol, p.stopPrice)} / TP {fmtPrice(p.symbol, p.takePrice)}
-                      </Text>
-                      {/* v1.5.4 — مارجین ورودی + ارزش فعلی پوزیشن */}
-                      <Text style={styles.posMargin}>
-                        مارجین ورودی: ${posMarginUsd.toFixed(2)} • ارزش پوزیشن: ${posNotionalUsd.toFixed(2)}
-                      </Text>
-                      {/* v1.5.3 — ساعت و تاریخ باز شدن معامله */}
-                      <Text style={styles.posTime}>باز شد: {fmtOpenTime(p.openedAt)}</Text>
-                      {/* v1.5.12 — سود بخش‌های بسته‌شده روی همان پوزیشن باز */}
-                      {p.partialRealizedPnl != null && p.partialRealizedPnl !== 0 ? (
-                        <Text style={[styles.posPartial, { color: p.partialRealizedPnl >= 0 ? colors.dark.green : colors.dark.red }]}>
-                          سود بخش بسته‌شده: {p.partialRealizedPnl >= 0 ? '+' : '−'}${Math.abs(p.partialRealizedPnl).toFixed(2)} ({(p.partialsDone ?? 0).toLocaleString('fa-IR')} برداشت)
-                        </Text>
-                      ) : null}
-                    </View>
-                    <View style={styles.posSide}>
-                      <Text style={[styles.posPnl, { color: pnl >= 0 ? colors.dark.green : colors.dark.red }]}>
-                        {pnl >= 0 ? '+' : '−'}${Math.abs(pnl).toFixed(2)}
-                      </Text>
-                      <Text style={[styles.posPnlPct, { color: pnlPct >= 0 ? colors.dark.green : colors.dark.red }]}>
-                        {pnlPct >= 0 ? '+' : '−'}{Math.abs(pnlPct).toFixed(2)}٪
-                      </Text>
-                      {/* v1.5.3 — ویرایش دستی TP/SL این معامله */}
-                      <Pressable
-                        style={styles.posEditBtn}
-                        hitSlop={6}
-                        onPress={() =>
-                          openEditTpsl({
-                            kind: 'demo',
-                            id: p.id,
-                            symbol: p.symbol,
-                            side: p.side,
-                            qty: p.qty,
-                            stopPrice: p.stopPrice,
-                            takePrice: p.takePrice,
-                            lastPrice: p.lastPrice,
-                          })
-                        }
-                        testID={`pos-edit-tpsl-${p.id}`}
-                      >
-                        <Edit3 size={11} color={colors.dark.accent} />
-                      </Pressable>
-                      {/* v1.5.4 — ✂ بستن درصد دلخواه (اول درصد پرسیده می‌شود) */}
-                      <Pressable
-                        style={styles.posHalfBtn}
-                        hitSlop={6}
-                        onPress={() =>
-                          openPartialClose({
-                            kind: 'demo',
-                            id: p.id,
-                            symbol: p.symbol,
-                            side: p.side,
-                            qty: p.qty,
-                            entryPrice: p.entryPrice,
-                            leverage: p.leverage,
-                            lastPrice: p.lastPrice,
-                          })
-                        }
-                        testID={`pos-half-${p.id}`}
-                      >
-                        <Scissors size={11} color={colors.dark.blue} />
-                      </Pressable>
-                      {/* v1.5.6 — بستن کامل فقط با پیغام تایید (بازیابی از v1.5.4) */}
-                      <Pressable
-                        style={styles.posCloseBtn}
-                        onPress={() =>
-                          confirmClosePosition({ id: p.id, symbol: p.symbol, side: p.side, lastPrice: p.lastPrice })
-                        }
-                        testID={`pos-close-${p.id}`}
-                      >
-                        <X size={11} color={colors.dark.red} />
-                      </Pressable>
-                    </View>
-                  </View>
-                );
-              })}
+              {/* v1.5.23 — «نمایش زندهٔ دمو حذف شد»: پوزیشن‌های باز دمو دیگر
+                  کارت‌به‌کارت نمایش داده نمی‌شوند؛ PnL لحظه‌ای همهٔ پوزیشن‌های باز
+                  در بلوک «PnL ربات» لحاظ می‌شود و مدیریت (بستن همه) از سربرگ همین
+                  بخش است. مدیریت خودکار SL/TP/تریل ربات تغییری نمی‌کند. */}
+              <Text style={styles.sourceHint}>
+                {openPositions.length > 0
+                  ? `${openPositions.length.toLocaleString('fa-IR')} پوزیشن دموی باز فعال است — مدیریت خودکار (SL/TP/تریل) روشن است؛ نمایش زندهٔ هر پوزیشن حذف شده است.`
+                  : 'پوزیشن بازی نیست — با اولین سیگنال/حرکت نهنگ باز می‌شود.'}
+              </Text>
               {closedFiltered.length > 0 || histTypeFilter !== 'all' ? (
                 <View style={styles.closedBox}>
                   {/* v1.5.6 — سرتیتر + دکمه PDF کل تاریخچه‌ی فیلتر فعلی (بازیابی از v1.5.4) */}
@@ -2435,7 +2340,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
           )}
 
           {/* v1.5.22 — بلوک پوزیشن‌های واقعی فقط در مود واقعی */}
-          {settings.mode === 'real' && (settings.enabledReal || realPositions.length > 0) && (
+          {/* v1.5.23 — همیشه در مود واقعی دیده می‌شود (حتی با ربات خاموش) */}
+          {settings.mode === 'real' && (
             <View style={styles.sourceBox}>
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={realTotalPnl >= 0 ? colors.dark.green : colors.dark.red} />
@@ -2686,7 +2592,11 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     </View>
                   )}
                 </View>
-              ) : null}
+              ) : (
+                <Text style={styles.sourceHint}>
+                  هنوز معامله‌ی واقعی بسته‌شده‌ای ثبت نشده — با اولین معامله، تاریخچه این‌جا نمایش داده می‌شود.
+                </Text>
+              )}
             </View>
           )}
 
@@ -2813,21 +2723,6 @@ const styles = StyleSheet.create({
   },
   modeBtnTextActive: {
     color: colors.dark.background,
-  },
-  // v1.5.22 — نشانگر «در حال نمایش: دمو/واقعی» (نمایش = مود فعال)
-  viewingBadge: {
-    fontSize: 9.5,
-    fontWeight: '800',
-    color: colors.dark.green,
-    backgroundColor: colors.dark.green + '1A',
-    borderRadius: 7,
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-    overflow: 'hidden',
-  },
-  viewingBadgeReal: {
-    color: colors.dark.orange ?? '#f59e0b',
-    backgroundColor: (colors.dark.orange ?? '#f59e0b') + '22',
   },
   // v1.5.19 — نقطهٔ وضعیت کنار اسم مود (روشن/خاموشِ مستقل هر ربات)
   modeBtnInner: {

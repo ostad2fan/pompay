@@ -1036,6 +1036,27 @@ async function manageReal(cfg: AutoCfg, st: StoredAutoConfig): Promise<void> {
     // v1.5.3 — برداشت سود پله‌ای روی پوزیشن واقعی (۲۵٪/۵۰٪ سود حساب)؛
     // سپس تریل روی حجم باقی‌مانده در همان چرخه اعمال می‌شود.
     const marginPct = marginPnlPctOf(state.real[i], mark);
+    // v1.5.23 — گارد سخت «حد ضرر درصدی» (پاریتی با اپ): وقتی ضررِ حساب (٪
+    // مارجین) به «حد ضرر» تنظیم‌شده رسید، خود موتور معامله را می‌بندد —
+    // حتی اگر سفارش استاپ روی صرافی ثبت نشده باشد یا قیمت پرش کرده باشد.
+    if (marginPct <= -cfg.maxLossPercent) {
+      await putState(state);
+      try {
+        await closeReal(st, keys, p.symbol, p.side, p.qty, `حد ضرر ${cfg.maxLossPercent}٪ رسید`, "stop");
+      } catch (e) {
+        await appendLog("error", `حد ضرر ${p.symbol}: ${e instanceof Error ? e.message.slice(0, 60) : "خطا"}`);
+      }
+      const fresh = await getState();
+      state.real = fresh.real;
+      const fi = state.real.findIndex((x) => x.id === p.id && x.status === "open");
+      if (fi < 0) {
+        dirty = false;
+        continue;
+      }
+      i = fi;
+      p = state.real[fi];
+      dirty = false;
+    }
     const done = state.real[i].partialsDone ?? 0;
     if (done < PARTIAL_TAKE_PNL_PCTS.length && marginPct >= PARTIAL_TAKE_PNL_PCTS[done]) {
       await putState(state);

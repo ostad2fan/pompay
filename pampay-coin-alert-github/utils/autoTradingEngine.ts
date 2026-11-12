@@ -1781,6 +1781,48 @@ async function manageRealPositions(
     // v1.5.3 — برداشت سود پله‌ای روی پوزیشن واقعی (۲۵٪ / ۵۰٪ سود حساب)؛
     // سپس تریل روی حجم باقی‌مانده در همان چرخه اعمال می‌شود.
     const marginPct = marginPnlPctOf(tracked[i], mark);
+    // v1.5.23 — گارد سخت «حد ضرر درصدی»: وقتی ضررِ حساب (٪ مارجین — همان
+    // عددی که روی هر پوزیشن نشان داده می‌شود) به «حد ضرر» تنظیم‌شده رسید،
+    // خودِ موتور معامله را می‌بندد. قبلاً بستنِ روی حد ضرر فقط به سفارش استاپ
+    // صرافی تکیه داشت و اگر ثبت استاپ روی صرافی شکست می‌خورد (مثلاً خطای
+    // پارامتر Bitunix) یا قیمت پرش می‌کرد، معامله از حد ضرر عبور می‌کرد.
+    if (marginPct <= -settings.maxLossPercent) {
+      await saveRealPositions(tracked);
+      try {
+        await adapter.closeAll(keys, `${p.symbol}USDT`, p.side);
+      } catch (e) {
+        errors.push(`حد ضرر ${p.symbol}: ${e instanceof Error ? e.message.slice(0, 60) : 'خطا'}`);
+      }
+      const dir = p.side === 'long' ? 1 : -1;
+      const pnl = (mark - p.entryPrice) * dir * p.qty;
+      const ci = tracked.findIndex((x) => x.id === p.id);
+      if (ci >= 0) {
+        tracked[ci] = {
+          ...tracked[ci],
+          status: 'closed',
+          closedAt: Date.now(),
+          closeReason: 'stop',
+          realizedPnl: pnl,
+          lastPrice: mark,
+        };
+      }
+      closed++;
+      await recordClosedPnl(pnl);
+      await appendLog(
+        'close',
+        `بستن واقعی ${p.symbol} (حد ضرر ${settings.maxLossPercent}٪ رسید): ${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)}`
+      );
+      await notifyAutoTrade(
+        `🤖 ربات واقعی: بستن ${p.symbol} — حد ضرر`,
+        `ضرر به ${settings.maxLossPercent}٪ رسید و معامله بسته شد • ${pnl >= 0 ? '+' : '−'}$${Math.abs(pnl).toFixed(2)}`
+      );
+      await announceOnce(
+        `close:${p.id}:stop`,
+        `بک‌تست (واقعی): بستن ${p.symbol} — حد ضرر`,
+        `ضرر به ${settings.maxLossPercent}٪ رسید → معامله بسته شد • ${pnl >= 0 ? '✅ سود' : '❌ ضرر'} ~$${Math.abs(pnl).toFixed(2)}${p.strategyName ? ` • استراتژی ${p.strategyName}` : ''}`
+      );
+      continue;
+    }
     const done = tracked[i].partialsDone ?? 0;
     if (done < PARTIAL_TAKE_PNL_PCTS.length && marginPct >= PARTIAL_TAKE_PNL_PCTS[done]) {
       await saveRealPositions(tracked);
@@ -2308,7 +2350,15 @@ export async function runLightMtm(): Promise<void> {
   try {
     const settings = await loadAutoSettings();
     // v1.5.19 — MTM هر ربات مستقل: فقط ربات‌های روشن قیمت/تریل می‌گیرند
-    if (!settings.enabledDemo && !settings.enabledReal) return;
+    if (!settings.enabledDemo && !settings.enabledReal) {
+      // v1.5.23 — حتی با هر دو ربات خاموش، وضعیت سرور ۲۴/۷ هر از گاهی
+      // pull می‌شود تا پوزیشن‌ها/تاریخچهٔ حالت واقعی در برنامه دیده شوند
+      // (throttle داخل sync است؛ MTM/قیمت محلی skip می‌شود).
+      if (await isServerModeActive()) {
+        void syncAutoTradeStateFromServer().catch(() => {});
+      }
+      return;
+    }
     // v1.5.9 — sync سرور همیشه «غیرمسدودکننده» است: در بک‌گراند و حداکثر
     // هر ۱۰ ثانیه؛ دیگر چرخه سبک روی سرورِ خواب معطل نمی‌ماند (بازخورد:
     // «بروزرسانی اطلاعات و موجودی در PnL دیر انجام می‌شد»). MTM محلی همیشه
@@ -2616,8 +2666,11 @@ let lastStateSyncAt = 0;
 
 export async function syncAutoTradeStateFromServer(force = false): Promise<boolean> {
   try {
-    const settings = await loadAutoSettings();
-    if (!(settings.mode === 'real' ? settings.enabledReal : settings.enabledDemo)) return false;
+    // v1.5.23 — دیگر به «رباتِ همین مود روشن باشد» وابسته نیست: حتی با ربات
+    // خاموشِ گوشی، معاملات سرور ۲۴/۷ (پوزیشن‌های باز/تاریخچه) باید به برنامه
+    // بیایند تا تقویم/تاریخچه/پوزیشن‌های زندهٔ حالت واقعی خالی نمانند.
+    // merge پایین‌تر امن است (آرایهٔ خالی سرور دادهٔ محلی را پاک نمی‌کند)
+    // و throttle ۱۰ ثانیه‌ای هم جلوی فشار شبکه را می‌گیرد.
     const base = await getServerUrl();
     if (!base) return false;
     if (!force && Date.now() - lastStateSyncAt < 10_000) return true;

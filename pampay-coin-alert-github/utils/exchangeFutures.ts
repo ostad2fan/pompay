@@ -386,7 +386,9 @@ const bybitAdapter: FuturesAdapter = {
 
 const BITUNIX_BASE = 'https://fapi.bitunix.com';
 
-/** کش دقت نمادها (qtyStep/minQty) — ۱ ساعت. */
+/** کش دقت نمادها — ۱ ساعت. فیلدهای واقعی پاسخ Bitunix (مطابق مستندات
+ *  get_trading_pairs): basePrecision (دقت مقدار)، quotePrecision (دقت قیمت)،
+ *  minTradeVolume (حداقل حجم)، min/maxMarketOrderVolume. */
 let bitunixPairsCache: { at: number; map: Record<string, { qtyStep: number; minQty: number }> } | null = null;
 
 async function bitunixPairs(): Promise<Record<string, { qtyStep: number; minQty: number }>> {
@@ -397,9 +399,15 @@ async function bitunixPairs(): Promise<Record<string, { qtyStep: number; minQty:
   for (const p of data?.data ?? []) {
     const sym = String(p.symbol ?? '');
     if (!sym.endsWith('USDT')) continue;
-    const prec = Number(p.qtyPrecision ?? p.quantityPrecision ?? p.accuracy ?? 3);
-    const step = p.qtyStep ? parseFloat(p.qtyStep) : Math.pow(10, -prec);
-    map[sym] = { qtyStep: step > 0 ? step : 0.001, minQty: parseFloat(p.minQty ?? p.minQuantity ?? '0') || 0 };
+    // v1.5.23 — فیلد درست «basePrecision» است (قبلاً qtyPrecision خوانده می‌شد
+    // که وجود ندارد → همیشه 0.001 فرض می‌شد → qty با اعشار اضافه → «Parameter error»)
+    const prec = Number(p.basePrecision ?? p.qtyPrecision ?? p.accuracy ?? 3);
+    const step = Math.pow(10, -prec);
+    const minQty = Math.max(
+      parseFloat(p.minTradeVolume ?? p.minQty ?? '0') || 0,
+      parseFloat(p.minMarketOrderVolume ?? '0') || 0
+    );
+    map[sym] = { qtyStep: step > 0 ? step : 0.001, minQty };
   }
   if (Object.keys(map).length > 0) bitunixPairsCache = { at: Date.now(), map };
   return map;
@@ -432,7 +440,9 @@ async function bitunixPost(keys: ExchangeKeys, path: string, bodyObj: Record<str
     body,
   });
   const data = (await res.json()) as { code: number; msg?: string; data?: any };
-  if (data.code !== 0) throw new Error(`Bitunix: ${data.msg ?? data.code}`);
+  // v1.5.23 — پیام خطا کد صرافی را هم دارد (کدها در مستندات ErrorCode لیست
+  // شده‌اند) تا از تلگرام دقیقاً معلوم باشد چه چیزی رد شده است.
+  if (data.code !== 0) throw new Error(`Bitunix: ${data.msg ?? 'خطا'} (code ${data.code})`);
   return data.data;
 }
 
@@ -445,12 +455,19 @@ async function bitunixGet(keys: ExchangeKeys, path: string, params: Record<strin
     headers: bitunixHeaders(keys, sortedQuery, ''),
   });
   const data = (await res.json()) as { code: number; msg?: string; data?: any };
-  if (data.code !== 0) throw new Error(`Bitunix: ${data.msg ?? data.code}`);
+  if (data.code !== 0) throw new Error(`Bitunix: ${data.msg ?? 'خطا'} (code ${data.code})`);
   return data.data;
 }
 
 function bitunixPositionQty(p: any): number {
   return Number(p.qty ?? p.positionQty ?? p.volume ?? p.holdQty ?? 0);
+}
+
+/** v1.5.23 — qty به تعداد رقم مجاز basePrecision به‌صورت رشتهٔ تمیز —
+ *  اعشار شناور (مثل 0.30000000000000004) رد می‌شود («Parameter error»). */
+function bitunixQtyStr(qty: number, pair?: { qtyStep: number }): string {
+  const prec = pair && pair.qtyStep > 0 ? Math.max(0, Math.round(-Math.log10(pair.qtyStep))) : 3;
+  return qty.toFixed(Math.min(8, prec));
 }
 
 const bitunixAdapter: FuturesAdapter = {
@@ -467,66 +484,124 @@ const bitunixAdapter: FuturesAdapter = {
     return map;
   },
   async setLeverage(keys, symbol, leverage) {
-    await bitunixGet(keys, '/api/v1/futures/account/change_leverage', {
+    // v1.5.23 — هر دو اندپوینت POST هستند (مطابق SDK/lumibot — قبلاً
+    // change_leverage با GET صدا زده می‌شد). مقادیر رسمی: marginMode
+    // «ISOLATED» است نه «ISOLATION». خطاها غیرمرگبارند (لوریج/مارجین
+    // تکراری یا محدودیت صرافی نباید باز کردن پوزیشن را بلاک کند).
+    await bitunixPost(keys, '/api/v1/futures/account/change_margin_mode', {
+      marginMode: 'ISOLATED',
+      symbol,
+      marginCoin: 'USDT',
+    }).catch(() => {});
+    await bitunixPost(keys, '/api/v1/futures/account/change_leverage', {
       symbol,
       leverage,
       marginCoin: 'USDT',
-    });
+    }).catch(() => {});
   },
   async getFuturesBalance(keys) {
-    // صفحهٔ موجودی بیتیونیکس در مستندات برای خوانندهٔ ما بلاک بود؛ اندپوینت
-    // wallet را بدون سندِ باز حدس نمی‌زنیم → UI چیزی نشان نمی‌دهد (null).
-    return null;
+    // v1.5.23 — اندپوینت رسمی GET /api/v1/futures/account (SDK بیتیونیکس):
+    // {available, frozen, margin, ...} بر حسب marginCoin
+    const row = (await bitunixGet(keys, '/api/v1/futures/account', { marginCoin: 'USDT' }).catch(() => null)) as any;
+    if (!row) return null;
+    const num = (v: unknown) => {
+      const n = parseFloat(String(v ?? '0'));
+      return Number.isFinite(n) ? n : 0;
+    };
+    const available = num(row.available);
+    const equity = available + num(row.frozen) + num(row.margin);
+    return { available, equity };
   },
   async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
+    const pair = (await bitunixPairs())[symbol];
+    // نماد روی این صرافی لیست نیست؟ خطای واضح به‌جای «Parameter error»
+    if (!pair) throw new Error(`Bitunix: نماد ${symbol} در این صرافی معامله نمی‌شود — باز نشد`);
     const tickers = await bitunixAdapter.priceMap().catch(() => ({}) as Record<string, number>);
     const last = tickers[symbol] || stopPrice || takePrice;
     if (!(last > 0)) throw new Error('Bitunix: قیمت نماد در دسترس نیست');
-    const pair = (await bitunixPairs())[symbol];
-    await bitunixAdapter.setLeverage(keys, symbol, leverage).catch(() => {
-      // لوریج تکراری/ثابت — غیرمرگبار
-    });
-    const qty = roundToStep((sizeUsd * leverage) / last, pair?.qtyStep ?? 0.001);
+    await bitunixAdapter.setLeverage(keys, symbol, leverage);
+    const qty = roundToStep((sizeUsd * leverage) / last, pair.qtyStep);
     if (!(qty > 0)) throw new Error('Bitunix: حجم محاسبه‌شده نامعتبر است');
-    await bitunixPost(keys, '/api/v1/futures/trade/place_order', {
+    // v1.5.23 — حداقل حجم صرافی را چک کن (قبلاً qty زیر minTradeVolume هم
+    // ارسال می‌شد → «Parameter error»). اگر پوزیشن کوچک‌تر از حد مجاز است،
+    // به حداقل مجاز افزایش می‌یابد (ربات با حجم کوچک از قبل رد نمی‌شود).
+    let qtyFinal = qty;
+    if (pair.minQty > 0 && qty < pair.minQty) qtyFinal = roundToStep(pair.minQty, pair.qtyStep) || pair.minQty;
+    const qtyStr = bitunixQtyStr(qtyFinal, pair);
+    const body: Record<string, unknown> = {
       symbol,
       side: side === 'long' ? 'BUY' : 'SELL',
-      qty: String(qty),
       orderType: 'MARKET',
       effect: 'GTC',
-    });
-    // استاپ/حد سود جدا از سفارش است → «اولویت حفاظت»: اگر ثبت SL/TP نشد،
-    // پوزیشن همان لحظه بسته می‌شود تا بدون حفاظ نماند.
-    let positionId: string | undefined;
-    for (let i = 0; i < 7 && !positionId; i++) {
-      if (i > 0) await sleep(700);
-      const positions = (await bitunixGet(keys, '/api/v1/futures/position/get_pending_positions').catch(() => [])) as any[];
-      const p = (positions ?? []).find((x) => x.symbol === symbol);
-      positionId = p ? String(p.positionId ?? '') : undefined;
-    }
-    if (!positionId) throw new Error('Bitunix: پوزیشن بازشده پیدا نشد (SL/TP ثبت نشد — پوزیشن بسته شد)');
-    try {
-      if (stopPrice > 0) {
-        await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
-          symbol,
-          positionId,
-          slPrice: String(stopPrice),
-          slQty: String(qty),
-        });
+      qty: qtyStr,
+    };
+    if (stopPrice > 0) body.slPrice = String(stopPrice);
+    if (takePrice > 0) body.tpPrice = String(takePrice);
+    // تلاش ۱: دوجهته (tradeSide OPEN) → تلاش ۲: یک‌طرفه (بدون tradeSide) →
+    // تلاش ۳: بدون SL/TP داخلی (بعداً جداگانه ثبت می‌شود)
+    let lastErr: unknown = null;
+    let okAttempt = -1;
+    const attempts: Record<string, unknown>[] = [
+      { ...body, tradeSide: 'OPEN' },
+      body,
+      { ...body, tradeSide: 'OPEN' },
+    ];
+    const { slPrice: _dropSl, tpPrice: _dropTp, ...plain } = attempts[2] as Record<string, unknown>;
+    attempts[2] = { ...plain, tradeSide: 'OPEN' };
+    for (let i = 0; i < attempts.length; i++) {
+      try {
+        await bitunixPost(keys, '/api/v1/futures/trade/place_order', attempts[i]);
+        okAttempt = i;
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+        const msg = e instanceof Error ? e.message : '';
+        // «Parameter error» با قالب این تلاش رد شد → تلاش بعدی؛ خطای دیگر → همان لحظه رد
+        if (!/Parameter|10002/i.test(msg)) throw e;
       }
-      if (takePrice > 0) {
-        await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
-          symbol,
-          positionId,
-          tpPrice: String(takePrice),
-          tpQty: String(qty),
-        });
-      }
-    } catch (e) {
-      await bitunixAdapter.closeAll(keys, symbol, side).catch(() => {});
-      throw new Error(`Bitunix: ثبت SL/TP ناموفق بود و پوزیشن برای امنیت بسته شد (${e instanceof Error ? e.message : 'خطا'})`);
     }
-    return { qty };
+    if (okAttempt < 0) {
+      const msg = lastErr instanceof Error ? lastErr.message : 'خطا';
+      // سفارش با هر سه قالب رد شد — خطای کامل (با جزئیات qty/حداقل مجاز) برگرد
+      throw new Error(
+        `Bitunix: ${msg} [qty=${qtyStr} • حداقل مجاز=${pair.minQty} • لوریج ${leverage}x — اگر تکرار شد این پیام را بفرستید]`
+      );
+    }
+    // اگر سفارش با تلاش ۳ (بدون SL/TP داخلی) موفق شد → SL/TP جداگانه ثبت کن
+    if (okAttempt === 2 && (stopPrice > 0 || takePrice > 0)) {
+      let positionId: string | undefined;
+      for (let i = 0; i < 7 && !positionId; i++) {
+        if (i > 0) await sleep(700);
+        const positions = (await bitunixGet(keys, '/api/v1/futures/position/get_pending_positions').catch(() => [])) as any[];
+        const p = (positions ?? []).find((x) => x.symbol === symbol);
+        positionId = p ? String(p.positionId ?? '') : undefined;
+      }
+      if (!positionId) throw new Error('Bitunix: پوزیشن بازشده پیدا نشد (SL/TP ثبت نشد — پوزیشن بسته شد)');
+      try {
+        if (stopPrice > 0) {
+          await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
+            symbol,
+            positionId,
+            slPrice: String(stopPrice),
+            slQty: qtyStr,
+          });
+        }
+        if (takePrice > 0) {
+          await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
+            symbol,
+            positionId,
+            tpPrice: String(takePrice),
+            tpQty: qtyStr,
+          });
+        }
+      } catch (e) {
+        // «اولویت حفاظت»: بدون SL/TP نماند → پوزیشن همان لحظه بسته می‌شود
+        await bitunixAdapter.closeAll(keys, symbol, side).catch(() => {});
+        throw new Error(`Bitunix: ثبت SL/TP ناموفق بود و پوزیشن برای امنیت بسته شد (${e instanceof Error ? e.message : 'خطا'})`);
+      }
+    }
+    return { qty: qtyFinal };
   },
   async listPositions(keys) {
     const positions = (await bitunixGet(keys, '/api/v1/futures/position/get_pending_positions').catch(() => [])) as any[];
@@ -552,19 +627,28 @@ const bitunixAdapter: FuturesAdapter = {
     if (!(qty > 0)) return;
     const pair = (await bitunixPairs())[symbol];
     const q = roundToStep(qty, pair?.qtyStep ?? 0.001);
+    // v1.5.23 — qty تمیز با دقت مجاز (اعشار شناور = «Parameter error»)
     const body = {
       symbol,
       side: side === 'long' ? 'SELL' : 'BUY',
-      qty: String(q),
+      qty: bitunixQtyStr(q, pair),
       orderType: 'MARKET',
       effect: 'GTC',
       reduceOnly: true,
     };
+    // تلاش ۱: دوجهته (tradeSide CLOSE + positionId) → تلاش ۲: یک‌طرفه (بدون
+    // tradeSide) → تلاش ۳: بدون reduceOnly
+    const posId = p ? String(p.positionId ?? '') : '';
+    const attempt1 = posId ? { ...body, tradeSide: 'CLOSE', positionId: posId } : { ...body, tradeSide: 'CLOSE' };
     try {
-      await bitunixPost(keys, '/api/v1/futures/trade/place_order', body);
+      await bitunixPost(keys, '/api/v1/futures/trade/place_order', attempt1);
     } catch {
-      const { reduceOnly: _drop, ...bodyNoReduce } = body;
-      await bitunixPost(keys, '/api/v1/futures/trade/place_order', bodyNoReduce);
+      try {
+        await bitunixPost(keys, '/api/v1/futures/trade/place_order', body);
+      } catch {
+        const { reduceOnly: _dropReduce, ...plain } = body;
+        await bitunixPost(keys, '/api/v1/futures/trade/place_order', plain);
+      }
     }
   },
   async closePartial(keys, symbol, side, fraction) {
@@ -575,19 +659,28 @@ const bitunixAdapter: FuturesAdapter = {
     const pair = (await bitunixPairs())[symbol];
     const q = roundToStep(qty * Math.min(1, Math.max(0, fraction)), pair?.qtyStep ?? 0.001);
     if (!(q > 0)) return;
+    // v1.5.23 — qty تمیز با دقت مجاز (اعشار شناور = «Parameter error»)
     const body = {
       symbol,
       side: side === 'long' ? 'SELL' : 'BUY',
-      qty: String(q),
+      qty: bitunixQtyStr(q, pair),
       orderType: 'MARKET',
       effect: 'GTC',
       reduceOnly: true,
     };
+    // تلاش ۱: دوجهته (tradeSide CLOSE + positionId) → تلاش ۲: یک‌طرفه (بدون
+    // tradeSide) → تلاش ۳: بدون reduceOnly
+    const posId = p ? String(p.positionId ?? '') : '';
+    const attempt1 = posId ? { ...body, tradeSide: 'CLOSE', positionId: posId } : { ...body, tradeSide: 'CLOSE' };
     try {
-      await bitunixPost(keys, '/api/v1/futures/trade/place_order', body);
+      await bitunixPost(keys, '/api/v1/futures/trade/place_order', attempt1);
     } catch {
-      const { reduceOnly: _drop, ...bodyNoReduce } = body;
-      await bitunixPost(keys, '/api/v1/futures/trade/place_order', bodyNoReduce);
+      try {
+        await bitunixPost(keys, '/api/v1/futures/trade/place_order', body);
+      } catch {
+        const { reduceOnly: _dropReduce, ...plain } = body;
+        await bitunixPost(keys, '/api/v1/futures/trade/place_order', plain);
+      }
     }
   },
   async updateTradingStop(keys, symbol, side, stopPrice, takePrice, _qty, updateTake) {
@@ -598,12 +691,13 @@ const bitunixAdapter: FuturesAdapter = {
     const positionId = String(p.positionId ?? '');
     const qty = bitunixPositionQty(p);
     const pair = (await bitunixPairs())[symbol];
+    const qtyStr = bitunixQtyStr(roundToStep(qty, pair?.qtyStep ?? 0.001), pair);
     if (stopPrice > 0) {
       await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
         symbol,
         positionId,
         slPrice: String(stopPrice),
-        slQty: String(roundToStep(qty, pair?.qtyStep ?? 0.001)),
+        slQty: qtyStr,
       });
     }
     if (updateTake && takePrice > 0) {
@@ -611,7 +705,7 @@ const bitunixAdapter: FuturesAdapter = {
         symbol,
         positionId,
         tpPrice: String(takePrice),
-        tpQty: String(roundToStep(qty, pair?.qtyStep ?? 0.001)),
+        tpQty: qtyStr,
       });
     }
   },
