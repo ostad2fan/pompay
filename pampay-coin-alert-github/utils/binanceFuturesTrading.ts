@@ -136,6 +136,29 @@ export async function getAccountInfo(apiKey: string, apiSecret: string): Promise
   return data as BinanceAccountInfo;
 }
 
+/** v1.5.22 — موجودی کیف فیوچرز USDT (برای نمایش در PnL ربات واقعی).
+ *  /fapi/v2/balance سبک‌تر از /fapi/v2/account است و per-asset می‌دهد. */
+export async function getFuturesBalance(
+  apiKey: string,
+  apiSecret: string
+): Promise<{ available: number; equity: number } | null> {
+  try {
+    const data = (await signedRequest('GET', '/fapi/v2/balance', {}, apiKey, apiSecret)) as {
+      asset: string;
+      balance: string;
+      availableBalance: string;
+    }[];
+    const usdt = (data ?? []).find((b) => b.asset === 'USDT');
+    if (!usdt) return null;
+    const available = parseFloat(usdt.availableBalance ?? '0');
+    const equity = parseFloat(usdt.balance ?? '0');
+    if (!Number.isFinite(available) && !Number.isFinite(equity)) return null;
+    return { available: Number.isFinite(available) ? available : 0, equity: Number.isFinite(equity) ? equity : 0 };
+  } catch {
+    return null;
+  }
+}
+
 export async function getPositions(apiKey: string, apiSecret: string): Promise<BinanceFuturesPosition[]> {
   console.log('[BinanceFutures] Getting positions...');
   const data = await signedRequest('GET', '/fapi/v2/positionRisk', {}, apiKey, apiSecret);

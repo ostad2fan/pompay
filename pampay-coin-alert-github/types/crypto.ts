@@ -6,6 +6,7 @@ export type ExchangeId =
   | 'toobit'
   | 'bingx'
   | 'mexc'
+  | 'ourbit'
   | 'bitunix'
   | 'bitget'
   | 'gateio'

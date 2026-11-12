@@ -2,7 +2,7 @@
   "expo": {
     "name": "ارزهای پامپی و دامپی",
     "slug": "pampay-coin-alert",
-    "version": "1.5.21",
+    "version": "1.5.22",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "pampaycoin",

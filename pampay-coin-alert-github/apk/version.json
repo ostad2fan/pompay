@@ -1,9 +1,9 @@
 {
-  "latestVersion": "1.5.21",
-  "versionCode": 46,
-  "apkUrl": "https://github.com/ostad2fan/pompay/releases/download/v1.5.21/PampDumpCoins-v1.5.21.apk",
-  "releaseUrl": "https://github.com/ostad2fan/pompay/releases/tag/v1.5.21",
-  "updatedAt": "2026-11-11",
-  "notes": "نسخه ۱.۵.۲۱ — مکسی/گیت/کوکوین به ربات بک‌تست واقعی اضافه شدند + تاریخچه مستقل حالت واقعی (تقویم روزانه و PnL جدا) + رفع تداخل نمایش دمو/واقعی.",
+  "latestVersion": "1.5.22",
+  "versionCode": 47,
+  "apkUrl": "https://github.com/ostad2fan/pompay/releases/download/v1.5.22/PampDumpCoins-v1.5.22.apk",
+  "releaseUrl": "https://github.com/ostad2fan/pompay/releases/tag/v1.5.22",
+  "updatedAt": "2026-11-12",
+  "notes": "نسخه ۱.۵.۲۲ — همهٔ پوزیشن‌های ربات واقعی حتماً با مارجین ایزوله (OKX/مکسی از کراس اصلاح شد؛ بای‌بیت/توبیت/بینگ‌ایکس صریحاً ایزوله) + تفکیک کامل نمایش دمو/واقعی (هر مود فقط بخش خودش: پوزیشن‌ها، تاریخچه، PnL، تقویم) + رفع باز نشدن پوزیشن ربات واقعی (خطاها به لاگ و تلگرام می‌رسد؛ رفتار سیگنال مثل دمو) + موجودی کیف فیوچرز در PnL واقعی + صرافی یازدهم: اوربیت (Ourbit).",
   "commit": "see https://github.com/ostad2fan/pompay/tree/main/pampay-coin-alert-github"
 }

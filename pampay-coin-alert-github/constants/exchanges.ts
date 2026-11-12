@@ -50,6 +50,13 @@ export const EXCHANGES: Record<ExchangeId, ExchangeInfo> = {
     takerFee: 0.0004,
     futuresBaseUrl: 'https://contract.mexc.com',
   },
+  ourbit: {
+    id: 'ourbit',
+    name: 'اوربیت (Ourbit)',
+    makerFee: 0.0002,
+    takerFee: 0.0006,
+    futuresBaseUrl: 'https://futures.ourbit.com',
+  },
 
   bitunix: {
     id: 'bitunix',

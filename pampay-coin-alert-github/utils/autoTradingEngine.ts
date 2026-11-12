@@ -54,7 +54,8 @@ import { getUserIndicators, scanCustomIndicators } from './customIndicatorsServi
 import { getStoredHookSignals } from './hookReversalService';
 import { getStoredGainzAlgoSignals } from './gainzAlgoService';
 import { getServerUrl, getInstallSecret } from './scanServerApi';
-import { futuresAdapterFor } from './exchangeFutures';
+import { futuresAdapterFor, exchangeNeedsPassphrase } from './exchangeFutures';
+import { EXCHANGES } from '@/constants/exchanges';
 import type { ExchangeId } from '@/types/crypto';
 import { mergePositionsById } from './autoMerge';
 
@@ -1628,6 +1629,18 @@ async function openReal(
   price: number,
   sourceLabel: string
 ): Promise<RealAutoPosition | null> {
+  // v1.5.22 — «رفتار واقعی دقیقاً مثل دمو»: همان گاردهای دمو (سقف پوزیشن
+  // باز + یک پوزیشن per symbol+side) عیناً اینجا هم اعمال می‌شود (قبلاً
+  // ربات واقعی این گاردها را نداشت و رفتارش با دمو فرق داشت).
+  const trackedNow = await loadRealPositions();
+  if (trackedNow.filter((p) => p.status === 'open').length >= settings.maxOpenPositions) {
+    await appendLog('info', `واقعی ${symbol}: سقف پوزیشن باز (${settings.maxOpenPositions}) پر است — باز نشد`);
+    return null;
+  }
+  if (trackedNow.some((p) => p.status === 'open' && p.symbol === symbol && p.side === side)) {
+    await appendLog('info', `واقعی ${symbol}: پوزیشن ${side === 'long' ? 'لانگ' : 'شورت'} همین نماد از قبل باز است — باز نشد`);
+    return null;
+  }
   const gate = await aiCapitalGate(settings);
   if (gate.pausedReason) {
     await appendLog('info', `${symbol}: ${gate.pausedReason}`);
@@ -1878,7 +1891,15 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
           try {
             if (await openReal(withParams(settings, 'real'), ctx.realKeys, o.coin, side, price, label)) result.opened++;
           } catch (e) {
-            result.errors.push(`واقعی ${o.coin}: ${e instanceof Error ? e.message : 'خطا'}`);
+            const msg = e instanceof Error ? e.message : 'خطا';
+            result.errors.push(`واقعی ${o.coin}: ${msg}`);
+            // v1.5.22 — خطای بازکردن واقعی فقط در لاگ نمی‌ماند؛ به تلگرام هم
+            // می‌رود (روزانه یک‌بار per نماد) تا کاربر بفهمد چرا باز نشد.
+            await announceOnce(
+              `openfail:${o.coin}:${todayKey()}`,
+              `⚠️ ربات واقعی: باز کردن ${o.coin} نشد`,
+              `سیگنال بود ولی سفارش واقعی ثبت نشد:\n${msg.slice(0, 180)}`
+            );
           }
         }
       }
@@ -1934,7 +1955,14 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
           try {
             if (await openReal(withParams(settings, 'real'), ctx.realKeys, coin, side, price, label)) result.opened++;
           } catch (e) {
-            result.errors.push(`واقعی ${coin}: ${e instanceof Error ? e.message : 'خطا'}`);
+            const msg = e instanceof Error ? e.message : 'خطا';
+            result.errors.push(`واقعی ${coin}: ${msg}`);
+            // v1.5.22 — مثل مسیر نهنگ: خطای بازکردن واقعی به تلگرام هم می‌رود
+            await announceOnce(
+              `openfail:${coin}:${todayKey()}`,
+              `⚠️ ربات واقعی: باز کردن ${coin} نشد`,
+              `سیگنال بود ولی سفارش واقعی ثبت نشد:\n${msg.slice(0, 180)}`
+            );
           }
         }
       }
@@ -2018,7 +2046,25 @@ async function runGlobalCycle(): Promise<void> {
     // تلگرام» چیزی نمی‌آمد — بازخورد کاربر. حالا ربات روی خود گوشی
     // اجرا می‌شود و اعلام تلگرام از خود برنامه ارسال می‌شود.
     // v1.5.19 — کلیدِ «صرافی انتخابی» ربات واقعی (نه همیشه بایننس)
-    const realKeys = settings.enabledReal ? await loadRealKeys(settings.realExchangeId) : undefined;
+    let realKeys = settings.enabledReal ? await loadRealKeys(settings.realExchangeId) : undefined;
+    // v1.5.22 — رفع «ربات واقعی روشن است ولی هیچ پوزیشنی باز نمی‌کند»:
+    // قبلاً وقتی کلیدِ صرافیِ انتخابی (اضافه/فعال نبودن در تب «واقعی» یا
+    // passphrase نداشتن) در دسترس نبود، چرخهٔ واقعی بی‌صدا skip می‌شد و
+    // کاربر هیچ لاگ/اعلانی نمی‌دید. حالا: لاگ error + اعلان تلگرام روزانه.
+    if (settings.enabledReal && !realKeys) {
+      const exName = EXCHANGES[settings.realExchangeId]?.name ?? settings.realExchangeId;
+      await appendLog(
+        'error',
+        `ربات واقعی روشن است ولی کلید API «${exName}» فعال نیست — از تب «واقعی» کلید صرافی را اضافه/فعال کنید${exchangeNeedsPassphrase(settings.realExchangeId) ? ' (این صرافی Passphrase هم می‌خواهد)' : ''} تا ربات بتواند معامله باز کند`
+      );
+      await announceOnce(
+        `realkeys:${todayKey()}`,
+        '⚠️ ربات واقعی: کلید API فعال نیست',
+        `ربات واقعی روشن است ولی کلید API «${exName}» در تب «واقعی» اضافه/فعال نشده است و هیچ پوزیشنی باز نمی‌شود.`
+      );
+      // چرخهٔ دمو (و مدیریت پوزیشن‌های واقعیِ قبلی روی بایننسِ پیش‌فرض) ادامه یابد
+      realKeys = undefined;
+    }
     const res = await runAutoCycle({ settings, realKeys });
     for (const e of res.errors.slice(0, 2)) await appendLog('error', e);
     // v1.5.9 — heartbeat برنامه‌باز: تا برنامه باز است سرور موتور خودش را

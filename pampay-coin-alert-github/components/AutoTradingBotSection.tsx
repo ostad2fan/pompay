@@ -112,7 +112,7 @@ import { saveEnabledStrategies, STRATEGY_ORDER } from '@/utils/tradeAiService';
 import type { TradingStrategy } from '@/types/tradeAi';
 // v1.5.19 — انتخاب صرافیِ اجرای ربات واقعی (از صرافی‌های اضافه‌شدهٔ کاربر)
 // v1.5.20 — لیست صرافی‌های دارای اجرای کامل داینامیک شد (بایننس/بای‌بیت/بیتیونیکس/توبیت/بینگ‌ایکس/OKX/بیتگت)
-import { EXECUTABLE_EXCHANGE_IDS, exchangeNeedsPassphrase, isExchangeExecutable } from '@/utils/exchangeFutures';
+import { EXECUTABLE_EXCHANGE_IDS, exchangeNeedsPassphrase, futuresAdapterFor, isExchangeExecutable } from '@/utils/exchangeFutures';
 import { EXCHANGES } from '@/constants/exchanges';
 import type { ExchangeId } from '@/types/crypto';
 
@@ -291,6 +291,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   const [positions, setPositions] = useState<DemoAutoPosition[]>([]);
   const [realPositions, setRealPositions] = useState<RealAutoPosition[]>([]);
   const [logs, setLogs] = useState<{ id: string; at: number; kind: string; message: string }[]>([]);
+  /** v1.5.22 — موجودی کیف فیوچرز صرافیِ انتخابی ربات واقعی (کل + آزاد). */
+  const [futuresBalance, setFuturesBalance] = useState<{ available: number; equity: number } | null>(null);
   const [cycleBusy, setCycleBusy] = useState(false);
   const [lastCycleAt, setLastCycleAt] = useState<number | null>(null);
   const [showDetail, setShowDetail] = useState(false);
@@ -415,6 +417,23 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
     setRealPositions(await loadRealPositions());
     setLogs((await getAutoLogs()).slice(0, 30));
     setLastCycleAt(getLastGlobalCycleAt());
+    // v1.5.22 — موجودی کیف فیوچرز صرافیِ انتخابی (فقط مود واقعی، هر رفرش؛
+    // آداپتورها fail-soft هستند — اگر صرافی ندهد null می‌ماند و UI مخفی است).
+    try {
+      const s = await loadAutoSettings();
+      if (s.mode === 'real' && s.enabledReal) {
+        const keys = await loadRealKeys(s.realExchangeId);
+        const adapter = futuresAdapterFor(s.realExchangeId);
+        if (keys && adapter) {
+          const bal = await adapter.getFuturesBalance(keys).catch(() => null);
+          setFuturesBalance(bal ?? null);
+          return;
+        }
+      }
+      setFuturesBalance(null);
+    } catch {
+      setFuturesBalance(null);
+    }
   }, []);
 
   // v1.5.19 — کلیدِ فعالِ «صرافی انتخابی» (بایننس/بای‌بیت/…) — با تغییر صرافی
@@ -961,13 +980,12 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
 
   // v1.5.21 — دو بخش دمو/واقعی هم‌زمان دیده می‌شوند؛ گیت نمایش = ربات روشن
   // یا دادهٔ موجود در همان بخش (هر بخش مستقل معامله/اعلان/بروزرسانی خودش را دارد).
+  // v1.5.22 — «هر مود فقط بخش خودش»: گیت نمایش هم فقط از داده‌های مودِ فعلی
+  // حساب می‌شود (در دمو دادهٔ واقعی و برعکس دیده نمی‌شود).
   const hasAnyPosition =
-    settings.enabledDemo ||
-    settings.enabledReal ||
-    openPositions.length > 0 ||
-    positions.some((p) => p.status === 'closed') ||
-    realOpen.length > 0 ||
-    realPositions.some((p) => p.status === 'closed');
+    settings.mode === 'demo'
+      ? settings.enabledDemo || openPositions.length > 0 || positions.some((p) => p.status === 'closed')
+      : settings.enabledReal || realOpen.length > 0 || realPositions.some((p) => p.status === 'closed');
 
   // v1.5.19 — ربات مودِ فعلی روشن است؟ (دمو و واقعی کلید مستقل دارند)
   const modeEnabled = settings.mode === 'real' ? settings.enabledReal : settings.enabledDemo;
@@ -1272,6 +1290,10 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                 </Pressable>
               ))}
             </View>
+            {/* v1.5.22 — نشانگر واضح «الان کدام بخش را می‌بینم» (نمایش = مود فعال) */}
+            <Text style={[styles.viewingBadge, settings.mode === 'real' && styles.viewingBadgeReal]}>
+              در حال نمایش: {settings.mode === 'demo' ? 'دمو' : 'واقعی'}
+            </Text>
             {modeEnabled ? (
               <Pressable
                 style={styles.stopBtn}
@@ -1777,8 +1799,10 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     </Pressable>
                   ))}
                 </View>
-                {/* v1.5.21 — هر دو بلوک PnL هم‌زمان (هر بخش مستقل) */}
-                {(settings.enabledDemo || positions.length > 0) && (
+                {/* v1.5.22 — «هر مود فقط بخش خودش»: در مود دمو فقط بلوک دمو
+                    دیده می‌شود و در مود واقعی فقط بلوک واقعی (سوییچر مود داخل
+                    کارت، نمایش را همان لحظه عوض می‌کند). */}
+                {settings.mode === 'demo' && (settings.enabledDemo || positions.length > 0) && (
                   <View style={styles.pnlModeBlock}>
                     <Text style={styles.pnlModeLabel}>دمو</Text>
                     {/* ردیف‌های بایننس‌مانند: سود/زیان دلاری + درصد ROI بر سرمایه اولیه */}
@@ -1804,8 +1828,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     </Text>
                   </View>
                 )}
-                {/* v1.5.21 — بلوک واقعی هم همیشه (هر بخش مستقل) */}
-                {(settings.enabledReal || realPositions.length > 0) && (
+                {/* v1.5.22 — بلوک واقعی فقط در مود واقعی + موجودی کیف فیوچرز صرافی */}
+                {settings.mode === 'real' && (settings.enabledReal || realPositions.length > 0) && (
                   <View style={[styles.pnlModeBlock, styles.pnlModeBlockReal]}>
                     <Text style={styles.pnlModeLabel}>واقعی</Text>
                     <PnlRow label="PNL بسته‌شده" value={realStats.realized} pct={roiOf(realStats.realized)} />
@@ -1820,6 +1844,17 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                       value={Math.max(0, settings.initialCapitalUsd + realStats.realized - engagedMarginUsd)}
                       neutral
                     />
+                    {/* v1.5.22 — موجودی اصلی کیف فیوچرز صرافیِ انتخابی (زنده از خود صرافی) */}
+                    {futuresBalance && (
+                      <PnlRow
+                        label={`موجودی کیف فیوچرز ${EXCHANGES[settings.realExchangeId]?.name ?? ''} (کل)`}
+                        value={futuresBalance.equity}
+                        neutral
+                      />
+                    )}
+                    {futuresBalance && (
+                      <PnlRow label="موجودی آزاد کیف فیوچرز (قابل معامله)" value={futuresBalance.available} neutral />
+                    )}
                     <Text style={styles.pnlMetaText}>
                       {realStats.trades.toLocaleString('fa-IR')} معامله • نرخ برد{' '}
                       {realStats.trades > 0
@@ -1842,7 +1877,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               </View>
 
               {/* ── v1.5.12 — تقویم ۳۰ روزه سود/زیان — v1.5.21: تقویم دمو و واقعی جدا و هم‌زمان ── */}
-              {(settings.enabledDemo || positions.some((p) => p.status === 'closed')) && (
+              {settings.mode === 'demo' && (settings.enabledDemo || positions.some((p) => p.status === 'closed')) && (
                 <View style={styles.calBox}>
                   <Pressable style={styles.calHead} onPress={() => setCalOpenDemo((v) => !v)} testID="cal-toggle">
                     <CalendarDays size={13} color={colors.dark.accent} />
@@ -1919,7 +1954,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
 
               {/* ── v1.5.12 — تقویم ۳۰ روزه سود/زیان (جدولی، تفکیک روزانه،
                   با فلش باز/بسته + ساخت عکس برای ذخیره/اشتراک) ── */}
-              {(settings.enabledReal || realPositions.some((p) => p.status === 'closed')) && (
+              {settings.mode === 'real' && (settings.enabledReal || realPositions.some((p) => p.status === 'closed')) && (
                 <View style={styles.calBox}>
                   <Pressable style={styles.calHead} onPress={() => setCalOpenDemo((v) => !v)} testID="cal-toggle-real">
                     <CalendarDays size={13} color={colors.dark.accent} />
@@ -2157,8 +2192,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             </Pressable>
           </Modal>
 
-          {/* v1.5.21 — پوزیشن‌های دمو همیشه دیده می‌شوند (حتی وقتی ربات واقعی روشن است) */}
-          {(settings.enabledDemo || positions.length > 0) && (
+          {/* v1.5.22 — «در دمو فقط بخش دمو، در واقعی فقط بخش واقعی»: بلوک
+              پوزیشن‌های دمو فقط در مود دمو رندر می‌شود (سوییچر مود داخل کارت). */}
+          {settings.mode === 'demo' && (settings.enabledDemo || positions.length > 0) && (
             <View style={styles.sourceBox}>
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={totalPnl >= 0 ? colors.dark.green : colors.dark.red} />
@@ -2398,8 +2434,8 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
             </View>
           )}
 
-          {/* v1.5.21 — پوزیشن‌های واقعی هم همیشه دیده می‌شوند (مستقل از مود کارت) */}
-          {(settings.enabledReal || realPositions.length > 0) && (
+          {/* v1.5.22 — بلوک پوزیشن‌های واقعی فقط در مود واقعی */}
+          {settings.mode === 'real' && (settings.enabledReal || realPositions.length > 0) && (
             <View style={styles.sourceBox}>
               <View style={styles.sourceHead}>
                 <TrendingUp size={13} color={realTotalPnl >= 0 ? colors.dark.green : colors.dark.red} />
@@ -2777,6 +2813,21 @@ const styles = StyleSheet.create({
   },
   modeBtnTextActive: {
     color: colors.dark.background,
+  },
+  // v1.5.22 — نشانگر «در حال نمایش: دمو/واقعی» (نمایش = مود فعال)
+  viewingBadge: {
+    fontSize: 9.5,
+    fontWeight: '800',
+    color: colors.dark.green,
+    backgroundColor: colors.dark.green + '1A',
+    borderRadius: 7,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    overflow: 'hidden',
+  },
+  viewingBadgeReal: {
+    color: colors.dark.orange ?? '#f59e0b',
+    backgroundColor: (colors.dark.orange ?? '#f59e0b') + '22',
   },
   // v1.5.19 — نقطهٔ وضعیت کنار اسم مود (روشن/خاموشِ مستقل هر ربات)
   modeBtnInner: {

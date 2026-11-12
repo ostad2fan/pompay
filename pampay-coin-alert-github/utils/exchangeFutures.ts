@@ -1,19 +1,21 @@
 /**
- * utils/exchangeFutures.ts — v1.5.20
+ * utils/exchangeFutures.ts — v1.5.22
  *
  * لایه آداپتور فیوچرز چندصرافی برای ربات بک‌تست (حالت واقعی).
  *
  *   • تا v1.5.18 اجرای واقعی ربات فقط روی فیوچرز بایننس بود.
  *   • v1.5.19 — بایننس + بای‌بیت.
- *   • v1.5.20 — «صرافی‌های دیگه مثل بیتیونیکس هم وصل بشن»: اجرای کامل روی
- *     بیتیونیکس (امضای دوبل SHA256 — تأییدشده با SDK)، توبیت، بینگ‌ایکس،
- *     OKX و بیتگت (تأییدشده با پیاده‌سازی مرجع CCXT). هر آداپتور:
- *     سفارش مارکت + استاپ/حدسود (روی خود سفارش در حد امکان) + لیست
- *     پوزیشن‌ها + بستن کامل/کسری + آپدیت استاپ (fail-soft: اگر آپدیت نشد،
- *     استاپ قبلی روی صرافی فعال می‌ماند).
- *   • بقیه صرافی‌ها (مکسی/گیت/کوکوین/اچ‌تی‌ایکس/…) — «به‌زودی»: در dropdown
- *     می‌آیند اما استارت ربات رویشان رد می‌شود (هر کدام API مخصوص خودش
- *     را دارد و بدون تست حساب واقعی پیاده نمی‌شود تا پوزیشن بی‌حفاظ باز نشود).
+ *   • v1.5.20 — بیتیونیکس، توبیت، بینگ‌ایکس، OKX و بیتگت.
+ *   • v1.5.21 — مکسی، گیت، کوکوین (جمعاً ۱۰ صرافی).
+ *   • v1.5.22 — «همهٔ پوزیشن‌های واقعی حتماً ایزوله»: OKX از کراس به
+ *     isolated، مکسی openType از ۲ (کراس) به ۱ (ایزوله)، گیت فقط leverage
+ *     مثبت (= ایزوله) بدون cross_leverage_limit، و بای‌بیت/توبیت/بینگ‌ایکس
+ *     قبل از سفارش marginType/switch-isolated صریح می‌زنند (بایننس و بیتگت
+ *     از قبل ایزوله‌اند). + متد getFuturesBalance (موجودی کیف فیوچرز برای
+ *     نمایش در PnL واقعی) + صرافی یازدهم: اوربیت (Ourbit — فیوچرزش
+ *     هم‌راستای API مکسی است؛ امضا با هدرهای ApiKey/Request-Time/Signature).
+ *   • بقیه صرافی‌ها (آل‌بانک=LBank و KCEX) — API معاملاتی عمومی ندارند؛
+ *     اجرای ربات رویشان ممکن نیست (نامشان در UI نمی‌آید).
  *
  * کلیدها همیشه روی دستگاه می‌مانند (هرگز به هیچ سروری نمی‌روند).
  */
@@ -29,6 +31,7 @@ import {
   getPositions as binanceGetPositions,
   updateStopLoss as binanceUpdateStopLoss,
   updateTakeProfit as binanceUpdateTakeProfit,
+  getFuturesBalance as binanceGetFuturesBalance,
 } from './binanceFuturesTrading';
 
 /** کلیدهای صرافی (KuCoin/OKX به passphrase هم نیاز دارند — برای آینده). */
@@ -86,6 +89,9 @@ export interface FuturesAdapter {
     qty: number,
     updateTake?: boolean
   ): Promise<void>;
+  /** v1.5.22 — موجودی کیف فیوچرز صرافی (USDT) برای نمایش در PnL واقعی؛
+   *  fail-soft: اگر صرافی ندهد null برمی‌گردد (UI چیزی نشان نمی‌دهد). */
+  getFuturesBalance(keys: ExchangeKeys): Promise<{ available: number; equity: number } | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +108,9 @@ const binanceAdapter: FuturesAdapter = {
     const map: Record<string, number> = {};
     for (const t of arr) map[t.symbol] = parseFloat(t.price);
     return map;
+  },
+  async getFuturesBalance(keys) {
+    return binanceGetFuturesBalance(keys.apiKey, keys.apiSecret);
   },
   async setLeverage(keys, symbol, leverage) {
     await binanceSetLeverage(keys.apiKey, keys.apiSecret, symbol, leverage);
@@ -256,6 +265,16 @@ const bybitAdapter: FuturesAdapter = {
   },
   async setLeverage(keys, symbol, leverage) {
     const lev = String(leverage);
+    // v1.5.22 — «همهٔ پوزیشن‌های واقعی ایزوله»: قبل از سفارش، مارجین نماد
+    // صریحاً روی ایزوله می‌رود (tradeMode:1). اگر همین باشد صرافی خطای
+    // غیرمرگبار می‌دهد → catch-soft.
+    await bybitPost(keys, '/v5/position/switch-isolated', {
+      category: 'linear',
+      symbol,
+      tradeMode: 1,
+      buyLeverage: lev,
+      sellLeverage: lev,
+    }).catch(() => {});
     await bybitPost(keys, '/v5/position/set-leverage', {
       category: 'linear',
       symbol,
@@ -263,6 +282,15 @@ const bybitAdapter: FuturesAdapter = {
       sellLeverage: lev,
       leverage: lev,
     });
+  },
+  async getFuturesBalance(keys) {
+    const result = await bybitGet('/v5/account/wallet-balance', { accountType: 'UNIFIED', coin: 'USDT' });
+    const list = result?.list?.[0];
+    const coin = list?.coin?.find((c: any) => c.coin === 'USDT') ?? list?.coin?.[0];
+    const equity = parseFloat(coin?.walletBalance ?? list?.totalWalletBalance ?? '0');
+    const available = parseFloat(coin?.availableToWithdraw ?? list?.totalAvailableBalance ?? '0');
+    if (!Number.isFinite(equity) && !Number.isFinite(available)) return null;
+    return { available: Number.isFinite(available) ? available : 0, equity: Number.isFinite(equity) ? equity : 0 };
   },
   async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
     const price = stopPrice > 0 ? stopPrice : takePrice;
@@ -444,6 +472,11 @@ const bitunixAdapter: FuturesAdapter = {
       leverage,
       marginCoin: 'USDT',
     });
+  },
+  async getFuturesBalance(keys) {
+    // صفحهٔ موجودی بیتیونیکس در مستندات برای خوانندهٔ ما بلاک بود؛ اندپوینت
+    // wallet را بدون سندِ باز حدس نمی‌زنیم → UI چیزی نشان نمی‌دهد (null).
+    return null;
   },
   async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
     const tickers = await bitunixAdapter.priceMap().catch(() => ({}) as Record<string, number>);
@@ -652,10 +685,24 @@ const toobitAdapter: FuturesAdapter = {
     return map;
   },
   async setLeverage(keys, symbol, leverage) {
+    // v1.5.22 — مارجین نماد صریحاً ISOLATED می‌رود (مستندات رسمی توبیت:
+    // POST /api/v1/futures/marginType)؛ اگر همین باشد خطای غیرمرگبار می‌دهد.
+    await toobitSigned(keys, 'POST', '/api/v1/futures/marginType', {
+      symbol: toobitToSym(symbol),
+      marginType: 'ISOLATED',
+    }).catch(() => {});
     await toobitSigned(keys, 'POST', '/api/v1/futures/leverage', {
       symbol: toobitToSym(symbol),
       leverage,
     });
+  },
+  async getFuturesBalance(keys) {
+    const arr = (await toobitSigned(keys, 'GET', '/api/v1/futures/balance', {}).catch(() => null)) as any[] | null;
+    const row = (arr ?? []).find((b: any) => String(b.coin ?? '').toUpperCase() === 'USDT');
+    if (!row) return null;
+    const available = parseFloat(row.availableBalance ?? '0');
+    const equity = parseFloat(row.balance ?? '0');
+    return { available: Number.isFinite(available) ? available : 0, equity: Number.isFinite(equity) ? equity : 0 };
   },
   async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
     const sym = toobitToSym(symbol);
@@ -821,6 +868,18 @@ const bingxAdapter: FuturesAdapter = {
   async setLeverage() {
     // بینگ‌ایکس v2 لوریج از API قابل تنظیم نیست (در حساب کاربر تنظیم می‌شود)
   },
+  async getFuturesBalance(keys) {
+    const body = (await bingxSigned(keys, 'GET', '/openApi/swap/v3/user/balance', {}).catch(() => null)) as any;
+    const rows = Array.isArray(body) ? body : (body?.data ?? body ?? []);
+    const row = (rows as any[]).find((b) => {
+      const asset = String(b.asset ?? b.marginCoin ?? b.currency ?? '').toUpperCase();
+      return !asset || asset === 'USDT';
+    });
+    if (!row) return null;
+    const available = parseFloat(row.availableMargin ?? row.availableBalance ?? '0');
+    const equity = parseFloat(row.equity ?? row.balance ?? '0');
+    return { available: Number.isFinite(available) ? available : 0, equity: Number.isFinite(equity) ? equity : 0 };
+  },
   async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
     const sym = bingxToSym(symbol);
     const prices = await bingxAdapter.priceMap().catch(() => ({}) as Record<string, number>);
@@ -829,6 +888,12 @@ const bingxAdapter: FuturesAdapter = {
     const instr = (await bingxContracts())[sym];
     const qty = roundToStep((sizeUsd * leverage) / last, instr?.qtyStep ?? 0.001);
     if (!(qty > 0)) throw new Error('BingX: حجم محاسبه‌شده نامعتبر است');
+    // v1.5.22 — مارجین نماد صریحاً ISOLATED می‌رود (مستندات رسمی BingX:
+    // POST /openApi/swap/v2/trade/marginType)؛ اگر همین باشد خطای غیرمرگبار می‌دهد.
+    await bingxSigned(keys, 'POST', '/openApi/swap/v2/trade/marginType', {
+      symbol: sym,
+      marginType: 'ISOLATED',
+    }).catch(() => {});
     // SL/TP داخل خود سفارش (JSON رشته‌ای) — حفاظت هم‌زمان با باز شدن
     await bingxSigned(keys, 'POST', '/openApi/swap/v2/trade/order', {
       symbol: sym,
@@ -1016,8 +1081,19 @@ const okxAdapter: FuturesAdapter = {
     await okxSigned(keys, 'POST', '/api/v5/account/set-leverage', {
       instId: okxToSym(symbol),
       lever: String(leverage),
-      mgnMode: 'cross',
+      mgnMode: 'isolated',
     });
+  },
+  async getFuturesBalance(keys) {
+    const data = (await okxSigned(keys, 'GET', '/api/v5/account/balance', undefined, '?ccy=USDT').catch(
+      () => null
+    )) as any[] | null;
+    const details = data?.[0]?.details;
+    const row = (details ?? []).find((d: any) => d.ccy === 'USDT') ?? details?.[0];
+    if (!row) return null;
+    const equity = parseFloat(row.eq ?? row.eqUsd ?? '0');
+    const available = parseFloat(row.availBal ?? '0');
+    return { available: Number.isFinite(available) ? available : 0, equity: Number.isFinite(equity) ? equity : 0 };
   },
   async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
     const sym = okxToSym(symbol);
@@ -1031,7 +1107,7 @@ const okxAdapter: FuturesAdapter = {
     // یک‌طرفه (posSide: net) با تلاش مجدد در حالت دوجهته؛ SL/TP با attachAlgoOrds
     const base = {
       instId: sym,
-      tdMode: 'cross',
+      tdMode: 'isolated',
       side: side === 'long' ? 'buy' : 'sell',
       ordType: 'market',
       sz: String(contracts),
@@ -1083,7 +1159,7 @@ const okxAdapter: FuturesAdapter = {
     try {
       await okxSigned(keys, 'POST', '/api/v5/trade/close-position', {
         instId: sym,
-        mgnMode: 'cross',
+        mgnMode: 'isolated',
         posSide: 'net',
       });
     } catch (e) {
@@ -1091,7 +1167,7 @@ const okxAdapter: FuturesAdapter = {
       if (/posSide|position mode|51000|51001/i.test(msg)) {
         await okxSigned(keys, 'POST', '/api/v5/trade/close-position', {
           instId: sym,
-          mgnMode: 'cross',
+          mgnMode: 'isolated',
           posSide: side === 'long' ? 'long' : 'short',
         });
       } else {
@@ -1111,7 +1187,7 @@ const okxAdapter: FuturesAdapter = {
     if (!(contracts > 0)) return;
     await okxSigned(keys, 'POST', '/api/v5/trade/order', {
       instId: sym,
-      tdMode: 'cross',
+      tdMode: 'isolated',
       side: side === 'long' ? 'sell' : 'buy',
       posSide: 'net',
       ordType: 'market',
@@ -1141,7 +1217,7 @@ const okxAdapter: FuturesAdapter = {
     } catch {}
     await okxSigned(keys, 'POST', '/api/v5/trade/order-algo', {
       instId: sym,
-      tdMode: 'cross',
+      tdMode: 'isolated',
       side: side === 'long' ? 'sell' : 'buy',
       posSide: 'net',
       ordType: 'oco',
@@ -1226,6 +1302,20 @@ const bitgetAdapter: FuturesAdapter = {
       marginCoin: 'USDT',
       leverage: String(leverage),
     });
+  },
+  async getFuturesBalance(keys) {
+    const data = (await bitgetSigned(
+      keys,
+      'GET',
+      '/api/v2/mix/account/accounts',
+      undefined,
+      '?productType=USDT-FUTURES'
+    ).catch(() => null)) as any[] | null;
+    const row = data?.[0];
+    if (!row) return null;
+    const available = parseFloat(row.available ?? '0');
+    const equity = parseFloat(row.usdtEquity ?? row.accountEquity ?? '0');
+    return { available: Number.isFinite(available) ? available : 0, equity: Number.isFinite(equity) ? equity : 0 };
   },
   async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
     const prices = await bitgetAdapter.priceMap().catch(() => ({}) as Record<string, number>);
@@ -1481,6 +1571,13 @@ const mexcAdapter: FuturesAdapter = {
   async setLeverage() {
     // لوریج مکسی روی قرارداد اعمال می‌شود (بعد از باز شدن پوزیشن، catch-soft)
   },
+  async getFuturesBalance(keys) {
+    const row = (await mexcSigned(keys, 'GET', '/api/v1/private/account/asset/USDT').catch(() => null)) as any;
+    if (!row) return null;
+    const available = parseFloat(row.availableBalance ?? '0');
+    const equity = parseFloat(row.equity ?? row.cashBalance ?? '0');
+    return { available: Number.isFinite(available) ? available : 0, equity: Number.isFinite(equity) ? equity : 0 };
+  },
   async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
     const sym = mexcToSym(symbol);
     const prices = await mexcAdapter.priceMap().catch(() => ({}) as Record<string, number>);
@@ -1488,13 +1585,13 @@ const mexcAdapter: FuturesAdapter = {
     if (!(last > 0)) throw new Error('MEXC: قیمت نماد در دسترس نیست');
     const cc = (await mexcContracts())[sym];
     const contracts = Math.max(cc?.minVol ?? 1, Math.round((sizeUsd * leverage) / last / (cc?.setSize ?? 1)));
-    // side: 1 باز کردن لانگ / 3 باز کردن شورت / type: 6 مارکت / openType: 2 کراس
+    // side: 1 باز کردن لانگ / 3 باز کردن شورت / type: 6 مارکت / openType: 1 ایزوله (v1.5.22)
     await mexcSigned(keys, 'POST', '/api/v1/private/order/create', {
       symbol: sym,
       vol: contracts,
       side: side === 'long' ? 1 : 3,
       type: 6,
-      openType: 2,
+      openType: 1,
     });
     // لوریج روی پوزیشن باز (catch-soft) — change_leverage positionId می‌خواهد
     try {
@@ -1503,7 +1600,7 @@ const mexcAdapter: FuturesAdapter = {
       if (p?.positionId) {
         await mexcSigned(keys, 'POST', '/api/v1/private/position/change_leverage', {
           positionId: String(p.positionId),
-          openType: 2,
+          openType: 1,
           leverage,
           symbol: sym,
           positionType: side === 'long' ? 1 : 2,
@@ -1520,7 +1617,7 @@ const mexcAdapter: FuturesAdapter = {
           side: closeSide,
           type: 5,
           orderType: 5,
-          openType: 2,
+          openType: 1,
           triggerPrice: String(stopPrice),
           triggerType: side === 'long' ? 2 : 1, // لانگ: پایین‌تر فعال می‌شود
           executeCycle: 1,
@@ -1534,7 +1631,7 @@ const mexcAdapter: FuturesAdapter = {
           side: closeSide,
           type: 5,
           orderType: 5,
-          openType: 2,
+          openType: 1,
           triggerPrice: String(takePrice),
           triggerType: side === 'long' ? 1 : 2,
           executeCycle: 1,
@@ -1576,7 +1673,7 @@ const mexcAdapter: FuturesAdapter = {
       vol: contracts,
       side: side === 'long' ? 4 : 2,
       type: 6,
-      openType: 2,
+      openType: 1,
     });
   },
   async closePartial(keys, symbol, side, fraction) {
@@ -1591,7 +1688,7 @@ const mexcAdapter: FuturesAdapter = {
       vol,
       side: side === 'long' ? 4 : 2,
       type: 6,
-      openType: 2,
+      openType: 1,
     });
   },
   async updateTradingStop(keys, symbol, side, stopPrice, takePrice, _qty, updateTake) {
@@ -1609,7 +1706,7 @@ const mexcAdapter: FuturesAdapter = {
         side: closeSide,
         type: 5,
         orderType: 5,
-        openType: 2,
+        openType: 1,
         triggerPrice: String(stopPrice),
         triggerType: side === 'long' ? 2 : 1,
         executeCycle: 1,
@@ -1623,7 +1720,7 @@ const mexcAdapter: FuturesAdapter = {
         side: closeSide,
         type: 5,
         orderType: 5,
-        openType: 2,
+        openType: 1,
         triggerPrice: String(takePrice),
         triggerType: side === 'long' ? 1 : 2,
         executeCycle: 1,
@@ -1740,15 +1837,22 @@ const gateAdapter: FuturesAdapter = {
     return map;
   },
   async setLeverage(keys, symbol, leverage) {
-    // روی پوزیشن اعمال می‌شود؛ در حساب کراس cross_leverage_limit هم لازم است
+    // v1.5.22 — ایزوله: در گیت «leverage مثبت = مارجین ایزوله با همان لوریج»
+    // و cross_leverage_limit فقط برای کراس است → فقط leverage می‌فرستیم.
     try {
       await gateSigned(keys, 'POST', `/api/v4/futures/usdt/positions/${gateToSym(symbol)}/leverage`, {
         leverage: String(leverage),
-        cross_leverage_limit: String(leverage),
       });
     } catch {
       // حالت دوجهته/کراس — غیرمرگبار
     }
+  },
+  async getFuturesBalance(keys) {
+    const row = (await gateSigned(keys, 'GET', '/api/v4/futures/usdt/accounts').catch(() => null)) as any;
+    if (!row) return null;
+    const available = parseFloat(row.available ?? '0');
+    const equity = parseFloat(row.total ?? '0');
+    return { available: Number.isFinite(available) ? available : 0, equity: Number.isFinite(equity) ? equity : 0 };
   },
   async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
     const sym = gateToSym(symbol);
@@ -1947,6 +2051,15 @@ const kucoinAdapter: FuturesAdapter = {
   async setLeverage() {
     // لوریج کوکوین داخل خود سفارش ارسال می‌شود
   },
+  async getFuturesBalance(keys) {
+    const row = (await kucoinSigned(keys, 'GET', '/api/v1/account-overview', undefined, '?currency=USDT').catch(
+      () => null
+    )) as any;
+    if (!row) return null;
+    const equity = parseFloat(row.accountEquity ?? '0');
+    const available = parseFloat(row.availableBalance ?? '0');
+    return { available: Number.isFinite(available) ? available : 0, equity: Number.isFinite(equity) ? equity : 0 };
+  },
   async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
     const sym = kucoinToSym(symbol);
     const prices = await binanceAdapter.priceMap(60_000).catch(() => ({}) as Record<string, number>);
@@ -1956,6 +2069,13 @@ const kucoinAdapter: FuturesAdapter = {
     const mult = cc?.multiplier ?? 1;
     const lot = cc?.lotSize ?? 1;
     const contracts = Math.max(lot, Math.round((sizeUsd * leverage) / last / mult / lot) * lot);
+    // v1.5.22 — «همهٔ پوزیشن‌های واقعی ایزوله»: مارجین‌مود نماد صریحاً روی
+    // ایزوله می‌رود (کوکوین به‌طور پیش‌فرض ایزوله است؛ این فراخوانی مطمئن
+    // می‌شود — اگر همین باشد/پشتیبانی نشود غیرمرگبار است).
+    await kucoinSigned(keys, 'POST', '/api/v1/position/margin-mode', {
+      symbol: sym,
+      isolated: true,
+    }).catch(() => {});
     // استاپ/حدسود روی خود سفارش (OCO پیوسته کوکوین)
     await kucoinSigned(keys, 'POST', '/api/v1/orders', {
       clientOid: randomHex(24),
@@ -2046,6 +2166,235 @@ const kucoinAdapter: FuturesAdapter = {
 };
 
 // ---------------------------------------------------------------------------
+// OURBIT (futures.ourbit.com) — v1.5.22: صرافی یازدهم. فیوچرزش هم‌راستای API
+// مکسی است (نماد BTC_USDT، side 1/3 باز و 4/2 بستن، type 6 مارکت، openType 1
+// ایزوله، positionMode 2 یک‌طرفه)؛ امضا: هدر ApiKey/Request-Time/Signature =
+// HMAC-SHA256(apiKey + ts + (POST: بدنهٔ JSON دقیق | GET: کوئری انکد مرتب)).
+// TP/SL با stoporder/change_price روی orderId سفارش بازشده.
+// ---------------------------------------------------------------------------
+
+const OURBIT_BASE = 'https://futures.ourbit.com';
+
+function ourbitToSym(binanceSymbol: string): string {
+  return binanceSymbol.replace(/USDT$/, '_USDT');
+}
+function ourbitFromSym(exchangeSymbol: string): string {
+  return exchangeSymbol.replace('_USDT', 'USDT');
+}
+
+async function ourbitSigned(
+  keys: ExchangeKeys,
+  method: 'GET' | 'POST',
+  path: string,
+  params: Record<string, string | number | boolean> = {}
+): Promise<any> {
+  const ts = Date.now().toString();
+  let auth = '';
+  let url = `${OURBIT_BASE}${path}`;
+  let body: string | undefined;
+  if (method === 'POST') {
+    auth = JSON.stringify(params);
+    body = auth;
+  } else {
+    const sorted: Record<string, string | number | boolean> = {};
+    for (const k of Object.keys(params).sort()) sorted[k] = params[k];
+    auth = formUrlencode(sorted);
+    if (auth) url += `?${auth}`;
+  }
+  const sign = hmacSha256Hex(keys.apiSecret, `${keys.apiKey}${ts}${auth}`);
+  const res = await fetch(url, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      ApiKey: keys.apiKey,
+      'Request-Time': ts,
+      Signature: sign,
+    },
+    body,
+  });
+  const data = (await res.json()) as { success?: boolean; code?: number | string; msg?: string; data?: any };
+  const ok = data.success === true || String(data.code ?? '') === '0' || String(data.code ?? '') === '200';
+  if (!ok) throw new Error(`Ourbit: ${data.msg ?? data.code}`);
+  return data.data;
+}
+
+let ourbitContractsCache: { at: number; map: Record<string, { setSize: number; minVol: number }> } | null = null;
+
+async function ourbitContracts(): Promise<Record<string, { setSize: number; minVol: number }>> {
+  if (ourbitContractsCache && Date.now() - ourbitContractsCache.at < 3_600_000) return ourbitContractsCache.map;
+  const res = await fetch(`${OURBIT_BASE}/api/v1/contract/detail`);
+  const body = (await res.json()) as { data?: any[] };
+  const map: Record<string, { setSize: number; minVol: number }> = {};
+  for (const c of body?.data ?? []) {
+    const sym = String(c.symbol ?? '');
+    if (!sym.endsWith('_USDT')) continue;
+    map[sym] = {
+      setSize: parseFloat(c.setSize ?? '1') || 1,
+      minVol: parseFloat(c.minVol ?? '1') || 1,
+    };
+  }
+  if (Object.keys(map).length > 0) ourbitContractsCache = { at: Date.now(), map };
+  return map;
+}
+
+const ourbitAdapter: FuturesAdapter = {
+  id: 'ourbit',
+  executable: true,
+  async priceMap() {
+    const res = await fetch(`${OURBIT_BASE}/api/v1/contract/ticker`);
+    const body = (await res.json()) as { data?: any[] };
+    const map: Record<string, number> = {};
+    for (const t of body?.data ?? []) {
+      const sym = String(t.symbol ?? '');
+      if (sym.endsWith('_USDT')) map[ourbitFromSym(sym)] = Number(t.lastPrice ?? t.price ?? 0);
+    }
+    if (Object.keys(map).length === 0) throw new Error('Ourbit: تیکرها خالی بود');
+    return map;
+  },
+  async setLeverage() {
+    // لوریج اوربیت روی پوزیشن باز اعمال می‌شود (بعد از باز شدن، catch-soft)
+  },
+  async getFuturesBalance(keys) {
+    const row = (await ourbitSigned(keys, 'GET', '/api/v1/private/account/asset/USDT').catch(() => null)) as any;
+    if (!row) return null;
+    const available = parseFloat(row.availableBalance ?? '0');
+    const equity = parseFloat(row.equity ?? row.cashBalance ?? '0');
+    return { available: Number.isFinite(available) ? available : 0, equity: Number.isFinite(equity) ? equity : 0 };
+  },
+  async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
+    const sym = ourbitToSym(symbol);
+    const prices = await ourbitAdapter.priceMap().catch(() => ({}) as Record<string, number>);
+    const last = prices[symbol] || stopPrice || takePrice;
+    if (!(last > 0)) throw new Error('Ourbit: قیمت نماد در دسترس نیست');
+    const cc = (await ourbitContracts())[sym];
+    const contracts = Math.max(cc?.minVol ?? 1, Math.round((sizeUsd * leverage) / last / (cc?.setSize ?? 1)));
+    // side: 1 باز کردن لانگ / 3 باز کردن شورت / type: 6 مارکت / openType: 1 ایزوله
+    const res = (await ourbitSigned(keys, 'POST', '/api/v1/private/order/submit', {
+      symbol: sym,
+      vol: contracts,
+      leverage,
+      side: side === 'long' ? 1 : 3,
+      type: 6,
+      openType: 1,
+      positionMode: 2,
+    })) as { orderId?: string | number } | undefined;
+    // لوریج روی پوزیشن باز (catch-soft)
+    try {
+      const positions = (await ourbitSigned(keys, 'GET', '/api/v1/private/position/open_positions')) as any[];
+      const p = (positions ?? []).find((x) => x.symbol === sym);
+      if (p?.positionId) {
+        await ourbitSigned(keys, 'POST', '/api/v1/private/position/change_leverage', {
+          positionId: String(p.positionId),
+          openType: 1,
+          leverage,
+          symbol: sym,
+          positionType: side === 'long' ? 1 : 2,
+        });
+      }
+    } catch {}
+    // TP/SL روی orderId سفارش بازشده (change_price) — «اولویت حفاظت»
+    const orderId = res?.orderId;
+    try {
+      if (orderId && (stopPrice > 0 || takePrice > 0)) {
+        await ourbitSigned(keys, 'POST', '/api/v1/private/stoporder/change_price', {
+          orderId: String(orderId),
+          ...(stopPrice > 0 ? { stopLossPrice: String(stopPrice) } : {}),
+          ...(takePrice > 0 ? { takeProfitPrice: String(takePrice) } : {}),
+        });
+      }
+    } catch (e) {
+      await ourbitAdapter.closeAll(keys, symbol, side).catch(() => {});
+      throw new Error(`Ourbit: ثبت SL/TP ناموفق بود و پوزیشن برای امنیت بسته شد (${e instanceof Error ? e.message : 'خطا'})`);
+    }
+    return { qty: contracts * (cc?.setSize ?? 1) };
+  },
+  async listPositions(keys) {
+    const positions = (await ourbitSigned(keys, 'GET', '/api/v1/private/position/open_positions').catch(() => [])) as any[];
+    const cc = await ourbitContracts().catch(() => ({}) as Record<string, { setSize: number; minVol: number }>);
+    const rows: LivePositionRow[] = [];
+    for (const p of positions ?? []) {
+      const contracts = Number(p.holdNum ?? 0);
+      if (!(contracts > 0)) continue;
+      const setSize = cc[String(p.symbol ?? '')]?.setSize ?? 1;
+      const qty = contracts * setSize;
+      const isShort = String(p.positionType ?? '') === '2';
+      rows.push({
+        symbol: ourbitFromSym(String(p.symbol ?? '')),
+        positionAmt: isShort ? String(-qty) : String(qty),
+        markPrice: String(p.marketPrice ?? 0),
+        entryPrice: String(p.holdAvgPrice ?? p.avgPrice ?? 0),
+      });
+    }
+    return rows;
+  },
+  async closeAll(keys, symbol, side) {
+    const positions = (await ourbitSigned(keys, 'GET', '/api/v1/private/position/open_positions').catch(() => [])) as any[];
+    const p = (positions ?? []).find((x) => ourbitFromSym(x.symbol) === symbol);
+    const contracts = p ? Number(p.holdNum ?? 0) : 0;
+    if (!(contracts > 0)) return;
+    await ourbitSigned(keys, 'POST', '/api/v1/private/order/create', {
+      symbol: ourbitToSym(symbol),
+      vol: contracts,
+      side: side === 'long' ? 4 : 2,
+      type: 6,
+      openType: 1,
+    });
+  },
+  async closePartial(keys, symbol, side, fraction) {
+    const positions = (await ourbitSigned(keys, 'GET', '/api/v1/private/position/open_positions').catch(() => [])) as any[];
+    const p = (positions ?? []).find((x) => ourbitFromSym(x.symbol) === symbol);
+    const contracts = p ? Number(p.holdNum ?? 0) : 0;
+    if (!(contracts > 0)) return;
+    const vol = Math.max(1, Math.round(contracts * Math.min(1, Math.max(0, fraction))));
+    if (!(vol > 0)) return;
+    await ourbitSigned(keys, 'POST', '/api/v1/private/order/create', {
+      symbol: ourbitToSym(symbol),
+      vol,
+      side: side === 'long' ? 4 : 2,
+      type: 6,
+      openType: 1,
+    });
+  },
+  async updateTradingStop(keys, symbol, side, stopPrice, takePrice, _qty, updateTake) {
+    // TP/SL روی پوزیشن باز با positionId — planorder مثل مکسی (fail-soft)
+    const positions = (await ourbitSigned(keys, 'GET', '/api/v1/private/position/open_positions').catch(() => [])) as any[];
+    const p = (positions ?? []).find((x) => ourbitFromSym(x.symbol) === symbol);
+    const contracts = p ? Number(p.holdNum ?? 0) : 0;
+    if (!(contracts > 0)) return;
+    const sym = ourbitToSym(symbol);
+    const closeSide = side === 'long' ? 4 : 2;
+    if (stopPrice > 0) {
+      await ourbitSigned(keys, 'POST', '/api/v1/private/planorder/place', {
+        symbol: sym,
+        vol: contracts,
+        side: closeSide,
+        type: 5,
+        orderType: 5,
+        openType: 1,
+        triggerPrice: String(stopPrice),
+        triggerType: side === 'long' ? 2 : 1,
+        executeCycle: 1,
+        trend: 1,
+      });
+    }
+    if (updateTake && takePrice > 0) {
+      await ourbitSigned(keys, 'POST', '/api/v1/private/planorder/place', {
+        symbol: sym,
+        vol: contracts,
+        side: closeSide,
+        type: 5,
+        orderType: 5,
+        openType: 1,
+        triggerPrice: String(takePrice),
+        triggerType: side === 'long' ? 1 : 2,
+        executeCycle: 1,
+        trend: 1,
+      });
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
 
 /** آداپتورهای دارای اجرای کامل — به‌ترتیب اولویت نمایش. */
 const EXECUTABLE_ADAPTERS: Record<string, FuturesAdapter> = {
@@ -2057,6 +2406,7 @@ const EXECUTABLE_ADAPTERS: Record<string, FuturesAdapter> = {
   okx: okxAdapter,
   bitget: bitgetAdapter,
   mexc: mexcAdapter,
+  ourbit: ourbitAdapter,
   gateio: gateAdapter,
   kucoin: kucoinAdapter,
 };
