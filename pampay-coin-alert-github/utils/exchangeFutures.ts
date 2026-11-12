@@ -470,6 +470,26 @@ function bitunixQtyStr(qty: number, pair?: { qtyStep: number }): string {
   return qty.toFixed(Math.min(8, prec));
 }
 
+/** v1.5.25 — بلک‌لیست نمادهای غیرقابل معامله از طریق API (کد 710002):
+ *  Bitunix بعضی جفت‌ارزها را در لیست trading_pairs دارد ولی سفارش API را
+ *  با «This trading pair does not currently support trading via OpenAPI»
+ *  رد می‌کند (مثل ANTHROPIC). چنین نمادی ۷ روز کنار گذاشته می‌شود تا
+ *  ربات هر چرخه دوباره تلاش نکند و تلگرام اسپم نگیرد. */
+const BITUNIX_API_BLOCKED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+let bitunixApiBlocked: { at: number; symbols: Set<string> } = { at: Date.now(), symbols: new Set() };
+
+export function bitunixMarkApiBlocked(symbol: string): void {
+  bitunixApiBlocked.symbols.add(symbol);
+}
+
+function bitunixIsApiBlocked(symbol: string): boolean {
+  if (Date.now() - bitunixApiBlocked.at > BITUNIX_API_BLOCKED_TTL_MS) {
+    bitunixApiBlocked = { at: Date.now(), symbols: new Set() };
+    return false;
+  }
+  return bitunixApiBlocked.symbols.has(symbol);
+}
+
 const bitunixAdapter: FuturesAdapter = {
   id: 'bitunix',
   executable: true,
@@ -516,6 +536,10 @@ const bitunixAdapter: FuturesAdapter = {
     const pair = (await bitunixPairs())[symbol];
     // نماد روی این صرافی لیست نیست؟ خطای واضح به‌جای «Parameter error»
     if (!pair) throw new Error(`Bitunix: نماد ${symbol} در این صرافی معامله نمی‌شود — باز نشد`);
+    // v1.5.25 — نمادی که صرافی API معامله‌اش را نمی‌پذیرد (710002) — ۷ روز skip
+    if (bitunixIsApiBlocked(symbol)) {
+      throw new Error(`Bitunix: نماد ${symbol} از طریق API قابل معامله نیست (صرافی پشتیبانی نمی‌کند) — تا ۷ روز رد می‌شود`);
+    }
     const tickers = await bitunixAdapter.priceMap().catch(() => ({}) as Record<string, number>);
     const last = tickers[symbol] || stopPrice || takePrice;
     if (!(last > 0)) throw new Error('Bitunix: قیمت نماد در دسترس نیست');
@@ -557,8 +581,17 @@ const bitunixAdapter: FuturesAdapter = {
       } catch (e) {
         lastErr = e;
         const msg = e instanceof Error ? e.message : '';
+        // v1.5.25 — کد 710002 = «این جفت‌ارز از OpenAPI پشتیبانی نمی‌کند»:
+        // مشکل قالب سفارش نیست، خودِ صرافی معاملهٔ API این نماد را نمی‌پذیرد —
+        // تلاش مجدد بی‌فایده است و نماد ۷ روز بلک‌لیست می‌شود.
+        if (/710002|does not currently support trading|OpenAPI/i.test(msg)) {
+          bitunixMarkApiBlocked(symbol);
+          throw e;
+        }
         // «Parameter error» با قالب این تلاش رد شد → تلاش بعدی؛ خطای دیگر → همان لحظه رد
-        if (!/Parameter|10002/i.test(msg)) throw e;
+        // v1.5.25 — \b اضافه شد: قبلاً «10002» داخل «710002» هم مچ می‌شد و
+        // خطای «نماد غیرقابل معامله» را به‌اشتباه Parameter error می‌گرفت.
+        if (!/Parameter|10002\b/i.test(msg)) throw e;
       }
     }
     if (okAttempt < 0) {

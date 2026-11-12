@@ -1937,10 +1937,15 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
             result.errors.push(`واقعی ${o.coin}: ${msg}`);
             // v1.5.22 — خطای بازکردن واقعی فقط در لاگ نمی‌ماند؛ به تلگرام هم
             // می‌رود (روزانه یک‌بار per نماد) تا کاربر بفهمد چرا باز نشد.
+            // v1.5.25 — نماد غیرقابل معامله از API: پیام شفاف + «دیگر تلاش
+            // نمی‌شود» (آداپتور تا ۷ روز بلک‌لیست می‌کند — تلگرام اسپم نمی‌گیرد).
+            const blocked = /قابل معامله نیست|710002|OpenAPI/i.test(msg);
             await announceOnce(
               `openfail:${o.coin}:${todayKey()}`,
               `⚠️ ربات واقعی: باز کردن ${o.coin} نشد`,
-              `سیگنال بود ولی سفارش واقعی ثبت نشد:\n${msg.slice(0, 180)}`
+              blocked
+                ? `صرافی معاملهٔ API این نماد را پشتیبانی نمی‌کند — نماد تا ۷ روز کنار گذاشته می‌شود و دیگر تلاش نمی‌شود:\n${msg.slice(0, 120)}`
+                : `سیگنال بود ولی سفارش واقعی ثبت نشد:\n${msg.slice(0, 180)}`
             );
           }
         }
@@ -2000,10 +2005,14 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
             const msg = e instanceof Error ? e.message : 'خطا';
             result.errors.push(`واقعی ${coin}: ${msg}`);
             // v1.5.22 — مثل مسیر نهنگ: خطای بازکردن واقعی به تلگرام هم می‌رود
+            // v1.5.25 — نماد غیرقابل معامله از API: پیام شفاف (بلک‌لیست ۷روزه)
+            const blocked = /قابل معامله نیست|710002|OpenAPI/i.test(msg);
             await announceOnce(
               `openfail:${coin}:${todayKey()}`,
               `⚠️ ربات واقعی: باز کردن ${coin} نشد`,
-              `سیگنال بود ولی سفارش واقعی ثبت نشد:\n${msg.slice(0, 180)}`
+              blocked
+                ? `صرافی معاملهٔ API این نماد را پشتیبانی نمی‌کند — نماد تا ۷ روز کنار گذاشته می‌شود و دیگر تلاش نمی‌شود:\n${msg.slice(0, 120)}`
+                : `سیگنال بود ولی سفارش واقعی ثبت نشد:\n${msg.slice(0, 180)}`
             );
           }
         }
