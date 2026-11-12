@@ -1,9 +1,9 @@
 {
-  "latestVersion": "1.5.22",
-  "versionCode": 47,
-  "apkUrl": "https://github.com/ostad2fan/pompay/releases/download/v1.5.22/PampDumpCoins-v1.5.22.apk",
-  "releaseUrl": "https://github.com/ostad2fan/pompay/releases/tag/v1.5.22",
+  "latestVersion": "1.5.24",
+  "versionCode": 49,
+  "apkUrl": "https://github.com/ostad2fan/pompay/releases/download/v1.5.24/PampDumpCoins-v1.5.24.apk",
+  "releaseUrl": "https://github.com/ostad2fan/pompay/releases/tag/v1.5.24",
   "updatedAt": "2026-11-12",
-  "notes": "نسخه ۱.۵.۲۲ — همهٔ پوزیشن‌های ربات واقعی حتماً با مارجین ایزوله (OKX/مکسی از کراس اصلاح شد؛ بای‌بیت/توبیت/بینگ‌ایکس صریحاً ایزوله) + تفکیک کامل نمایش دمو/واقعی (هر مود فقط بخش خودش: پوزیشن‌ها، تاریخچه، PnL، تقویم) + رفع باز نشدن پوزیشن ربات واقعی (خطاها به لاگ و تلگرام می‌رسد؛ رفتار سیگنال مثل دمو) + موجودی کیف فیوچرز در PnL واقعی + صرافی یازدهم: اوربیت (Ourbit).",
+  "notes": "نسخه ۱.۵.۲۴ — ریشهٔ خطای بیتیونیکس رفع شد (فیلد دقت مقدار basePrecision + حداقل حجم minTradeVolume که قبلاً غلط خوانده می‌شد → Parameter error؛ استاپ/تیک‌پرافیت داخل سفارش؛ خطاها با کد صرافی) + نشانگر «در حال نمایش دمو» حذف شد + تقویم/تاریخچه/پوزیشن‌های زندهٔ حالت واقعی همیشه دیده می‌شوند (sync سرور ۲۴/۷) + گارد سخت حد ضرر درصدی در اپ و سرور (بستن خودکار روی حد ضرر تنظیم‌شده — حتی بدون سفارش استاپ صرافی).",
   "commit": "see https://github.com/ostad2fan/pompay/tree/main/pampay-coin-alert-github"
 }
