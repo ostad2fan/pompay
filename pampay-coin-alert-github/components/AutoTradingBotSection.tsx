@@ -304,7 +304,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   /** v1.5.1 — پیش‌نمایش عکس PnL: اول عکس ساخته و نشان داده می‌شود، بعد ذخیره/اشتراک. */
   const [previewUri, setPreviewUri] = useState<string | null>(null);
   /** v1.5.1 — فیلتر روزِ تاریخچه معاملات ربات (v1.5.3 — پیش‌فرض «امروز»). */
-  const [histPeriod, setHistPeriod] = useState<AutoPnlPeriod>('today');
+  const [histPeriod, setHistPeriod] = useState<AutoPnlPeriod>('30d');
   /** v1.5.3 — ریست کامل دمو در حال انجام. */
   const [resetBusy, setResetBusy] = useState(false);
   /** v1.5.2 — ویرایش دستی TP/SL پوزیشن باز. */
@@ -2218,15 +2218,103 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   )}
                 </Pressable>
               </View>
-              {/* v1.5.23 — «نمایش زندهٔ دمو حذف شد»: پوزیشن‌های باز دمو دیگر
-                  کارت‌به‌کارت نمایش داده نمی‌شوند؛ PnL لحظه‌ای همهٔ پوزیشن‌های باز
-                  در بلوک «PnL ربات» لحاظ می‌شود و مدیریت (بستن همه) از سربرگ همین
-                  بخش است. مدیریت خودکار SL/TP/تریل ربات تغییری نمی‌کند. */}
-              <Text style={styles.sourceHint}>
-                {openPositions.length > 0
-                  ? `${openPositions.length.toLocaleString('fa-IR')} پوزیشن دموی باز فعال است — مدیریت خودکار (SL/TP/تریل) روشن است؛ نمایش زندهٔ هر پوزیشن حذف شده است.`
-                  : 'پوزیشن بازی نیست — با اولین سیگنال/حرکت نهنگ باز می‌شود.'}
-              </Text>
+              {/* v1.5.28 — بازگشت نمایش زندهٔ پوزیشن‌های باز دمو (بازخورد کاربر:
+                  «در تب دمو هم باز پوزیشن‌های باز را نشان نمی‌دهد — برگرد به حالت
+                  قبل»): کارت هر پوزیشن باز مثل v1.5.22 دیده می‌شود. */}
+              {openPositions.length === 0 && (
+                <Text style={styles.sourceHint}>پوزیشن بازی نیست — با اولین سیگنال/حرکت نهنگ باز می‌شود.</Text>
+              )}
+              {openPositions.map((p) => {
+                const dir = p.side === 'long' ? 1 : -1;
+                const pnl = (p.lastPrice - p.entryPrice) * dir * p.qty;
+                const pnlPct = positionPnlPercent(p);
+                const posMarginUsd = p.leverage > 0 ? (p.qty * p.entryPrice) / p.leverage : 0;
+                const posNotionalUsd = p.qty * p.entryPrice;
+                return (
+                  <View key={p.id} style={styles.posRow}>
+                    <View style={styles.posMain}>
+                      <Text style={styles.posSymbol}>
+                        {p.side === 'long' ? '🟢' : '🔴'} {p.symbol} ×{p.leverage}
+                        {p.trailArmed ? ' 🛡' : ''}
+                        {p.strategyName ? <Text style={styles.posStrategy}> • {p.strategyName}</Text> : null}
+                      </Text>
+                      <Text style={styles.posSource} numberOfLines={1}>
+                        {p.source === 'whale' ? '🐋 ' : '📈 '}{p.sourceLabel}
+                      </Text>
+                      <Text style={styles.posPrices}>
+                        ورود: {fmtPrice(p.symbol, p.entryPrice)} → فعلی: {fmtPrice(p.symbol, p.lastPrice)}
+                      </Text>
+                      <Text style={styles.posPrices}>
+                        SL {fmtPrice(p.symbol, p.stopPrice)} / TP {fmtPrice(p.symbol, p.takePrice)}
+                      </Text>
+                      <Text style={styles.posMargin}>
+                        مارجین ورودی: ${posMarginUsd.toFixed(2)} • ارزش پوزیشن: ${posNotionalUsd.toFixed(2)}
+                      </Text>
+                      <Text style={styles.posTime}>باز شد: {fmtOpenTime(p.openedAt)}</Text>
+                      {p.partialRealizedPnl != null && p.partialRealizedPnl !== 0 ? (
+                        <Text style={[styles.posPartial, { color: p.partialRealizedPnl >= 0 ? colors.dark.green : colors.dark.red }]}>
+                          سود بخش بسته‌شده: {p.partialRealizedPnl >= 0 ? '+' : '−'}${Math.abs(p.partialRealizedPnl).toFixed(2)} ({(p.partialsDone ?? 0).toLocaleString('fa-IR')} برداشت)
+                        </Text>
+                      ) : null}
+                    </View>
+                    <View style={styles.posSide}>
+                      <Text style={[styles.posPnl, { color: pnl >= 0 ? colors.dark.green : colors.dark.red }]}>
+                        {pnl >= 0 ? '+' : '−'}${Math.abs(pnl).toFixed(2)}
+                      </Text>
+                      <Text style={[styles.posPnlPct, { color: pnlPct >= 0 ? colors.dark.green : colors.dark.red }]}>
+                        {pnlPct >= 0 ? '+' : '−'}{Math.abs(pnlPct).toFixed(2)}٪
+                      </Text>
+                      <Pressable
+                        style={styles.posEditBtn}
+                        hitSlop={6}
+                        onPress={() =>
+                          openEditTpsl({
+                            kind: 'demo',
+                            id: p.id,
+                            symbol: p.symbol,
+                            side: p.side,
+                            qty: p.qty,
+                            stopPrice: p.stopPrice,
+                            takePrice: p.takePrice,
+                            lastPrice: p.lastPrice,
+                          })
+                        }
+                        testID={`pos-edit-tpsl-${p.id}`}
+                      >
+                        <Edit3 size={11} color={colors.dark.accent} />
+                      </Pressable>
+                      <Pressable
+                        style={styles.posHalfBtn}
+                        hitSlop={6}
+                        onPress={() =>
+                          openPartialClose({
+                            kind: 'demo',
+                            id: p.id,
+                            symbol: p.symbol,
+                            side: p.side,
+                            qty: p.qty,
+                            entryPrice: p.entryPrice,
+                            leverage: p.leverage,
+                            lastPrice: p.lastPrice,
+                          })
+                        }
+                        testID={`pos-half-${p.id}`}
+                      >
+                        <Scissors size={11} color={colors.dark.blue} />
+                      </Pressable>
+                      <Pressable
+                        style={styles.posCloseBtn}
+                        onPress={() =>
+                          confirmClosePosition({ id: p.id, symbol: p.symbol, side: p.side, lastPrice: p.lastPrice })
+                        }
+                        testID={`pos-close-${p.id}`}
+                      >
+                        <X size={11} color={colors.dark.red} />
+                      </Pressable>
+                    </View>
+                  </View>
+                );
+              })}
               {closedFiltered.length > 0 || histTypeFilter !== 'all' ? (
                 <View style={styles.closedBox}>
                   {/* v1.5.6 — سرتیتر + دکمه PDF کل تاریخچه‌ی فیلتر فعلی (بازیابی از v1.5.4) */}
@@ -2302,7 +2390,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                         {p.symbol}
                         {p.strategyName ? ` • ${p.strategyName}` : ''}
                         {p.sourceLabel ? ` • ${p.sourceLabel}` : ''}
-                        {' '}({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'تیک‌پرافیت' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : p.closeReason === 'partial' ? 'برداشت سود (نصف حجم)' : p.closeReason === 'partial-manual' ? 'بستن حجمی' : 'دستی'})
+                        {' '}({p.closeReason === 'safety' ? 'بستن امنیتی (خطای ثبت استاپ)' : p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'تیک‌پرافیت' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : p.closeReason === 'partial' ? 'برداشت سود (نصف حجم)' : p.closeReason === 'partial-manual' ? 'بستن حجمی' : 'دستی'})
                         {p.closedAt ? ` • ${fmtOpenTime(p.closedAt)}` : ''}
                       </Text>
                       <Text style={[styles.posPnl, { color: (p.realizedPnl ?? 0) >= 0 ? colors.dark.green : colors.dark.red }]}>
@@ -2477,7 +2565,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   </View>
                 );
               })}
-              {realClosedFiltered.length > 0 || histTypeFilter !== 'all' ? (
+              {(
                 <View style={styles.closedBox}>
                   {/* v1.5.6 — سرتیتر + دکمه PDF (بازیابی از v1.5.4) */}
                   <View style={styles.closedTitleRow}>
@@ -2551,7 +2639,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                         {p.symbol}
                         {p.strategyName ? ` • ${p.strategyName}` : ''}
                         {p.sourceLabel ? ` • ${p.sourceLabel}` : ''}
-                        {' '}({p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'روی صرافی' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : p.closeReason === 'partial' ? 'برداشت سود (نصف حجم)' : p.closeReason === 'partial-manual' ? 'بستن حجمی' : 'دستی'})
+                        {' '}({p.closeReason === 'safety' ? 'بستن امنیتی (خطای ثبت استاپ)' : p.closeReason === 'stop' ? 'استاپ' : p.closeReason === 'take' ? 'روی صرافی' : p.closeReason === 'whale-close' ? 'نهنگ بست' : p.closeReason === 'signal' ? 'سیگنال' : p.closeReason === 'partial' ? 'برداشت سود (نصف حجم)' : p.closeReason === 'partial-manual' ? 'بستن حجمی' : 'دستی'})
                         {p.closedAt ? ` • ${fmtOpenTime(p.closedAt)}` : ''}
                       </Text>
                       <Text style={[styles.posPnl, { color: (p.realizedPnl ?? 0) >= 0 ? colors.dark.green : colors.dark.red }]}>
@@ -2592,10 +2680,6 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                     </View>
                   )}
                 </View>
-              ) : (
-                <Text style={styles.sourceHint}>
-                  هنوز معامله‌ی واقعی بسته‌شده‌ای ثبت نشده — با اولین معامله، تاریخچه این‌جا نمایش داده می‌شود.
-                </Text>
               )}
             </View>
           )}

@@ -55,6 +55,7 @@ import { getStoredHookSignals } from './hookReversalService';
 import { getStoredGainzAlgoSignals } from './gainzAlgoService';
 import { getServerUrl, getInstallSecret } from './scanServerApi';
 import { futuresAdapterFor, exchangeNeedsPassphrase } from './exchangeFutures';
+import type { LivePositionRow, OpenMarketResult } from './exchangeFutures';
 import { EXCHANGES } from '@/constants/exchanges';
 import type { ExchangeId } from '@/types/crypto';
 import { mergePositionsById } from './autoMerge';
@@ -256,7 +257,7 @@ export interface DemoAutoPosition {
   sourceLabel: string;
   status: 'open' | 'closed';
   lastPrice: number;
-  closeReason?: 'stop' | 'take' | 'signal' | 'whale-close' | 'manual' | 'partial' | 'partial-manual';
+  closeReason?: 'stop' | 'take' | 'signal' | 'whale-close' | 'manual' | 'partial' | 'partial-manual' | 'safety';
   closedAt?: number;
   realizedPnl?: number;
   /** v1.5.0 — trailing-stop bookkeeping. */
@@ -291,7 +292,7 @@ export interface RealAutoPosition {
   sourceLabel: string;
   status: 'open' | 'closed';
   lastPrice: number;
-  closeReason?: 'stop' | 'take' | 'signal' | 'whale-close' | 'manual' | 'partial' | 'partial-manual';
+  closeReason?: 'stop' | 'take' | 'signal' | 'whale-close' | 'manual' | 'partial' | 'partial-manual' | 'safety';
   closedAt?: number;
   realizedPnl?: number;
   initialStopPrice?: number;
@@ -1647,30 +1648,80 @@ async function openReal(
     return null;
   }
   const sizeUsd = gate.sizeUsd;
-  const { stopPrice, takePrice } = computeStopTake(side, price, settings.maxLossPercent, settings.rewardRatio, settings.leverage);
-  // v1.5.13 — برچسب استراتژی «واقعی» (لیست هر مود جداست)
-  const strategyName = await currentStrategyLabel('real');
   // v1.5.19 — اجرا روی صرافی انتخابی (بایننس همان مسیر قبلی؛ بای‌بیت V5؛
   // بقیه صرافی‌ها هنوز «به‌زودی» هستند و قبل از استارت رد می‌شوند).
   const adapter = futuresAdapterFor(settings.realExchangeId);
   if (!adapter) {
     throw new Error(`اجرای ربات روی این صرافی هنوز فعال نیست (به‌زودی)`);
   }
-  await adapter.openMarket(
-    keys,
-    `${symbol}USDT`,
-    side,
-    sizeUsd,
-    settings.leverage,
-    Number(stopPrice.toFixed(6)),
-    Number(takePrice.toFixed(6))
-  );
-  const qty = (sizeUsd * settings.leverage) / price;
+  // v1.5.26 — استاپ/حد سود از «قیمت لحظه‌ای صرافی» در لحظهٔ سفارش محاسبه
+  // می‌شود (نه قیمت سیگنال که ممکن است چند دقیقه قدیمی باشد) تا حد ضررِ
+  // واقعی دقیقاً همان عدد تنظیم‌شده باشد.
+  const livePx = (await adapter.priceMap().catch(() => ({}) as Record<string, number>))[`${symbol}USDT`] ?? 0;
+  const entry = livePx > 0 ? livePx : price;
+  const { stopPrice, takePrice } = computeStopTake(side, entry, settings.maxLossPercent, settings.rewardRatio, settings.leverage);
+  // v1.5.13 — برچسب استراتژی «واقعی» (لیست هر مود جداست)
+  const strategyName = await currentStrategyLabel('real');
+  let openRes: OpenMarketResult | null = null;
+  try {
+    openRes = await adapter.openMarket(
+      keys,
+      `${symbol}USDT`,
+      side,
+      sizeUsd,
+      settings.leverage,
+      Number(stopPrice.toFixed(6)),
+      Number(takePrice.toFixed(6)),
+      entry
+    );
+  } catch (e) {
+    // v1.5.28 — «بستن امنیتی» (خطای ثبت SL/TP روی صرافی): رکورد بسته‌شده
+    // ذخیره می‌شود تا در تاریخچه/تقویم/PnL دیده باشد — قبلاً پوزیشن بی‌ردیف
+    // ناپدید می‌شد و کاربر نمی‌فهمید چه اتفاقی افتاده.
+    const msg = e instanceof Error ? e.message : '';
+    if (/برای امنیت بسته شد/.test(msg)) {
+      try {
+        const qtySafe = (sizeUsd * settings.leverage) / Math.max(entry, 1e-9);
+        const trackedSafe = await loadRealPositions();
+        await saveRealPositions([
+          {
+            id: `r-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            symbol,
+            side,
+            entryPrice: entry,
+            qty: qtySafe,
+            leverage: settings.leverage,
+            stopPrice,
+            takePrice,
+            openedAt: Date.now(),
+            source: sourceLabel.includes('نهنگ') ? 'whale' : 'indicator',
+            sourceLabel,
+            status: 'closed',
+            lastPrice: entry,
+            closeReason: 'safety',
+            closedAt: Date.now(),
+            realizedPnl: 0,
+            initialStopPrice: stopPrice,
+            highWater: entry,
+            lowWater: entry,
+            trailArmed: false,
+            strategyName,
+            partialsDone: 0,
+          },
+          ...trackedSafe,
+        ]);
+      } catch {
+        // ذخیرهٔ رکورد نباید خطای اصلی را بپوشاند
+      }
+    }
+    throw e;
+  }
+  const qty = (sizeUsd * settings.leverage) / entry;
   const pos: RealAutoPosition = {
     id: `r-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     symbol,
     side,
-    entryPrice: price,
+    entryPrice: entry,
     qty,
     leverage: settings.leverage,
     stopPrice,
@@ -1679,10 +1730,10 @@ async function openReal(
     source: sourceLabel.includes('نهنگ') ? 'whale' : 'indicator',
     sourceLabel,
     status: 'open',
-    lastPrice: price,
+    lastPrice: entry,
     initialStopPrice: stopPrice,
-    highWater: price,
-    lowWater: price,
+    highWater: entry,
+    lowWater: entry,
     trailArmed: false,
     strategyName,
     partialsDone: 0,
@@ -1691,16 +1742,28 @@ async function openReal(
   await saveRealPositions([pos, ...tracked]);
   await appendLog(
     'open',
-    `واقعی ${side === 'long' ? 'خرید' : 'فروش'} ${symbol} @ ~${price} (${sourceLabel} • استراتژی ${strategyName}) — SL ${stopPrice.toFixed(4)} / TP ${takePrice.toFixed(4)}${sizeUsd !== settings.positionSizeUsd ? ` • حجم هوشمند: $${sizeUsd.toFixed(1)}` : ''}`
+    `واقعی ${side === 'long' ? 'خرید' : 'فروش'} ${symbol} @ ~${entry} (${sourceLabel} • استراتژی ${strategyName}) — SL ${stopPrice.toFixed(4)} / TP ${takePrice.toFixed(4)}${sizeUsd !== settings.positionSizeUsd ? ` • حجم هوشمند: $${sizeUsd.toFixed(1)}` : ''}`
   );
   await notifyAutoTrade(
     `🤖 ربات واقعی: ${side === 'long' ? 'خرید' : 'فروش'} ${symbol}`,
-    `ورود ~${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)} (${sourceLabel})`
+    `ورود ~${entry} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)} (${sourceLabel})`
   );
   await announceOnce(`open:${pos.id}`, 
     `بک‌تست (واقعی): ${side === 'long' ? '🟢 خرید' : '🔴 فروش'} ${symbol}`,
-    `ورود ~${price} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)}\nمنبع: ${sourceLabel} • لوریج ${settings.leverage}x • استراتژی ${strategyName}`
+    `ورود ~${entry} • استاپ ${stopPrice.toFixed(4)} • تیک‌پرافیت ${takePrice.toFixed(4)}\nمنبع: ${sourceLabel} • لوریج ${settings.leverage}x • استراتژی ${strategyName}`
   );
+  // v1.5.28 — اگر استاپ/حد سود روی صرافی ثبت نشد و بستن امنیتی هم ممکن نشد،
+  // پوزیشن باز و tracked است ولی بی‌دفاع: هشدار واضح + مدیریت با برنامه.
+  if (openRes && openRes.slTpAttached === false) {
+    await appendLog(
+      'error',
+      `واقعی ${symbol}: استاپ/حد سود روی صرافی ثبت نشد — گارد حد ضرر سخت و تریلینگ برنامه مدیریت می‌کنند؛ برنامه را باز نگه دارید`
+    );
+    await notifyAutoTrade(
+      `⚠️ ربات واقعی: ${symbol} بدون استاپ روی صرافی`,
+      `ثبت استاپ روی صرافی ناموفق بود؛ گارد حد ضرر و تریلینگ برنامه مدیریتش می‌کنند — برنامه را باز نگه دارید تا پوزیشن محافظت شود.`
+    );
+  }
   return pos;
 }
 
@@ -1726,6 +1789,87 @@ async function closeReal(
  *  • ratchet the SL upward via updateStopLoss (trailing + breakeven+fee);
  *  • detect positions closed on the exchange (SL/TP hit) and book their PnL.
  */
+/** v1.5.27/28 — همگام‌سازی پوزیشن‌های بازِ صرافی با رکوردهای ربات
+ *  (reconciliation): ریشهٔ «روی صرافی پوزیشن باز است ولی برنامه چیزی نشان
+ *  نمی‌دهد» — اگر سفارش باز شد ولی ثبت رکورد در برنامه شکست خورد، پوزیشن
+ *  روی صرافی «بی‌صاحب» می‌ماند: نه نمایش، نه PnL، نه حد ضرر، نه تریلینگ.
+ *  این تابع هر چرخه پوزیشن بازِ صرافیِ بدون رکورد را adopt می‌کند (ورود/
+ *  حجم/جهت از خود صرافی)، استاپ/حد سود را از تنظیمات فعلی حساب و همین
+ *  لحظه روی صرافی هم ثبت می‌کند (بی‌دفاع نمی‌ماند). */
+export async function syncRealOpenPositions(
+  settings: AutoTradeSettings,
+  keys: RealKeys
+): Promise<{ adopted: number; errors: string[] }> {
+  const errors: string[] = [];
+  let adopted = 0;
+  try {
+    const adapter = futuresAdapterFor(settings.realExchangeId);
+    if (!adapter) return { adopted, errors };
+    let live: LivePositionRow[] = [];
+    try {
+      live = await adapter.listPositions(keys);
+    } catch {
+      return { adopted, errors }; // صرافی پاسخ نداد → دست نمی‌زنیم
+    }
+    const tracked = await loadRealPositions();
+    const openTrackedSyms = new Set(tracked.filter((p) => p.status === 'open').map((p) => `${p.symbol}USDT`));
+    let changed = false;
+    for (const lp of live) {
+      if (!lp?.symbol || !/USDT$/i.test(lp.symbol)) continue;
+      if (openTrackedSyms.has(lp.symbol)) continue;
+      const amt = parseFloat(lp.positionAmt ?? '0');
+      const qty = Math.abs(amt);
+      if (!(qty > 0)) continue;
+      const entry = parseFloat(lp.entryPrice ?? '0');
+      const mark = parseFloat(lp.markPrice ?? '0');
+      const px = entry > 0 ? entry : mark;
+      if (!(px > 0)) continue;
+      const side: 'long' | 'short' = amt >= 0 ? 'long' : 'short';
+      const base = lp.symbol.replace(/USDT$/i, '');
+      // استاپ/حد سود از تنظیمات فعلی ربات — همان محاسبهٔ openReal
+      const { stopPrice, takePrice } = computeStopTake(side, px, settings.maxLossPercent, settings.rewardRatio, settings.leverage);
+      const pos: RealAutoPosition = {
+        id: `r-sync-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        symbol: base,
+        side,
+        entryPrice: px,
+        qty,
+        leverage: settings.leverage,
+        stopPrice,
+        takePrice,
+        openedAt: Date.now(),
+        source: 'indicator',
+        sourceLabel: 'sync از صرافی',
+        status: 'open',
+        lastPrice: mark > 0 ? mark : px,
+        initialStopPrice: stopPrice,
+        highWater: px,
+        lowWater: px,
+        trailArmed: false,
+        strategyName: undefined,
+        partialsDone: 0,
+      };
+      tracked.unshift(pos);
+      changed = true;
+      adopted++;
+      await appendLog(
+        'open',
+        `واقعی ${base}: پوزیشن بازِ صرافی به ربات اضافه شد (sync) — ورود ~${px} • SL ${stopPrice.toFixed(4)} / TP ${takePrice.toFixed(4)}`
+      );
+      // بی‌دفاع نماند: استاپ/حد سود همین حالا روی صرافی ثبت شود
+      try {
+        await adapter.updateTradingStop(keys, lp.symbol, side, Number(stopPrice.toFixed(6)), Number(takePrice.toFixed(6)), qty, true);
+      } catch (e) {
+        errors.push(`sync ${base}: ثبت استاپ روی صرافی نشد (${e instanceof Error ? e.message.slice(0, 60) : 'خطا'}) — گارد حد ضرر خودِ ربات فعال است`);
+      }
+    }
+    if (changed) await saveRealPositions(tracked);
+  } catch (e) {
+    errors.push(`sync واقعی: ${e instanceof Error ? e.message.slice(0, 60) : 'خطا'}`);
+  }
+  return { adopted, errors };
+}
+
 async function manageRealPositions(
   settings: AutoTradeSettings,
   keys: RealKeys
@@ -1895,7 +2039,15 @@ export async function runAutoCycle(ctx: RunCycleCtx): Promise<AutoCycleResult> {
 
   // 1.5) v1.5.0 — manage tracked REAL positions (trailing + closed detection)
   //  — فقط وقتی «ربات واقعی» روشن است، مستقل از اینکه مود انتخابی UI کدام است.
+  // v1.5.28 — اول sync: پوزیشن بازِ صرافی که رکورد ندارد (مثلاً بعد از کرش)
+  // adopt می‌شود — نمایش/PnL/حد ضرر/تریل از همین چرخه برقرار می‌شود.
   if (realOn && ctx.realKeys) {
+    try {
+      const s = await syncRealOpenPositions(withParams(settings, 'real'), ctx.realKeys);
+      result.errors.push(...s.errors);
+    } catch (e) {
+      result.errors.push(`sync واقعی: ${e instanceof Error ? e.message.slice(0, 60) : 'خطا'}`);
+    }
     try {
       const m = await manageRealPositions(withParams(settings, 'real'), ctx.realKeys);
       result.closed += m.closed;

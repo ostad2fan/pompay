@@ -44,6 +44,10 @@ export interface ExchangeKeys {
 /** نتیجه باز کردن پوزیشن مارکت (qty واقعی که صرافی ثبت کرد). */
 export interface OpenMarketResult {
   qty: number;
+  /** v1.5.28 — false = سفارش باز شد ولی ثبت استاپ/حد سود روی صرافی ناموفق
+   *  بود و بستن امنیتی هم ممکن نشد؛ موتور پوزیشن را ذخیره/دنبال می‌کند و
+   *  با گارد حد ضرر سخت + تریلینگ مدیریتش می‌کند (هشدار هم به تلگرام می‌رود). */
+  slTpAttached?: boolean;
 }
 
 /** ردیف پوزیشن زندهٔ صرافی — هم‌شکلِ خروجی getPositions بایننس تا موتور
@@ -70,7 +74,9 @@ export interface FuturesAdapter {
     sizeUsd: number,
     leverage: number,
     stopPrice: number,
-    takePrice: number
+    takePrice: number,
+    /** v1.5.26 — قیمت لنگر SL/TP (قیمت لحظه‌ای در لحظهٔ سفارش از موتور). */
+    entryHint?: number
   ): Promise<OpenMarketResult>;
   /** پوزیشن‌های باز زندهٔ صرافی. */
   listPositions(keys: ExchangeKeys): Promise<LivePositionRow[]>;
@@ -388,14 +394,17 @@ const BITUNIX_BASE = 'https://fapi.bitunix.com';
 
 /** کش دقت نمادها — ۱ ساعت. فیلدهای واقعی پاسخ Bitunix (مطابق مستندات
  *  get_trading_pairs): basePrecision (دقت مقدار)، quotePrecision (دقت قیمت)،
- *  minTradeVolume (حداقل حجم)، min/maxMarketOrderVolume. */
-let bitunixPairsCache: { at: number; map: Record<string, { qtyStep: number; minQty: number }> } | null = null;
+ *  minTradeVolume (حداقل حجم)، min/maxMarketOrderVolume.
+ *  v1.5.28 — priceDecimals (quotePrecision) اضافه شد: قیمت‌های SL/TP باید با
+ *  همین تعداد رقم اعشار ارسال شوند وگرنه صرافی «Parameter error (10002)»
+ *  می‌دهد — ریشهٔ «ثبت SL/TP ناموفق بود و پوزیشن برای امنیت بسته شد». */
+let bitunixPairsCache: { at: number; map: Record<string, { qtyStep: number; minQty: number; priceDecimals: number }> } | null = null;
 
-async function bitunixPairs(): Promise<Record<string, { qtyStep: number; minQty: number }>> {
+async function bitunixPairs(): Promise<Record<string, { qtyStep: number; minQty: number; priceDecimals: number }>> {
   if (bitunixPairsCache && Date.now() - bitunixPairsCache.at < 3_600_000) return bitunixPairsCache.map;
   const res = await fetch(`${BITUNIX_BASE}/api/v1/futures/market/trading_pairs`);
   const data = (await res.json()) as { code: number; data?: any[] };
-  const map: Record<string, { qtyStep: number; minQty: number }> = {};
+  const map: Record<string, { qtyStep: number; minQty: number; priceDecimals: number }> = {};
   for (const p of data?.data ?? []) {
     const sym = String(p.symbol ?? '');
     if (!sym.endsWith('USDT')) continue;
@@ -407,7 +416,10 @@ async function bitunixPairs(): Promise<Record<string, { qtyStep: number; minQty:
       parseFloat(p.minTradeVolume ?? p.minQty ?? '0') || 0,
       parseFloat(p.minMarketOrderVolume ?? '0') || 0
     );
-    map[sym] = { qtyStep: step > 0 ? step : 0.001, minQty };
+    // v1.5.28 — دقت قیمت؛ اگر صرافی نداد −1 (بعداً از رقم‌های قیمت لحظه‌ای حدس زده می‌شود)
+    const qprecRaw = p.quotePrecision ?? p.pricePrecision;
+    const priceDecimals = Number.isFinite(Number(qprecRaw)) && qprecRaw !== null && qprecRaw !== undefined ? Number(qprecRaw) : -1;
+    map[sym] = { qtyStep: step > 0 ? step : 0.001, minQty, priceDecimals };
   }
   if (Object.keys(map).length > 0) bitunixPairsCache = { at: Date.now(), map };
   return map;
@@ -468,6 +480,23 @@ function bitunixPositionQty(p: any): number {
 function bitunixQtyStr(qty: number, pair?: { qtyStep: number }): string {
   const prec = pair && pair.qtyStep > 0 ? Math.max(0, Math.round(-Math.log10(pair.qtyStep))) : 3;
   return qty.toFixed(Math.min(8, prec));
+}
+
+/** v1.5.28 — قیمت SL/TP به‌صورت رشته با «دقت قیمت» نماد — ریشهٔ
+ *  «Parameter error (code 10002)» در ثبت استاپ/تیک‌پرافیت داخل سفارش، در
+ *  tpsl/place_order جداگانه و در آپدیت تریلینگ: قیمت با اعشار کاملِ
+ *  اعشار شناور (مثل 63.245678901) توسط صرافی رد می‌شد. دقت از
+ *  quotePrecision نماد خوانده می‌شود؛ اگر صرافی نداده باشد، از تعداد رقم
+ *  اعشارِ خودِ قیمت لحظه‌ای (فرمت مجاز خودِ صرافی) حدس زده می‌شود. */
+function bitunixPriceStr(price: number, pair?: { priceDecimals: number }, lastPrice?: number): string {
+  let prec = pair && pair.priceDecimals >= 0 ? pair.priceDecimals : -1;
+  if (prec < 0 && lastPrice !== undefined && lastPrice > 0) {
+    const s = String(lastPrice);
+    const dot = s.indexOf('.');
+    prec = dot >= 0 ? Math.min(8, s.length - dot - 1) : 0;
+  }
+  if (prec < 0) prec = 2;
+  return price.toFixed(Math.min(8, Math.max(0, prec)));
 }
 
 /** v1.5.25 — بلک‌لیست نمادهای غیرقابل معامله از طریق API (کد 710002):
@@ -532,7 +561,7 @@ const bitunixAdapter: FuturesAdapter = {
     const equity = available + num(row.frozen) + num(row.margin);
     return { available, equity };
   },
-  async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice) {
+  async openMarket(keys, symbol, side, sizeUsd, leverage, stopPrice, takePrice, entryHint = 0) {
     const pair = (await bitunixPairs())[symbol];
     // نماد روی این صرافی لیست نیست؟ خطای واضح به‌جای «Parameter error»
     if (!pair) throw new Error(`Bitunix: نماد ${symbol} در این صرافی معامله نمی‌شود — باز نشد`);
@@ -552,6 +581,29 @@ const bitunixAdapter: FuturesAdapter = {
     let qtyFinal = qty;
     if (pair.minQty > 0 && qty < pair.minQty) qtyFinal = roundToStep(pair.minQty, pair.qtyStep) || pair.minQty;
     const qtyStr = bitunixQtyStr(qtyFinal, pair);
+    // v1.5.26 — لنگر SL/TP = قیمت لحظه‌ای در لحظهٔ سفارش (entryHint از موتور؛
+    // اگر نبود ticker). قبلاً فاصلهٔ استاپ از «قیمت سیگنال» حساب می‌شد و اگر
+    // قیمت جابجا شده بود، استاپ سمت اشتباه قیمت می‌افتاد (کد 30030).
+    const anchor = entryHint > 0 ? entryHint : last;
+    let slFinal = stopPrice;
+    let tpFinal = takePrice;
+    if ((slFinal > 0 || tpFinal > 0) && anchor > 0) {
+      const dist = slFinal > 0 ? Math.abs(anchor - slFinal) : tpFinal > 0 ? Math.abs(tpFinal - anchor) : 0;
+      const safeDist = dist > 0 ? dist : anchor * 0.01;
+      const ratio = dist > 0 && slFinal > 0 ? Math.abs(tpFinal - anchor) / dist : 1;
+      if (side === 'long') {
+        if (slFinal > 0 && slFinal >= last) slFinal = last - safeDist;
+        if (tpFinal > 0 && tpFinal <= last) tpFinal = last + safeDist * Math.max(0.5, ratio);
+      } else {
+        if (slFinal > 0 && slFinal <= last) slFinal = last + safeDist;
+        if (tpFinal > 0 && tpFinal >= last) tpFinal = last - safeDist * Math.max(0.5, ratio);
+      }
+    }
+    // v1.5.28 — گرد کردن به «دقت قیمت» نماد — ریشهٔ «Parameter error (10002)»:
+    // قیمت با اعشار کامل اعشار شناور توسط صرافی رد می‌شد (هم در سفارش، هم در
+    // tpsl جداگانه، هم در تریلینگ) → SL/TP هیچ‌وقت ثبت نمی‌شد و پوزیشن بسته می‌شد.
+    const slStr = slFinal > 0 ? bitunixPriceStr(slFinal, pair, last) : null;
+    const tpStr = tpFinal > 0 ? bitunixPriceStr(tpFinal, pair, last) : null;
     const body: Record<string, unknown> = {
       symbol,
       side: side === 'long' ? 'BUY' : 'SELL',
@@ -559,8 +611,8 @@ const bitunixAdapter: FuturesAdapter = {
       effect: 'GTC',
       qty: qtyStr,
     };
-    if (stopPrice > 0) body.slPrice = String(stopPrice);
-    if (takePrice > 0) body.tpPrice = String(takePrice);
+    if (slStr) body.slPrice = slStr;
+    if (tpStr) body.tpPrice = tpStr;
     // تلاش ۱: دوجهته (tradeSide OPEN) → تلاش ۲: یک‌طرفه (بدون tradeSide) →
     // تلاش ۳: بدون SL/TP داخلی (بعداً جداگانه ثبت می‌شود)
     let lastErr: unknown = null;
@@ -602,39 +654,89 @@ const bitunixAdapter: FuturesAdapter = {
       );
     }
     // اگر سفارش با تلاش ۳ (بدون SL/TP داخلی) موفق شد → SL/TP جداگانه ثبت کن
-    if (okAttempt === 2 && (stopPrice > 0 || takePrice > 0)) {
-      let positionId: string | undefined;
-      for (let i = 0; i < 7 && !positionId; i++) {
+    // v1.5.28 — با قیمت‌های گردشده + تلاش دوم با دقت برآشته از میانگین ورود
+    // پوزیشن؛ اگر هیچ‌کدام نشد: اول بستن امنیتی، و اگر بستن هم نشد پوزیشن
+    // «باز و tracked» برمی‌گردد (هرگز بی‌دفاع و بی‌صاحب رها نمی‌شود).
+    if (okAttempt === 2 && (slStr || tpStr)) {
+      let prow: any = undefined;
+      for (let i = 0; i < 7 && !prow; i++) {
         if (i > 0) await sleep(700);
         const positions = (await bitunixGet(keys, '/api/v1/futures/position/get_pending_positions').catch(() => [])) as any[];
-        const p = (positions ?? []).find((x) => x.symbol === symbol);
-        positionId = p ? String(p.positionId ?? '') : undefined;
+        prow = (positions ?? []).find((x) => x.symbol === symbol);
       }
-      if (!positionId) throw new Error('Bitunix: پوزیشن بازشده پیدا نشد (SL/TP ثبت نشد — پوزیشن بسته شد)');
+      const positionId = prow ? String(prow.positionId ?? '') : '';
+      if (!positionId) {
+        // سفارش باز شده ولی پوزیشن در لیست صرافی نیامده (تأخیر API؟)
+        const closed = await bitunixAdapter
+          .closeAll(keys, symbol, side)
+          .then(() => true)
+          .catch(() => false);
+        if (closed) throw new Error('Bitunix: پوزیشن بازشده در لیست صرافی پیدا نشد — برای امنیت بسته شد');
+        // بستن هم نشد → پوزیشن روی صرافی باز است؛ ok برمی‌گردد تا برنامه
+        // آن را ذخیره/دنبال کند (sync، گارد حد ضرر سخت و تریل رویش اجرا می‌شود)
+        return { qty: qtyFinal, slTpAttached: false };
+      }
+      const avgPx = Number(prow.avgPrice ?? prow.avgEntryPrice ?? prow.openPrice ?? 0);
       try {
-        if (stopPrice > 0) {
+        if (slStr) {
           await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
             symbol,
             positionId,
-            slPrice: String(stopPrice),
+            slPrice: slStr,
             slQty: qtyStr,
           });
         }
-        if (takePrice > 0) {
+        if (tpStr) {
           await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
             symbol,
             positionId,
-            tpPrice: String(takePrice),
+            tpPrice: tpStr,
             tpQty: qtyStr,
           });
         }
       } catch (e) {
-        // «اولویت حفاظت»: بدون SL/TP نماند → پوزیشن همان لحظه بسته می‌شود
-        await bitunixAdapter.closeAll(keys, symbol, side).catch(() => {});
-        throw new Error(`Bitunix: ثبت SL/TP ناموفق بود و پوزیشن برای امنیت بسته شد (${e instanceof Error ? e.message : 'خطا'})`);
+        // تلاش دوم: دقت قیمت از میانگین ورود خودِ پوزیشن (فرمت مجاز خود صرافی)
+        let ok2 = false;
+        if (avgPx > 0) {
+          try {
+            const avgPair = { ...pair, priceDecimals: -1 };
+            if (slStr && slFinal > 0) {
+              await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
+                symbol,
+                positionId,
+                slPrice: bitunixPriceStr(slFinal, avgPair, avgPx),
+                slQty: qtyStr,
+              });
+            }
+            if (tpStr && tpFinal > 0) {
+              await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
+                symbol,
+                positionId,
+                tpPrice: bitunixPriceStr(tpFinal, avgPair, avgPx),
+                tpQty: qtyStr,
+              });
+            }
+            ok2 = true;
+          } catch {
+            ok2 = false;
+          }
+        }
+        if (!ok2) {
+          // «اولویت حفاظت»: بدون SL/TP نماند → پوزیشن همان لحظه بسته می‌شود
+          const closed = await bitunixAdapter
+            .closeAll(keys, symbol, side)
+            .then(() => true)
+            .catch(() => false);
+          if (closed) {
+            throw new Error(`Bitunix: ثبت SL/TP ناموفق بود و پوزیشن برای امنیت بسته شد (${e instanceof Error ? e.message : 'خطا'})`);
+          }
+          // بستن هم نشد → باز و tracked برمی‌گردد + گارد حد ضرر سخت برنامه و
+          // تریلینگ استاپ مدیریتش می‌کنند (به‌جای رهاشدن بی‌صاحب)
+          return { qty: qtyFinal, slTpAttached: false };
+        }
       }
     }
-    return { qty: qtyFinal };
+    return { qty: qtyFinal, slTpAttached: true };
   },
   async listPositions(keys) {
     const positions = (await bitunixGet(keys, '/api/v1/futures/position/get_pending_positions').catch(() => [])) as any[];
@@ -718,6 +820,8 @@ const bitunixAdapter: FuturesAdapter = {
   },
   async updateTradingStop(keys, symbol, side, stopPrice, takePrice, _qty, updateTake) {
     // tpsl/place_order برای همان پوزیشن دوباره صدا می‌شود (جایگزینی مقادیر)
+    // v1.5.28 — قیمت‌ها با «دقت قیمت» نماد گرد می‌شوند (قبلاً قیمت اعشاری
+    // کامل ارسال می‌شد → «Parameter error (10002)» → تریلینگ هیچ‌وقت ثبت نمی‌شد)
     const positions = (await bitunixGet(keys, '/api/v1/futures/position/get_pending_positions').catch(() => [])) as any[];
     const p = (positions ?? []).find((x) => x.symbol === symbol);
     if (!p) return;
@@ -725,11 +829,12 @@ const bitunixAdapter: FuturesAdapter = {
     const qty = bitunixPositionQty(p);
     const pair = (await bitunixPairs())[symbol];
     const qtyStr = bitunixQtyStr(roundToStep(qty, pair?.qtyStep ?? 0.001), pair);
+    const refPx = Number(p.markPrice ?? p.lastPrice ?? p.avgPrice ?? 0) || undefined;
     if (stopPrice > 0) {
       await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
         symbol,
         positionId,
-        slPrice: String(stopPrice),
+        slPrice: bitunixPriceStr(stopPrice, pair, refPx),
         slQty: qtyStr,
       });
     }
@@ -737,7 +842,7 @@ const bitunixAdapter: FuturesAdapter = {
       await bitunixPost(keys, '/api/v1/futures/tpsl/place_order', {
         symbol,
         positionId,
-        tpPrice: String(takePrice),
+        tpPrice: bitunixPriceStr(takePrice, pair, refPx),
         tpQty: qtyStr,
       });
     }

@@ -994,6 +994,64 @@ async function closeReal(st: StoredAutoConfig, keys: { apiKey: string; apiSecret
   }
 }
 
+/** v1.5.28 — sync پوزیشن‌های بازِ صرافی (reconciliation، مثل اپ):
+ *  پوزیشن بازِ صرافی که رکوردِ بازی در state ندارد → رکورد sync ساخته می‌شود
+ *  (ورود/حجم/جهت از صرافی؛ استاپ/حد سود از پارامترهای واقعی کانفیگ) تا
+ *  نمایش/PnL/حد ضرر/تریل برقرار شود. */
+async function syncRealOpen(cfg: AutoCfg): Promise<void> {
+  const keys = cfg.binanceKeys;
+  if (!keys) return;
+  try {
+    const live = (await getLivePositions(keys).catch(() => [])) as {
+      symbol: string;
+      positionAmt: string;
+      markPrice: string;
+      entryPrice?: string;
+    }[];
+    const state = await getState();
+    const openSyms = new Set(state.real.filter((p) => p.status === "open").map((p) => `${p.symbol}USDT`));
+    let dirty = false;
+    for (const lp of live ?? []) {
+      if (!lp?.symbol || !/USDT$/.test(lp.symbol)) continue;
+      if (openSyms.has(lp.symbol)) continue;
+      const amt = parseFloat(lp.positionAmt ?? "0");
+      if (!(Math.abs(amt) > 0)) continue;
+      const entry = parseFloat(lp.entryPrice ?? "0");
+      const mark = parseFloat(lp.markPrice ?? "0");
+      const px = entry > 0 ? entry : mark;
+      if (!(px > 0)) continue;
+      const side: "long" | "short" = amt >= 0 ? "long" : "short";
+      const base = lp.symbol.replace(/USDT$/, "");
+      const { stopPrice, takePrice } = computeStopTake(side, px, cfg.maxLossPercent, cfg.rewardRatio, cfg.leverage);
+      const pos: BtPosition = {
+        id: `r-sync-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        symbol: base,
+        side,
+        entryPrice: px,
+        qty: Math.abs(amt),
+        leverage: cfg.leverage,
+        stopPrice,
+        takePrice,
+        openedAt: Date.now(),
+        source: "indicator",
+        sourceLabel: "sync از صرافی",
+        status: "open",
+        lastPrice: mark > 0 ? mark : px,
+        initialStopPrice: stopPrice,
+        highWater: px,
+        lowWater: px,
+        trailArmed: false,
+      };
+      state.real.unshift(pos);
+      dirty = true;
+      await appendLog("open", `واقعی ${base}: پوزیشن بازِ صرافی به ربات اضافه شد (sync سرور) — ورود ~${px}`);
+    }
+    if (dirty) await putState(state);
+  } catch {
+    // بی‌صدا — چرخهٔ بعدی دوباره تلاش می‌کند
+  }
+}
+
 async function manageReal(cfg: AutoCfg, st: StoredAutoConfig): Promise<void> {
   const keys = cfg.binanceKeys;
   if (!keys) return;
@@ -1131,6 +1189,8 @@ export async function runBacktestCycle(): Promise<void> {
     // 2) real positions management
     if (cfg.mode === "real" && cfg.binanceKeys) {
       try {
+        // v1.5.28 — اول sync: پوزیشن بازِ صرافی که رکورد ندارد adopt شود
+        await syncRealOpen(realCfg);
         // v1.5.13 — مدیریت پوزیشن واقعی با پارامترهای «واقعی»
         await manageReal(realCfg, st);
       } catch (e) {
