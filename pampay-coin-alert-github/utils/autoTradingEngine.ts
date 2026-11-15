@@ -145,6 +145,13 @@ export interface AutoTradeSettings {
   /** v1.5.19 — ربات واقعی مستقل: روشن/خاموشِ خودش؛ استارت آن بک‌تست دمو را
    *  متوقف نمی‌کند (و برعکس) — هر کدام فقط با دکمه خودش مدیریت می‌شود. */
   enabledReal: boolean;
+  /** v1.5.29 — زمان استارت هر ربات = لنگر «تقویم ماهانه»: ماه ۱ = ۳۰ روز اول
+   *  از همین لحظه، ماه ۲ = ۳۰ روز بعدی و همین‌طور تا ۱۲ ماه؛ ماه جاری (آخری)
+   *  زنده است و PnL آن ادامه پیدا می‌کند و ماه‌های قبل به‌عنوان آرشیو دیده
+   *  می‌شوند. فقط اولین استارت ثبت می‌شود (توقف/استارت مجدد لنگر را جابه‌جا
+   *  نمی‌کند — «ادامهٔ همان استارت»)؛ ریست کامل صفرش می‌کند. */
+  demoStartAt?: number;
+  realStartAt?: number;
   /** v1.5.19 — صرافیِ اجرای ربات واقعی: انتخاب از صرافی‌های اضافه‌شده در
    *  تب «واقعی» (قبلاً همیشه بایننس اجباری بود). */
   realExchangeId: ExchangeId;
@@ -469,6 +476,10 @@ export async function loadAutoSettings(): Promise<AutoTradeSettings> {
       typeof parsed.enabledDemo === 'boolean' ? parsed.enabledDemo : legacyOn && merged.mode !== 'real';
     merged.enabledReal =
       typeof parsed.enabledReal === 'boolean' ? parsed.enabledReal : legacyOn && merged.mode === 'real';
+    // v1.5.29 — لنگر تقویم ماهانه (تاریخچهٔ مهاجرت: نصب‌های قدیمی این فیلد را
+    // ندارند → UI خودش با اولین معاملهٔ همان مود fallback می‌کند)
+    merged.demoStartAt = typeof parsed.demoStartAt === 'number' && parsed.demoStartAt > 0 ? parsed.demoStartAt : undefined;
+    merged.realStartAt = typeof parsed.realStartAt === 'number' && parsed.realStartAt > 0 ? parsed.realStartAt : undefined;
     merged.realExchangeId =
       typeof parsed.realExchangeId === 'string' && parsed.realExchangeId
         ? (parsed.realExchangeId as ExchangeId)
@@ -2412,6 +2423,11 @@ export async function resetDemoBacktest(): Promise<{ local: boolean; server: { o
       // v1.5.5 — بک‌فیل هم از صفر شروع شود بعد از ریست کامل
       BACKFILL_SEEN_KEY,
     ]);
+  } catch {}
+  // v1.5.29 — لنگر تقویم ماهانه هم صفر شود تا «ماه ۱» از استارتِ بعدی شروع شود
+  try {
+    const s = await loadAutoSettings();
+    await saveAutoSettings({ ...s, demoStartAt: undefined });
   } catch {}
   await appendLog('info', 'ریست کامل بک‌تست دمو انجام شد — همه‌چیز از صفر شروع می‌شود (حتی تاریخچه پاک شد)');
   // سرور ۲۴/۷: اگر روشن است، state سرور هم پاک شود

@@ -634,39 +634,87 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
   // ── v1.5.12 — «تقویم ۳۰ روزه جدولی که در هر روز سود و زیان کلی اون روز را
   // نشان بدهد تفکیک شده» — سطر هر روز: تعداد، سود، ضرر، خالص (جدیدترین اول).
   // v1.5.21 — تقویم دمو و واقعی جدا شد (هر بخش مستقل دیده می‌شود).
-  const calendarRowsFor = useCallback((src: (typeof positions[number] | typeof realPositions[number])[]) => {
+  // v1.5.29 — پنجرهٔ هر «ماه» = ۳۰ روز از استارت ربات (نه ۳۰ روز اخیر رولینگ)
+  const calendarRowsFor = useCallback(
+    (src: (typeof positions[number] | typeof realPositions[number])[], fromTs: number, toTs: number) => {
+      const map = new Map<
+        string,
+        { key: string; label: string; ts: number; trades: number; wins: number; profit: number; loss: number; net: number }
+      >();
+      for (const p of src) {
+        if (p.status !== 'closed') continue;
+        const at = p.closedAt ?? p.openedAt;
+        if (!at || at < fromTs || at >= toTs) continue;
+        const d = new Date(at);
+        const key = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+        let row = map.get(key);
+        if (!row) {
+          row = { key, label: d.toLocaleDateString('fa-IR'), ts: at, trades: 0, wins: 0, profit: 0, loss: 0, net: 0 };
+          map.set(key, row);
+        }
+        const pnl = p.realizedPnl ?? 0;
+        row.trades += 1;
+        if (pnl >= 0) {
+          row.wins += 1;
+          row.profit += pnl;
+        } else {
+          row.loss += pnl;
+        }
+        row.net += pnl;
+      }
+      return Array.from(map.values()).sort((a, b) => b.ts - a.ts);
+    },
+    []
+  );
+
+  /** v1.5.29 — پنجره‌های ۳۰روزهٔ ماهانه از استارت ربات (حداکثر ۱۲ ماه آخر). */
+  const calMonthsFor = useCallback((startAt: number) => {
     const now = Date.now();
     const win = CAL_DAYS * 86_400_000;
-    const map = new Map<
-      string,
-      { key: string; label: string; ts: number; trades: number; wins: number; profit: number; loss: number; net: number }
-    >();
-    for (const p of src) {
-      if (p.status !== 'closed') continue;
-      const at = p.closedAt ?? p.openedAt;
-      if (!at || now - at > win) continue;
-      const d = new Date(at);
-      const key = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
-      let row = map.get(key);
-      if (!row) {
-        row = { key, label: d.toLocaleDateString('fa-IR'), ts: at, trades: 0, wins: 0, profit: 0, loss: 0, net: 0 };
-        map.set(key, row);
-      }
-      const pnl = p.realizedPnl ?? 0;
-      row.trades += 1;
-      if (pnl >= 0) {
-        row.wins += 1;
-        row.profit += pnl;
-      } else {
-        row.loss += pnl;
-      }
-      row.net += pnl;
+    const start = startAt > 0 && startAt <= now ? startAt : now;
+    const total = Math.max(1, Math.floor((now - start) / win) + 1);
+    const count = Math.min(12, total);
+    const firstIdx = total - count;
+    const months: { idx: number; from: number; to: number; isCurrent: boolean }[] = [];
+    for (let i = 0; i < count; i++) {
+      const idx = firstIdx + i + 1;
+      const from = start + (idx - 1) * win;
+      const to = start + idx * win;
+      months.push({ idx, from, to: Math.min(to, now), isCurrent: idx === total });
     }
-    return Array.from(map.values()).sort((a, b) => b.ts - a.ts);
+    return months;
   }, []);
 
-  const demoCalendarRows = useMemo(() => calendarRowsFor(positions), [calendarRowsFor, positions]);
-  const realCalendarRows = useMemo(() => calendarRowsFor(realPositions), [calendarRowsFor, realPositions]);
+  /** v1.5.29 — لنگر تقویم: زمان استارت ثبت‌شده؛ نصب‌های قدیمی‌تر که این فیلد
+   *  را ندارند → اولین معاملهٔ همان مود (وگرنه «الان») لنگر می‌شود. */
+  const demoCalStart = useMemo(() => {
+    if (settings.demoStartAt && settings.demoStartAt > 0) return settings.demoStartAt;
+    const first = positions.reduce((m, p) => Math.min(m, p.openedAt ?? Infinity), Infinity);
+    return Number.isFinite(first) ? first : Date.now();
+  }, [settings.demoStartAt, positions]);
+  const realCalStart = useMemo(() => {
+    if (settings.realStartAt && settings.realStartAt > 0) return settings.realStartAt;
+    const first = realPositions.reduce((m, p) => Math.min(m, p.openedAt ?? Infinity), Infinity);
+    return Number.isFinite(first) ? first : Date.now();
+  }, [settings.realStartAt, realPositions]);
+
+  const demoCalMonths = useMemo(() => calMonthsFor(demoCalStart), [calMonthsFor, demoCalStart]);
+  const realCalMonths = useMemo(() => calMonthsFor(realCalStart), [calMonthsFor, realCalStart]);
+  // ماه انتخابی به‌صورت «فاصله از ماه جاری» (۰ = جاری) ذخیره می‌شود تا با شروع
+  // ماهِ جدید، انتخاب کاربر روی همان ماهِ نسبی بماند.
+  const [demoCalBack, setDemoCalBack] = useState(0);
+  const [realCalBack, setRealCalBack] = useState(0);
+  const demoCalMonth = demoCalMonths[Math.min(demoCalBack, demoCalMonths.length - 1)];
+  const realCalMonth = realCalMonths[Math.min(realCalBack, realCalMonths.length - 1)];
+
+  const demoCalendarRows = useMemo(
+    () => calendarRowsFor(positions, demoCalMonth.from, demoCalMonth.to),
+    [calendarRowsFor, positions, demoCalMonth]
+  );
+  const realCalendarRows = useMemo(
+    () => calendarRowsFor(realPositions, realCalMonth.from, realCalMonth.to),
+    [calendarRowsFor, realPositions, realCalMonth]
+  );
   // نسخهٔ مود-فعلی (سازگاری با کدهای قبلی)
   const calendarRows = settings.mode === 'demo' ? demoCalendarRows : realCalendarRows;
 
@@ -801,7 +849,9 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
           onPress: () => {
             // v1.5.19 — فقط فلگِ همین مود روشن می‌شود؛ ربات دیگر دست‌نخورده می‌ماند
             void persist(
-              settings.mode === 'demo' ? { ...settings, enabledDemo: true } : { ...settings, enabledReal: true }
+              settings.mode === 'demo'
+                ? { ...settings, enabledDemo: true, demoStartAt: settings.demoStartAt ?? Date.now() }
+                : { ...settings, enabledReal: true, realStartAt: settings.realStartAt ?? Date.now() }
             ).then(() => {
               void runCycleAndRefresh();
             });
@@ -1882,7 +1932,7 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   <Pressable style={styles.calHead} onPress={() => setCalOpenDemo((v) => !v)} testID="cal-toggle">
                     <CalendarDays size={13} color={colors.dark.accent} />
                     <Text style={styles.calTitle}>
-                      تقویم ۳۰ روزه سود/زیان — دمو
+                      تقویم ماهانه سود/زیان — دمو (از استارت ربات)
                     </Text>
                     <View style={styles.calHeadSpace} />
                     {calOpenDemo ? (
@@ -1893,9 +1943,36 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   </Pressable>
                   {calOpenDemo && (
                     <View>
+                      {/* v1.5.29 — سلکتور ماه: ماه ۱ = ۳۰ روز اول استارت ربات؛
+                          ماه جاری زنده است و PnL آن ادامه دارد؛ تا ۱۲ ماه */}
+                      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.calMonthRow}>
+                        {demoCalMonths.map((m, i) => {
+                          const back = demoCalMonths.length - 1 - i;
+                          const on = back === Math.min(demoCalBack, demoCalMonths.length - 1);
+                          return (
+                            <Pressable
+                              key={m.idx}
+                              style={[styles.calMonthChip, on && styles.calMonthChipActive]}
+                              onPress={() => setDemoCalBack(back)}
+                              testID={`cal-month-demo-${m.idx}`}
+                            >
+                              <Text style={[styles.calMonthChipText, on && styles.calMonthChipTextActive]}>
+                                ماه {m.idx.toLocaleString('fa-IR')}
+                                {m.isCurrent ? ' (جاری)' : ''}
+                              </Text>
+                            </Pressable>
+                          );
+                        })}
+                      </ScrollView>
+                      <Text style={styles.calRange}>
+                        {new Date(demoCalMonth.from).toLocaleDateString('fa-IR')} تا{' '}
+                        {new Date(demoCalMonth.to - 1).toLocaleDateString('fa-IR')}
+                        {demoCalMonth.isCurrent ? ' — ماه جاری، در حال ادامه' : ' — آرشیو'}
+                      </Text>
                       <View ref={calCardRefDemo} collapsable={false} style={styles.calCard}>
                         <Text style={styles.calCardTitle}>
-                          🤖 بک‌تست — تقویم ۳۰ روزه (دمو)
+                          🤖 بک‌تست — تقویم ماه {demoCalMonth.idx.toLocaleString('fa-IR')}
+                          {demoCalMonth.isCurrent ? ' (در ادامه)' : ''} (دمو)
                         </Text>
                         <View style={[styles.calGridRow, styles.calGridHead]}>
                           <Text style={[styles.calCell, styles.calCellDate, styles.calCellHead]}>تاریخ</Text>
@@ -1920,11 +1997,14 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                           </View>
                         ))}
                         {calendarRows.length === 0 && (
-                          <Text style={styles.calEmpty}>در ۳۰ روز اخیر معامله‌ی بسته‌شده‌ای نیست.</Text>
+                          <Text style={styles.calEmpty}>در این ماه معامله‌ی بسته‌شده‌ای نیست.</Text>
                         )}
                         {calendarRows.length > 0 && (
                           <View style={[styles.calGridRow, styles.calGridTotal]}>
-                            <Text style={[styles.calCell, styles.calCellDate, styles.calCellTotalLabel]}>مجموع ۳۰ روز</Text>
+                            <Text style={[styles.calCell, styles.calCellDate, styles.calCellTotalLabel]}>
+                              مجموع ماه {demoCalMonth.idx.toLocaleString('fa-IR')}
+                              {demoCalMonth.isCurrent ? ' (تا امروز)' : ''}
+                            </Text>
                             <Text style={[styles.calCell, styles.calCellTotalLabel]}>{calTotals.trades.toLocaleString('fa-IR')}</Text>
                             <Text style={[styles.calCell, { color: calTotals.profit > 0 ? colors.dark.green : colors.dark.textMuted }]}>
                               +${calTotals.profit.toFixed(2)}
@@ -1937,7 +2017,11 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                             </Text>
                           </View>
                         )}
-                        <Text style={styles.calFooter}>PampDumpCoins • سود/زیان روزانه‌ی معاملات بسته‌شده در ۳۰ روز اخیر</Text>
+                        <Text style={styles.calFooter}>
+                          PampDumpCoins • ماه {demoCalMonth.idx.toLocaleString('fa-IR')} از استارت ربات —{' '}
+                          {new Date(demoCalMonth.from).toLocaleDateString('fa-IR')} تا{' '}
+                          {new Date(demoCalMonth.to - 1).toLocaleDateString('fa-IR')}
+                        </Text>
                       </View>
                       <Pressable style={styles.shareBtn} onPress={() => void handleMakeCalImage(calCardRefDemo)} disabled={captureBusy} testID="cal-make-image">
                         {captureBusy ? (
@@ -1957,10 +2041,10 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
               {/* v1.5.23 — همیشه در مود واقعی دیده می‌شود (حتی با ربات خاموش) */}
               {settings.mode === 'real' && (
                 <View style={styles.calBox}>
-                  <Pressable style={styles.calHead} onPress={() => setCalOpenDemo((v) => !v)} testID="cal-toggle-real">
+                  <Pressable style={styles.calHead} onPress={() => setCalOpenReal((v) => !v)} testID="cal-toggle-real">
                     <CalendarDays size={13} color={colors.dark.accent} />
                     <Text style={styles.calTitle}>
-                      تقویم ۳۰ روزه سود/زیان — واقعی
+                      تقویم ماهانه سود/زیان — واقعی (از استارت ربات)
                     </Text>
                     <View style={styles.calHeadSpace} />
                     {calOpenReal ? (
@@ -1971,9 +2055,35 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                   </Pressable>
                   {calOpenReal && (
                     <View>
+                      {/* v1.5.29 — سلکتور ماه تقویم واقعی (همان منطق دمو) */}
+                      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.calMonthRow}>
+                        {realCalMonths.map((m, i) => {
+                          const back = realCalMonths.length - 1 - i;
+                          const on = back === Math.min(realCalBack, realCalMonths.length - 1);
+                          return (
+                            <Pressable
+                              key={m.idx}
+                              style={[styles.calMonthChip, on && styles.calMonthChipActive]}
+                              onPress={() => setRealCalBack(back)}
+                              testID={`cal-month-real-${m.idx}`}
+                            >
+                              <Text style={[styles.calMonthChipText, on && styles.calMonthChipTextActive]}>
+                                ماه {m.idx.toLocaleString('fa-IR')}
+                                {m.isCurrent ? ' (جاری)' : ''}
+                              </Text>
+                            </Pressable>
+                          );
+                        })}
+                      </ScrollView>
+                      <Text style={styles.calRange}>
+                        {new Date(realCalMonth.from).toLocaleDateString('fa-IR')} تا{' '}
+                        {new Date(realCalMonth.to - 1).toLocaleDateString('fa-IR')}
+                        {realCalMonth.isCurrent ? ' — ماه جاری، در حال ادامه' : ' — آرشیو'}
+                      </Text>
                       <View ref={calCardRefReal} collapsable={false} style={styles.calCard}>
                         <Text style={styles.calCardTitle}>
-                          🤖 بک‌تست — تقویم ۳۰ روزه (واقعی)
+                          🤖 بک‌تست — تقویم ماه {realCalMonth.idx.toLocaleString('fa-IR')}
+                          {realCalMonth.isCurrent ? ' (در ادامه)' : ''} (واقعی)
                         </Text>
                         <View style={[styles.calGridRow, styles.calGridHead]}>
                           <Text style={[styles.calCell, styles.calCellDate, styles.calCellHead]}>تاریخ</Text>
@@ -2002,7 +2112,10 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                         )}
                         {realCalendarRows.length > 0 && (
                           <View style={[styles.calGridRow, styles.calGridTotal]}>
-                            <Text style={[styles.calCell, styles.calCellDate, styles.calCellTotalLabel]}>مجموع ۳۰ روز</Text>
+                            <Text style={[styles.calCell, styles.calCellDate, styles.calCellTotalLabel]}>
+                              مجموع ماه {realCalMonth.idx.toLocaleString('fa-IR')}
+                              {realCalMonth.isCurrent ? ' (تا امروز)' : ''}
+                            </Text>
                             <Text style={[styles.calCell, styles.calCellTotalLabel]}>{realCalTotals.trades.toLocaleString('fa-IR')}</Text>
                             <Text style={[styles.calCell, { color: realCalTotals.profit > 0 ? colors.dark.green : colors.dark.textMuted }]}>
                               +${realCalTotals.profit.toFixed(2)}
@@ -2015,7 +2128,11 @@ export default function AutoTradingBotSection({ realKeys: realKeysProp }: { real
                             </Text>
                           </View>
                         )}
-                        <Text style={styles.calFooter}>PampDumpCoins • سود/زیان روزانه‌ی معاملات بسته‌شده در ۳۰ روز اخیر</Text>
+                        <Text style={styles.calFooter}>
+                          PampDumpCoins • ماه {realCalMonth.idx.toLocaleString('fa-IR')} از استارت ربات —{' '}
+                          {new Date(realCalMonth.from).toLocaleDateString('fa-IR')} تا{' '}
+                          {new Date(realCalMonth.to - 1).toLocaleDateString('fa-IR')}
+                        </Text>
                       </View>
                       <Pressable style={styles.shareBtn} onPress={() => void handleMakeCalImage(calCardRefReal)} disabled={captureBusy} testID="cal-make-image-real">
                         {captureBusy ? (
@@ -3385,6 +3502,40 @@ const styles = StyleSheet.create({
     gap: 4,
     marginBottom: 6,
     marginTop: 2,
+  },
+  calMonthRow: {
+    marginTop: 8,
+    marginHorizontal: 10,
+  },
+  calMonthChip: {
+    alignItems: 'center',
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    borderRadius: 7,
+    backgroundColor: colors.dark.surface,
+    borderWidth: 1,
+    borderColor: colors.dark.border,
+    marginRight: 6,
+  },
+  calMonthChipActive: {
+    backgroundColor: colors.dark.accent,
+    borderColor: colors.dark.accent,
+  },
+  calMonthChipText: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: colors.dark.textSecondary,
+  },
+  calMonthChipTextActive: {
+    color: colors.dark.background,
+    fontWeight: '800',
+  },
+  calRange: {
+    textAlign: 'center',
+    color: colors.dark.textMuted,
+    fontSize: 9,
+    marginTop: 6,
+    marginHorizontal: 10,
   },
   histPeriodChip: {
     flex: 1,
